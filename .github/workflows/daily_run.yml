@@ -27,8 +27,4 @@ jobs:
         run: pip install requests openai
 
       - name: Run script
-        env:
-          OPENAI_API_KEY: "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"
-          JOBBYO_APIFY_TOKEN: "apify_api_cjTqImkuLHu1ovfHcGRSrV6wff3A820x6tm6"
-          JOBO_API_KEY: "jbe_live_QXds10kToWih1Hy5Z_3if_H7MEWgf3mr_GagtJwc3Gly29DZPH4knkJROm-0IBxcI"
         run: python send_jobbyo.py
