@@ -125,7 +125,7 @@ PERMANENTLY_BLOCKED_COMPANIES = {
 # Hiring.cafe Apify integration — primary source before OpenAI fallback.
 # Set JOBBYO_APIFY_TOKEN in .env to enable. Costs ~$0.25/user vs ~$0.70 for
 # 7 OpenAI search batches, and returns direct ATS URLs (Ashby, Greenhouse, etc.)
-APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "apify_api_cjTqImkuLHu1ovfHcGRSrV6wff3A820x6tm6")
+APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "apify_api_bNfdKbWVObeGs2XkVHCZZN4mafgnjh0zQUdh")
 APIFY_HIRING_CAFE_ACTOR_ID = "memo23~apify-hiring-cafe-scraper"
 HIRING_CAFE_MAX_ITEMS = 15           # raw results fetched per user from HC
 HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
