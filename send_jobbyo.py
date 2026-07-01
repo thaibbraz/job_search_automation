@@ -8,7 +8,8 @@ import time
 import urllib.parse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timezone, timedelta
 
 import requests
 from openai import OpenAI
@@ -21,7 +22,7 @@ from openai import OpenAI
 BASE_URL = "https://fastapi-service-03-160893319817.europe-southwest1.run.app"
 
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = "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"
 # Fast search model.
 SEARCH_MODEL = os.getenv("JOBBYO_SEARCH_MODEL", "gpt-4.1-mini")
 
@@ -57,6 +58,12 @@ SINGLE_USER_EMAIL = os.getenv("JOBBYO_SINGLE_USER_EMAIL", "").strip() or None
 SINGLE_USER_EMAILS = set()
 SINGLE_USER_UID = os.getenv("JOBBYO_SINGLE_USER_UID", "").strip() or None
 
+EXCLUDED_USER_EMAILS = {
+    "zakin2time@gmail.com",
+    "zachkolp.esl.japan@gmail.com",
+    "rosejhickman@gmail.com",
+}
+
 # Target new-match jobs per user per day.
 TARGET_JOBS_PER_USER = 10
 
@@ -68,16 +75,21 @@ MIN_JOBS_BEFORE_SECOND_ROUND = 10
 JOBS_PER_BATCH = 30
 
 # Overnight search plan:
-# - Round 1: up to 6 adaptive batches for every eligible user.
+# - Round 1: up to 7 batches for every eligible user.
 # - Round 2: up to 4 additional batches only when Round 1 shows enough live/direct-source supply.
-FIRST_ROUND_BATCHES = 5
-SECOND_ROUND_BATCHES = 3
-MAX_ROUNDS_PER_USER = 2
+# Extra batch replaces the cost saved by cutting resolution attempts (8→3, 3→1).
+FIRST_ROUND_BATCHES = 7
+SECOND_ROUND_BATCHES = 4
+MAX_ROUNDS_PER_USER = 3
+MIN_ACCEPTABLE_JOBS_PER_USER = 5
+MINIMUM_VIABLE_ROUND_BATCHES = 2
+MIN_VIABLE_SAFE_FALLBACK_GRADE = 58
+MIN_VIABLE_CONFIDENCE = 55
 
 # Direct URL resolver: when search finds a promising mirror/job-board lead,
 # spend a small extra call trying to find the real ATS/company URL.
-MAX_DIRECT_RESOLUTION_ATTEMPTS_PER_BATCH = 8
-MAX_REMOTE_FAILURE_RESOLUTION_ATTEMPTS_PER_BATCH = 3
+MAX_DIRECT_RESOLUTION_ATTEMPTS_PER_BATCH = 3
+MAX_REMOTE_FAILURE_RESOLUTION_ATTEMPTS_PER_BATCH = 1
 MAX_DIRECT_RESOLUTION_CANDIDATES = 16
 # Resolver should not over-trust the search model grade; some promising leads
 # come back as 0/3/5 even when title/company/location are strong.
@@ -86,8 +98,8 @@ PENDING_REVIEW_MIN_GRADE = 66
 
 # 15-day quota mode: temporary production bridge until full ATS inventory/scraper is built.
 ENABLE_QUOTA_MODE = True
-ENABLE_AUTOMATION_TITLE_CLUSTER_PREFETCH = True
-ENABLE_SHARED_DAILY_INVENTORY = True
+ENABLE_AUTOMATION_TITLE_CLUSTER_PREFETCH = False
+ENABLE_SHARED_DAILY_INVENTORY = False
 CLUSTER_PREFETCH_JOBS_PER_CLUSTER = 24
 MAX_AUTOMATION_TITLE_CLUSTERS = 14
 MAX_PREFETCH_INVENTORY_JOBS = 350
@@ -96,6 +108,39 @@ INVENTORY_LOCAL_SCORE_MIN = 28
 SAFE_FALLBACK_MIN_GRADE = 66
 DISCOVERY_PENDING_MIN_GRADE = 62
 DISCOVERY_PENDING_STATUS = "pending_review"
+
+# Companies that consistently return 404s, surveys, or spam across all users.
+# These are merged into rejected_companies at the start of each user run so the
+# search model is explicitly told to never return them.
+PERMANENTLY_BLOCKED_COMPANIES = {
+    "towardjobs",
+    "toward jobs",
+    "skillerszone",
+    "usasurveyjob",
+    "usa survey job",
+    "nogigshere",
+    "nogigiddy",
+}
+
+# Hiring.cafe Apify integration — primary source before OpenAI fallback.
+# Set JOBBYO_APIFY_TOKEN in .env to enable. Costs ~$0.25/user vs ~$0.70 for
+# 7 OpenAI search batches, and returns direct ATS URLs (Ashby, Greenhouse, etc.)
+APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "apify_api_cjTqImkuLHu1ovfHcGRSrV6wff3A820x6tm6")
+APIFY_HIRING_CAFE_ACTOR_ID = "memo23~apify-hiring-cafe-scraper"
+HIRING_CAFE_MAX_ITEMS = 15           # raw results fetched per user from HC
+HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
+HIRING_CAFE_LOCAL_SCORE_MIN = 28     # same floor as INVENTORY_LOCAL_SCORE_MIN
+ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
+
+JOBO_API_BASE = "https://connect.jobo.world"
+JOBO_API_KEY = os.getenv("JOBO_API_KEY", "jbe_live_QXds10kToWih1Hy5Z_3if_H7MEWgf3mr_GagtJwc3Gly29DZPH4knkJROm-0IBxcI")
+JOBO_ATS_MAX_ITEMS = 30           # raw results per call (was 15)
+JOBO_LOCAL_SCORE_MIN = 15         # lower than HC — Jobo URLs are ATS-direct; AI review handles fit
+ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
+
+DAILY_REPORT_API_BASE = "https://fastapi-service-03-160893319817.europe-southwest1.run.app"
+# Override to a test inbox; set to "" to deliver to the actual user's email.
+DAILY_REPORT_OVERRIDE_EMAIL = "hello@jobbyo.ai"
 
 DAILY_PREFETCH_INVENTORY = []
 DAILY_PREFETCH_META = {}
@@ -285,6 +330,10 @@ def domain_matches(domain, domain_set):
 # JOB LINK FILTERS
 # ============================================================
 
+GLOBAL_BLOCKED_COMPANY_NAMES = {
+    "mercor",   # talent aggregator / staffing platform
+}
+
 AGGREGATOR_DOMAINS = {
     # Major aggregators / search boards
     "linkedin.com",
@@ -348,6 +397,16 @@ AGGREGATOR_DOMAINS = {
     # HiringCafe is allowed only as discovery, never as the final job URL.
     "hiring.cafe",
     "hiringcafe.com",
+
+    # Search-result aggregators confirmed to post category/listing pages as jobs.
+    "jobright.ai",
+    "www.jobright.ai",
+
+    # Survey/gig spam sources that consistently produce 404s or non-jobs.
+    "towardjobs.com",
+    "www.towardjobs.com",
+    "skillerszone.com",
+    "www.skillerszone.com",
 }
 KNOWN_DIRECT_ATS_DOMAINS = {
     "jobs.lever.co",
@@ -1057,6 +1116,9 @@ def static_check(
     if looks_like_dead_job_url(url):
         return False, "dead_job_url_pattern"
 
+    if company.lower().strip() in GLOBAL_BLOCKED_COMPANY_NAMES:
+        return False, "blocked_company"
+
     if domain_matches(domain, AGGREGATOR_DOMAINS):
         return False, "aggregator_page"
 
@@ -1098,7 +1160,8 @@ def static_check(
     if domain == "jobs.workable.com" and "/view/" not in path_lower:
         return False, "career_homepage"
 
-    if not has_job_identifier(url) and not looks_like_specific_company_job_url(url):
+    is_prefetch_job = str(job.get("source", "")).startswith(("hiring_cafe", "jobo_ats"))
+    if not is_prefetch_job and not has_job_identifier(url) and not looks_like_specific_company_job_url(url):
         return False, "generic_or_homepage_url"
 
     norm = normalize_url(url)
@@ -2651,12 +2714,16 @@ DIRECT_JOB_RESOLUTION_SCHEMA = {
 }
 
 
+RESOLUTION_TIMEOUT_SECONDS = 30.0
+
+
 def openai_direct_resolution_call(prompt):
     try:
         return client.responses.create(
             model=RESOLUTION_MODEL,
             tools=[{"type": "web_search", "search_context_size": RESOLUTION_SEARCH_CONTEXT_SIZE}],
             input=prompt,
+            timeout=RESOLUTION_TIMEOUT_SECONDS,
             text={
                 "format": {
                     "type": "json_schema",
@@ -2674,6 +2741,7 @@ def openai_direct_resolution_call(prompt):
             model=RESOLUTION_MODEL,
             tools=[{"type": "web_search_preview", "search_context_size": RESOLUTION_SEARCH_CONTEXT_SIZE}],
             input=prompt,
+            timeout=RESOLUTION_TIMEOUT_SECONDS,
             text={
                 "format": {
                     "type": "json_schema",
@@ -3195,11 +3263,14 @@ def candidate_forbids_title_or_function(job, search_contract=None):
 
 def role_family_conflicts_candidate(job, search_contract=None, automation=None, user_profile=None):
     title = _norm_words(job.get("title", ""))
-    description = _norm_words(job.get("description", ""))
-    combined = f"{title} {description}"
 
+    # Check trigger terms on title only. Descriptions legitimately mention words
+    # like "commercial", "revenue", or "account" in technical contexts (government
+    # contracting, healthcare, UC engineering), which would cause false positives
+    # if we scanned the description. Role family is a title-level concept; the AI
+    # review step handles description-level nuance.
     for rule in ROLE_FAMILY_RULES:
-        if not any(term in combined for term in rule["trigger_terms"]):
+        if not any(term in title for term in rule["trigger_terms"]):
             continue
         if candidate_allows_terms(
             search_contract=search_contract,
@@ -3286,7 +3357,7 @@ def safe_borderline_for_waiting_approval(
 ):
     blob = (str(reason or "") + " " + " ".join(str(x) for x in (risk_flags or []))).lower()
 
-    if recommended_grade is not None and normalize_grade(recommended_grade) < PENDING_REVIEW_MIN_GRADE:
+    if recommended_grade is not None and normalize_grade(recommended_grade) < DISCOVERY_PENDING_MIN_GRADE:
         return False
 
     markers = set(HARD_PRE_REVIEW_RISK_MARKERS)
@@ -3382,6 +3453,17 @@ ROUND 2, 5-BATCH SECOND STRATEGY MODE
 - Consider one seniority level lower or higher when sensible.
 - Add industry-adjacent companies and adjacent-but-relevant role families.
 - Keep AI review strict and keep all direct-link/domain validation rules.
+"""
+
+    if round_mode == "minimum_viable":
+        return """
+MINIMUM VIABLE FALLBACK MODE — up to 2 batches.
+This user has fewer than 5 jobs today despite earlier rounds.
+- Broaden titles by 2 levels: include adjacent and near-adjacent roles.
+- Accept same-domain industry variants (e.g. if target is Account Director, try Marketing Director, Client Partner, Senior Account Manager).
+- Return the best available direct ATS URLs even if fit is 60-70% rather than 80%+.
+- All direct-URL, domain-blocking, and remote-validation rules still apply.
+- Return fewer high-confidence jobs rather than many weak ones.
 """
 
     return """
@@ -3708,13 +3790,23 @@ REVIEW_SCHEMA = {
 }
 
 
-def review_jobs_with_ai(user_profile, automation, cv_text, persona, jobs):
+def review_jobs_with_ai(user_profile, automation, cv_text, persona, jobs, minimum_viable_mode=False):
     prefs = extract_job_preferences(automation)
+
+    minimum_viable_note = ""
+    if minimum_viable_mode:
+        minimum_viable_note = f"""
+MINIMUM VIABLE FALLBACK: This user has fewer than {MIN_ACCEPTABLE_JOBS_PER_USER} jobs today.
+Accept safe_fallback at grade {MIN_VIABLE_SAFE_FALLBACK_GRADE}+ when the URL is direct and verified.
+Accept discovery_pending at grade {MIN_VIABLE_CONFIDENCE}+ when the title/function broadly fits.
+Only use bad_match for clear-cut mismatches (wrong function, obvious location conflict, 404-style URL).
+
+"""
 
     prompt = f"""
 Review these jobs BEFORE they are posted to the user.
 
-This script is running 15-day quota mode. The target is 10 useful, real, direct-apply jobs per user.
+{minimum_viable_note}This script is running 15-day quota mode. The target is 10 useful, real, direct-apply jobs per user.
 Do not pretend every job is perfect. Classify into honest tiers.
 
 Use:
@@ -3781,12 +3873,14 @@ Return strict JSON only.
     return parse_json_output(response.output_text)
 
 
-def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job_status=DEFAULT_STATUS, search_contract=None):
+def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job_status=DEFAULT_STATUS, search_contract=None, minimum_viable_mode=False):
     if not jobs:
         return [], []
 
     print("\nAI REVIEW BEFORE POSTING:")
     print(f"Reviewing {len(jobs)} live jobs...")
+    if minimum_viable_mode:
+        print("  [minimum viable mode — loosened thresholds]")
 
     try:
         review = review_jobs_with_ai(
@@ -3795,6 +3889,7 @@ def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job
             cv_text=cv_text,
             persona=persona,
             jobs=jobs,
+            minimum_viable_mode=minimum_viable_mode,
         )
     except Exception as e:
         print(f"AI review failed. No jobs from this batch will be posted. Error: {e}")
@@ -3854,28 +3949,38 @@ def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job
         normal_post_decisions = {"exact_match", "strong_adjacent", "safe_fallback", "good_match"}
         manual_review_statuses = {STARTER_MAX_STATUS, DEFAULT_STATUS, DISCOVERY_PENDING_STATUS, "waiting_approval"}
 
+        grade_floor = MIN_VIABLE_SAFE_FALLBACK_GRADE if minimum_viable_mode else SAFE_FALLBACK_MIN_GRADE
+        conf_floor = MIN_VIABLE_CONFIDENCE if minimum_viable_mode else MIN_REVIEW_CONFIDENCE
+
         allow_normal_post = (
             decision in normal_post_decisions
-            and confidence >= MIN_REVIEW_CONFIDENCE
-            and recommended_grade >= SAFE_FALLBACK_MIN_GRADE
+            and confidence >= conf_floor
+            and recommended_grade >= grade_floor
         )
         allow_discovery_pending = (
             decision == "discovery_pending"
-            and job_status in manual_review_statuses
-            and confidence >= MIN_REVIEW_CONFIDENCE
-            and recommended_grade >= DISCOVERY_PENDING_MIN_GRADE
-            and safe_borderline_for_waiting_approval(
-                reason,
-                risk_flags,
-                recommended_grade,
-                search_contract=search_contract,
-                automation=automation,
-                user_profile=user_profile,
+            and (job_status in manual_review_statuses or minimum_viable_mode)
+            and confidence >= conf_floor
+            and recommended_grade >= (MIN_VIABLE_CONFIDENCE if minimum_viable_mode else DISCOVERY_PENDING_MIN_GRADE)
+            and (
+                minimum_viable_mode
+                # Non-starter users (premium/default) go to pending_review for human check anyway —
+                # trust the AI reviewer's discovery_pending classification directly.
+                or job_status != STARTER_MAX_STATUS
+                # Starter users: apply the safety gate before posting to pending_review.
+                or safe_borderline_for_waiting_approval(
+                    reason,
+                    risk_flags,
+                    recommended_grade,
+                    search_contract=search_contract,
+                    automation=automation,
+                    user_profile=user_profile,
+                )
             )
         )
 
         if allow_normal_post or allow_discovery_pending:
-            stored_status = DISCOVERY_PENDING_STATUS if allow_discovery_pending else job_status
+            stored_status = DISCOVERY_PENDING_STATUS if (allow_discovery_pending or minimum_viable_mode) else job_status
             stored_decision = decision
             approved_job = {
                 "job_url": job["job_url"],
@@ -4139,33 +4244,8 @@ def save_strategy_report(user_profile, report):
 
 
 def print_strategy_report(report, path=None):
-    print("\n\n============================================================")
-    print("INTERNAL STRATEGY REPORT")
-    print("============================================================")
-    if path:
-        print(f"Saved strategy report: {path}")
-
-    print(f"\nTitle: {report.get('report_title')}")
-    print(f"Candidate: {report.get('candidate_name')} — {report.get('candidate_email')}")
-    print(f"\nSummary:\n{report.get('summary')}")
-
-    print("\nWhy the run is under target:")
-    for item in report.get("why_under_target", []):
-        print(f"• {item}")
-
-    print("\nRecommended relaxations:")
-    for item in report.get("recommended_relaxations", []):
-        print(f"• {item}")
-
-    print("\nNew search strategy:")
-    for item in report.get("new_search_strategy", []):
-        print(f"• {item}")
-
-    print("\nOperator notes:")
-    for item in report.get("operator_notes", []):
-        print(f"• {item}")
-
-    print("============================================================")
+    label = path or "strategy report"
+    print(f"Strategy report saved: {label}")
 
 
 
@@ -4398,15 +4478,7 @@ def maybe_create_strategy_pivot(
         )
         search_contract_path_saved = save_search_contract(user_profile, updated_search_contract)
 
-        print("\nADAPTIVE SEARCH STRATEGY CREATED")
-        print(f"Pivot stage: {pivot_stage}")
-        print(f"Saved adaptation: {adaptation_path}")
-        print(f"Saved updated search contract: {search_contract_path_saved}")
-        print(json.dumps({
-            "changed_rules": adaptation.get("changed_rules", []),
-            "preserved_hard_rules": adaptation.get("preserved_hard_rules", []),
-            "next_batch_strategy": adaptation.get("next_batch_strategy", []),
-        }, indent=2))
+        print(f"Strategy pivot [{pivot_stage}]: adaptation saved → {adaptation_path}")
 
         return {
             "pivot_stage": pivot_stage,
@@ -4815,6 +4887,358 @@ def mark_shared_inventory_job_bad(job, reason):
         DAILY_BAD_INVENTORY_COMPANY_TITLES.add(ct)
 
 
+# ============================================================
+# HIRING.CAFE APIFY INTEGRATION
+# ============================================================
+
+def _strip_html(html):
+    """Strip HTML tags and entities to plain text, capped for prompt size."""
+    if not html:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", str(html))
+    text = re.sub(r"&[a-z]{2,6};", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:3000]
+
+
+def _parse_hiring_cafe_job(raw_item):
+    """Map one raw Hiring.cafe API item to the internal job dict format.
+    Returns None for expired or malformed records."""
+    if not isinstance(raw_item, dict):
+        return None
+    if raw_item.get("is_expired"):
+        return None
+
+    apply_url = raw_item.get("apply_url", "").strip()
+    if not apply_url:
+        return None
+    # JazzHR and some other ATS providers return http:// URLs; upgrade to https://
+    # since HC only returns direct ATS apply pages, which universally support HTTPS.
+    if apply_url.startswith("http://"):
+        apply_url = "https://" + apply_url[7:]
+
+    v5 = raw_item.get("v5_processed_job_data") or {}
+    job_info = raw_item.get("job_information") or {}
+    enriched = raw_item.get("enriched_company_data") or {}
+
+    title = (v5.get("core_job_title") or job_info.get("title") or "").strip()
+    # enriched_company_data.name is more reliable than v5.company_name (v5 sometimes
+    # misidentifies the company, e.g. "Overview" instead of "Central Health").
+    company = (enriched.get("name") or v5.get("company_name") or "").strip()
+    if not title or not company:
+        return None
+
+    # Build description from clean structured summary first, then raw HTML.
+    # Many ATS pages (hrmdirect, icims) bury the job content after heavy UI
+    # boilerplate — the raw stripped text would exhaust the 3000-char limit on
+    # nav/share widgets before reaching the actual role description.
+    requirements_summary = (v5.get("requirements_summary") or "").strip()
+    description_html = job_info.get("description") or ""
+    description_raw = _strip_html(description_html)
+    if requirements_summary:
+        description = (requirements_summary + "\n\n" + description_raw[:800]).strip()
+    else:
+        description = description_raw
+    description = description[:3000]
+    location = (v5.get("formatted_workplace_location") or "").strip()
+    workplace_type = (v5.get("workplace_type") or "").strip()
+    source_tag = raw_item.get("source", "")
+    board = raw_item.get("board_token", "")
+
+    # Salary range for the AI review prompt context.
+    sal_min = v5.get("yearly_min_compensation")
+    sal_max = v5.get("yearly_max_compensation")
+    salary_note = ""
+    if sal_min and sal_max:
+        salary_note = f"${int(sal_min):,}–${int(sal_max):,}/yr"
+    elif sal_min:
+        salary_note = f"from ${int(sal_min):,}/yr"
+
+    return {
+        "job_url": apply_url,
+        "title": title,
+        "company": company,
+        "description": description + (f"\n\nSalary: {salary_note}" if salary_note else ""),
+        "location": location,
+        "source": f"hiring_cafe/{source_tag}/{board}"[:120],
+        "grade": 70,                         # placeholder; scored locally below
+        "_hc_workplace_type": workplace_type,
+        "_hc_object_id": raw_item.get("objectID", ""),
+    }
+
+
+def _build_hc_query(automation, search_contract, user_profile):
+    """Extract keyword, location, and workplace_type for the Apify HC actor."""
+    titles = extract_automation_job_titles(automation, limit=5)
+    keyword = titles[0] if titles else ""
+    if not keyword:
+        keyword = str((search_contract or {}).get("search_queries", [""])[0])[:80]
+
+    # Derive workplace_type from the location/remote policy.
+    policy = candidate_location_policy(user_profile, automation, search_contract)
+    if policy.get("worldwide") or policy.get("remote_allowed"):
+        workplace_type = "Remote"
+    else:
+        workplace_type = "Any"
+
+    # Build a location string: if no strong region, leave blank so HC searches globally.
+    allowed_regions = policy.get("allowed_regions", [])
+    location = ""
+    if "us" in allowed_regions:
+        location = "United States"
+    elif "uk" in allowed_regions:
+        location = "United Kingdom"
+    elif "eu" in allowed_regions:
+        location = "Europe"
+    # Otherwise blank = no geo filter on HC side (let our own policy filter do it).
+
+    return keyword, location, workplace_type
+
+
+def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, limit=None):
+    """Fetch and locally-score Hiring.cafe candidates for one user via Apify.
+
+    Returns a list of job dicts ready for the standard static/remote/AI review
+    pipeline.  Called once per user before the batch loop; results are consumed
+    batch-by-batch so OpenAI search only fires when the pool is exhausted.
+    """
+    if not ENABLE_HIRING_CAFE_PREFETCH:
+        return []
+
+    limit = limit or HIRING_CAFE_MAX_ITEMS
+    keyword, location, workplace_type = _build_hc_query(automation, search_contract, user_profile)
+
+    if not keyword:
+        print("Hiring.cafe: no keyword extracted — skipping prefetch")
+        return []
+
+    print(f"\nHiring.cafe prefetch  keyword={keyword!r}  location={location!r}  type={workplace_type}")
+
+    try:
+        actor_input = {"keyword": keyword, "workplaceType": workplace_type, "maxItems": limit}
+        if location:
+            actor_input["location"] = location
+
+        resp = requests.post(
+            f"https://api.apify.com/v2/acts/{APIFY_HIRING_CAFE_ACTOR_ID}/run-sync-get-dataset-items",
+            params={"token": APIFY_API_TOKEN},
+            json=actor_input,
+            timeout=180,
+        )
+        resp.raise_for_status()
+        raw_items = resp.json()
+    except Exception as e:
+        print(f"Hiring.cafe API error: {e}")
+        return []
+
+    if not isinstance(raw_items, list):
+        print(f"Hiring.cafe: unexpected response type {type(raw_items).__name__}")
+        return []
+
+    print(f"Hiring.cafe: {len(raw_items)} raw results received")
+
+    # Parse → dedup by (company, title) → filter seen/blocked → score → sort.
+    avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
+    blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
+
+    # HC often returns the same job from multiple ATS boards (same company + title,
+    # different URL subdomain). Deduplicate before scoring to avoid wasting batch slots.
+    seen_co_title = set()
+    deduped = []
+    for raw in raw_items:
+        job = _parse_hiring_cafe_job(raw)
+        if not job:
+            continue
+        co = re.sub(r"\s+", " ", job["company"].strip().lower())
+        ti = re.sub(r"\s+", " ", job["title"].strip().lower())
+        if (co, ti) in seen_co_title:
+            continue
+        seen_co_title.add((co, ti))
+        deduped.append(job)
+
+    parsed = []
+    for job in deduped:
+        norm = normalize_url(job["job_url"])
+        if norm and norm in avoid_norm:
+            continue
+        co_key = re.sub(r"\s+", " ", job["company"].strip().lower())
+        if co_key and co_key in blocked_cos:
+            continue
+        score = local_inventory_match_score(
+            job,
+            automation=automation,
+            search_contract=search_contract,
+            user_profile=user_profile,
+        )
+        if score < HIRING_CAFE_LOCAL_SCORE_MIN:
+            continue
+        job["grade"] = max(job["grade"], score)
+        job["inventory_local_score"] = score
+        parsed.append((score, job))
+
+    parsed.sort(key=lambda x: x[0], reverse=True)
+    results = [j for _, j in parsed]
+
+    print(f"Hiring.cafe: {len(results)} jobs after local scoring (min score {HIRING_CAFE_LOCAL_SCORE_MIN})")
+    return results
+
+
+def _parse_jobo_ats_job(raw_item):
+    """Map one raw jobo.world ATS Jobs API item to the internal job dict format."""
+    if not isinstance(raw_item, dict):
+        return None
+    apply_url = (raw_item.get("apply_url") or "").strip()
+    if not apply_url:
+        return None
+    title = (raw_item.get("title") or "").strip()
+    company = ((raw_item.get("company") or {}).get("name") or "").strip()
+    if not title or not company:
+        return None
+    summary = (raw_item.get("summary") or "").strip()
+    description_raw = (raw_item.get("description") or "").strip()
+    if summary:
+        description = (summary + "\n\n" + description_raw[:800]).strip()
+    else:
+        description = description_raw
+    description = description[:3000]
+    locations = raw_item.get("locations") or []
+    location = ""
+    if locations:
+        loc = locations[0]
+        parts = [loc.get("city"), loc.get("region"), loc.get("country")]
+        location = ", ".join(p for p in parts if p)
+    workplace_type = (raw_item.get("workplace_type") or "").strip()
+    comp = raw_item.get("compensation") or {}
+    sal_min = comp.get("min")
+    sal_max = comp.get("max")
+    period = (comp.get("period") or "").lower()
+    multiplier = {"yearly": 1, "monthly": 12, "weekly": 52, "hourly": 2080}.get(period, 1)
+    if sal_min:
+        sal_min = int(sal_min * multiplier)
+    if sal_max:
+        sal_max = int(sal_max * multiplier)
+    salary_note = ""
+    if sal_min and sal_max:
+        salary_note = f"${sal_min:,}–${sal_max:,}/yr"
+    elif sal_min:
+        salary_note = f"from ${sal_min:,}/yr"
+    elif sal_max:
+        salary_note = f"up to ${sal_max:,}/yr"
+    source_ats = raw_item.get("source", "")
+    return {
+        "job_url": apply_url,
+        "title": title,
+        "company": company,
+        "description": description + (f"\n\nSalary: {salary_note}" if salary_note else ""),
+        "location": location,
+        "source": f"jobo_ats/{source_ats}"[:120],
+        "grade": 70,
+        "_hc_workplace_type": workplace_type,
+        "_hc_object_id": raw_item.get("id", ""),
+    }
+
+
+def _extract_salary_floor_for_jobo(search_contract):
+    """Parse the user's annual USD salary minimum from their search contract text.
+
+    Returns an int (e.g. 100000) or None if nothing reliable was found.
+    Conservative: only returns a value when we're clearly confident, so we
+    never accidentally filter out valid jobs at the API level.
+    """
+    sc = search_contract or {}
+    text = " ".join([
+        str(sc.get("salary_hard_rule") or ""),
+        str(sc.get("salary_rules") or ""),
+    ]).replace(",", "")
+    amounts = []
+    for m in re.finditer(r'(?:[$€£]|usd|eur|gbp)?\s*(\d{2,3})k\b|\b(\d{5,6})\b', text, re.IGNORECASE):
+        raw = m.group(1) or m.group(2)
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if m.group(1):
+            val *= 1000
+        if 40000 <= val <= 500000:
+            amounts.append(val)
+    if not amounts:
+        return None
+    floor = min(amounts)
+    return floor if floor >= 40000 else None
+
+
+def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, limit=None):
+    """Fetch and locally-score jobo.world ATS Jobs API candidates via direct API."""
+    if not ENABLE_JOBO_ATS_PREFETCH:
+        return []
+    limit = limit or JOBO_ATS_MAX_ITEMS
+    keywords = extract_automation_job_titles(automation, limit=3)
+    _, location, workplace_type = _build_hc_query(automation, search_contract, user_profile)
+    if not keywords:
+        print("Jobo ATS: no keywords extracted — skipping prefetch")
+        return []
+    salary_floor = _extract_salary_floor_for_jobo(search_contract)
+    posted_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"\nJobo ATS prefetch  queries={keywords}  location={location!r}  type={workplace_type}"
+          f"  salary_min={salary_floor}  posted_after={posted_after[:10]}")
+    try:
+        body = {
+            "queries": keywords,
+            "work_models": ["remote"] if workplace_type == "Remote" else ["remote", "hybrid", "onsite"],
+            "page_size": limit,
+            "posted_after": posted_after,
+            "include_fields": ["summary", "description"],
+        }
+        if location:
+            body["locations"] = [location]
+        if salary_floor:
+            body["salary_usd"] = {"min": salary_floor}
+        resp = requests.post(
+            f"{JOBO_API_BASE}/api/jobs/search",
+            headers={"X-Api-Key": JOBO_API_KEY, "Content-Type": "application/json"},
+            json=body,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        raw_items = resp.json().get("jobs", [])
+    except Exception as e:
+        print(f"Jobo ATS API error: {e}")
+        return []
+    print(f"Jobo ATS: {len(raw_items)} raw results received")
+    avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
+    blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
+    seen_co_title = set()
+    parsed = []
+    for raw in raw_items:
+        job = _parse_jobo_ats_job(raw)
+        if not job:
+            continue
+        co = re.sub(r"\s+", " ", job["company"].strip().lower())
+        ti = re.sub(r"\s+", " ", job["title"].strip().lower())
+        if (co, ti) in seen_co_title:
+            continue
+        seen_co_title.add((co, ti))
+        norm = normalize_url(job["job_url"])
+        if norm and norm in avoid_norm:
+            continue
+        if co and co in blocked_cos:
+            continue
+        score = local_inventory_match_score(
+            job,
+            automation=automation,
+            search_contract=search_contract,
+            user_profile=user_profile,
+        )
+        if score < JOBO_LOCAL_SCORE_MIN:
+            continue
+        job["grade"] = max(job["grade"], score)
+        job["inventory_local_score"] = score
+        parsed.append((score, job))
+    parsed.sort(key=lambda x: x[0], reverse=True)
+    results = [j for _, j in parsed]
+    print(f"Jobo ATS: {len(results)} jobs after local scoring (min score {JOBO_LOCAL_SCORE_MIN})")
+    return results
+
+
 def get_inventory_candidates_for_user(user_profile, automation, persona, search_contract, avoid_urls, limit=INVENTORY_CANDIDATES_PER_USER):
     if not DAILY_PREFETCH_INVENTORY:
         return []
@@ -4885,6 +5309,7 @@ def find_jobs_for_user(
     max_batches_for_round=FIRST_ROUND_BATCHES,
     round_mode="first_round",
     previous_result=None,
+    minimum_viable_mode=False,
 ):
     uid = user.get("uid")
     email = user.get("email")
@@ -4983,10 +5408,7 @@ def find_jobs_for_user(
     cv_text = cv_to_text(user_profile)
     persona = get_or_create_persona(user_profile, automation, cv_text)
 
-    print_persona(persona)
-
     search_contract = get_or_create_search_contract(user_profile, automation, cv_text, persona)
-    print_search_contract(search_contract)
 
     existing_urls, existing_company_titles = existing_duplicate_sets(existing_jobs)
 
@@ -5029,6 +5451,7 @@ def find_jobs_for_user(
     # Company names whose every URL attempt 404'd/expired/hallucinated this run.
     # Carried forward from Round 1 so Round 2 doesn't retry the same dead companies.
     rejected_companies = set(previous_result.get("rejected_companies", []))
+    rejected_companies.update(PERMANENTLY_BLOCKED_COMPANIES)
     # All company names seen across all batches this round (for prompt diversity hint).
     seen_companies_round = set(previous_result.get("seen_companies_round", []))
 
@@ -5075,6 +5498,29 @@ def find_jobs_for_user(
         )
         apply_pivot(second_pivot)
 
+    # Pre-fetch candidates once per user before the batch loop.
+    # HC and Jobo ATS are merged into one pool; OpenAI fires only when pool empties.
+    hc_inventory = []
+    if ENABLE_HIRING_CAFE_PREFETCH and round_mode in ("first_round", "second_round"):
+        hc_inventory = fetch_hiring_cafe_for_user(
+            automation=automation,
+            search_contract=search_contract,
+            user_profile=user_profile,
+            avoid_urls=avoid_urls,
+            rejected_companies=rejected_companies,
+        )
+    if ENABLE_JOBO_ATS_PREFETCH and round_mode in ("first_round", "second_round", "minimum_viable"):
+        jobo_jobs = fetch_jobo_ats_for_user(
+            automation=automation,
+            search_contract=search_contract,
+            user_profile=user_profile,
+            avoid_urls=avoid_urls,
+            rejected_companies=rejected_companies,
+        )
+        if jobo_jobs:
+            hc_inventory = hc_inventory + jobo_jobs
+            print(f"Pre-fetch pool: {len(hc_inventory)} total jobs in pre-fetch pool (HC + Jobo ATS)")
+
     for batch_number in range(1, max_batches_for_round + 1):
         current_total_estimate = pending_today_before + len(posted_jobs_this_round)
 
@@ -5085,14 +5531,37 @@ def find_jobs_for_user(
         ats_only_mode = should_use_ats_only_mode(round_mode, batch_number)
         batch_phase_text = get_batch_phase_text(round_mode, batch_number)
 
-        print("\n------------------------------------------------------------")
-        print(f"BATCH {batch_number}/{max_batches_for_round} for {email}")
-        print(f"Round mode: {round_mode}")
-        print(f"Posted jobs so far this round: {len(posted_jobs_this_round)}")
-        print(f"Estimated pending today total: {current_total_estimate}")
-        print(f"Still needed: {still_needed}")
-        print(f"ATS-only emergency mode: {ats_only_mode}")
-        print("------------------------------------------------------------")
+        # Per-batch funnel counters — reset each iteration.
+        batch_returned = 0
+        batch_static_pass = 0
+        batch_remote_pass = 0
+        batch_approved = 0
+        batch_remote_fail_types = []
+
+        filled = min(current_total_estimate, TARGET_JOBS_PER_USER)
+        bar = "█" * filled + "░" * (TARGET_JOBS_PER_USER - filled)
+        last_fb = failed_batch_feedback[-1] if failed_batch_feedback else None
+
+        print("\n============================================================")
+        print(f"BATCH {batch_number}/{max_batches_for_round}  ·  {round_mode}  ·  {email}")
+        print(f"Progress: [{bar}] {current_total_estimate}/{TARGET_JOBS_PER_USER}  (need {still_needed} more)")
+        if last_fb:
+            fb_stats = last_fb.get("stats", {})
+            if fb_stats:
+                print(
+                    f"Prev:  {fb_stats.get('returned','?')} returned"
+                    f" → {fb_stats.get('static_pass','?')} static"
+                    f" → {fb_stats.get('remote_pass','?')} remote"
+                    f" → {fb_stats.get('approved','?')} approved"
+                    f"  [{last_fb.get('reason','')}]"
+                )
+            else:
+                print(f"Prev:  [{last_fb.get('reason','')}]  {(last_fb.get('message') or '')[:90]}")
+        if ats_only_mode:
+            print("Mode:  ATS-ONLY EMERGENCY")
+        if minimum_viable_mode:
+            print("Mode:  MINIMUM VIABLE FALLBACK (grade≥58 conf≥55)")
+        print("============================================================")
 
         rejected_notes = [
             {
@@ -5109,70 +5578,82 @@ def find_jobs_for_user(
             for item in rejected_jobs[-200:]
         ]
 
-        try:
-            result = ask_openai_for_jobs(
-                user_profile=user_profile,
-                automation=automation,
-                cv_text=cv_text,
-                persona=persona,
-                search_contract=search_contract,
-                batch_number=batch_number,
-                avoid_urls=avoid_urls,
-                rejected_notes=rejected_notes,
-                rejected_domains=rejected_domains,
-                failed_batch_feedback=failed_batch_feedback,
-                jobs_needed=still_needed,
-                ats_only_mode=ats_only_mode,
-                strategy_prompt_patch=strategy_prompt_patch,
-                max_batches_for_round=max_batches_for_round,
-                round_mode=round_mode,
-                batch_phase_text=batch_phase_text,
-                user_plan=user_plan,
-                job_status=job_status,
-                plan_rejected_learning=plan_rejected_learning,
-                link_failure_notes=build_link_failure_notes(rejected_jobs, limit=80),
-                rejected_companies=rejected_companies,
-                seen_companies_round=seen_companies_round,
-            )
-        except Exception as e:
-            print(f"OpenAI search error for {email}: {e}")
-            failed_batch_feedback.append({
-                "batch": batch_number,
-                "reason": "openai_search_error",
-                "message": str(e)[:300],
-                "round_mode": round_mode,
-            })
-            consecutive_zero_approval_batches += 1
-            continue
+        # --- SOURCE JOBS: Hiring.cafe first, OpenAI as fallback ---
+        if hc_inventory:
+            # Consume next slice of pre-fetched HC candidates.
+            jobs = hc_inventory[:HIRING_CAFE_BATCH_SIZE]
+            hc_inventory = hc_inventory[HIRING_CAFE_BATCH_SIZE:]
+            batch_source = "hiring_cafe"
+            print(f"Hiring.cafe: {len(jobs)} jobs  ({len(hc_inventory)} remaining in pool)")
+        else:
+            # HC pool exhausted (or disabled) — fall back to OpenAI web search.
+            batch_source = "openai_search"
+            try:
+                result = ask_openai_for_jobs(
+                    user_profile=user_profile,
+                    automation=automation,
+                    cv_text=cv_text,
+                    persona=persona,
+                    search_contract=search_contract,
+                    batch_number=batch_number,
+                    avoid_urls=avoid_urls,
+                    rejected_notes=rejected_notes,
+                    rejected_domains=rejected_domains,
+                    failed_batch_feedback=failed_batch_feedback,
+                    jobs_needed=still_needed,
+                    ats_only_mode=ats_only_mode,
+                    strategy_prompt_patch=strategy_prompt_patch,
+                    max_batches_for_round=max_batches_for_round,
+                    round_mode=round_mode,
+                    batch_phase_text=batch_phase_text,
+                    user_plan=user_plan,
+                    job_status=job_status,
+                    plan_rejected_learning=plan_rejected_learning,
+                    link_failure_notes=build_link_failure_notes(rejected_jobs, limit=80),
+                    rejected_companies=rejected_companies,
+                    seen_companies_round=seen_companies_round,
+                )
+            except Exception as e:
+                print(f"OpenAI search error for {email}: {e}")
+                failed_batch_feedback.append({
+                    "batch": batch_number,
+                    "reason": "openai_search_error",
+                    "message": str(e)[:300],
+                    "round_mode": round_mode,
+                    "stats": {"returned": 0, "static_pass": 0, "remote_pass": 0, "approved": 0},
+                })
+                consecutive_zero_approval_batches += 1
+                continue
 
-        jobs = result.get("jobs", [])
+            jobs = result.get("jobs", [])
 
-        # Quota-mode boost: before relying only on this user's web-search batch,
-        # inject the best same-day jobs found by automation-title cluster prefetch.
-        # These are still fully static/remote/review validated below before posting.
-        if ENABLE_QUOTA_MODE and ENABLE_SHARED_DAILY_INVENTORY:
-            inventory_candidates = get_inventory_candidates_for_user(
-                user_profile=user_profile,
-                automation=automation,
-                persona=persona,
-                search_contract=search_contract,
-                avoid_urls=avoid_urls,
-                limit=INVENTORY_CANDIDATES_PER_USER if batch_number == 1 else max(8, INVENTORY_CANDIDATES_PER_USER // 3),
-            )
-            if inventory_candidates:
-                print(f"Shared daily inventory candidates injected: {len(inventory_candidates)}")
-                jobs = merge_jobs_dedup(inventory_candidates, jobs)
+            if ENABLE_QUOTA_MODE and ENABLE_SHARED_DAILY_INVENTORY:
+                inventory_candidates = get_inventory_candidates_for_user(
+                    user_profile=user_profile,
+                    automation=automation,
+                    persona=persona,
+                    search_contract=search_contract,
+                    avoid_urls=avoid_urls,
+                    limit=INVENTORY_CANDIDATES_PER_USER if batch_number == 1 else max(8, INVENTORY_CANDIDATES_PER_USER // 3),
+                )
+                if inventory_candidates:
+                    print(f"Shared daily inventory candidates injected: {len(inventory_candidates)}")
+                    jobs = merge_jobs_dedup(inventory_candidates, jobs)
 
-        print(f"OpenAI returned/inventory-merged jobs: {len(jobs)}")
-        round_metrics["openai_jobs_returned"] += len(jobs)
-        round_metrics["static_candidates"] += len(jobs)
+        batch_returned = len(jobs)
+        print(f"Source [{batch_source}]  jobs in batch: {batch_returned}")
+        round_metrics["openai_jobs_returned"] += batch_returned
+        round_metrics["static_candidates"] += batch_returned
 
         if not jobs:
+            zero_reason = "hc_returned_zero_candidates" if batch_source == "hiring_cafe" else "openai_returned_zero_jobs"
             failed_batch_feedback.append({
                 "batch": batch_number,
-                "reason": "openai_returned_zero_jobs",
-                "message": "Next batch must search direct ATS/company URLs and return valid job posts.",
+                "reason": zero_reason,
+                "message": "No candidates from this source for this batch.",
                 "round_mode": round_mode,
+                "source": batch_source,
+                "stats": {"returned": 0, "static_pass": 0, "remote_pass": 0, "approved": 0},
             })
             consecutive_zero_approval_batches += 1
             continue
@@ -5278,20 +5759,23 @@ def find_jobs_for_user(
                     maybe_track_rejected_domain(job, reason, rejected_domains)
                     print_skip(job, "STATIC", reason)
 
-        print(f"Static passed: {len(static_pass_jobs)}")
-        round_metrics["static_pass_count"] += len(static_pass_jobs)
+        batch_static_pass = len(static_pass_jobs)
+        print(f"Static passed: {batch_static_pass}")
+        round_metrics["static_pass_count"] += batch_static_pass
 
         if not static_pass_jobs:
             failed_batch_feedback.append({
                 "batch": batch_number,
                 "reason": "all_jobs_failed_static_validation",
                 "message": (
-                    "All returned jobs failed static validation. "
+                    f"All {batch_returned} returned jobs failed static URL validation — "
+                    "wrong domain pattern, aggregator, generic page, or dupe. "
                     "Next batch must use only direct ATS/company job URLs with real job IDs. "
                     "Avoid rejected domains and aggregator/mirror sources."
                 ),
                 "rejected_domains": sorted(rejected_domains)[-50:],
                 "round_mode": round_mode,
+                "stats": {"returned": batch_returned, "static_pass": 0, "remote_pass": 0, "approved": 0},
             })
             print("No jobs passed static check. Trying next batch.")
             consecutive_zero_approval_batches += 1
@@ -5316,10 +5800,12 @@ def find_jobs_for_user(
                 "batch": batch_number,
                 "reason": "all_jobs_failed_cheap_pre_review",
                 "message": (
-                    "All static-passed jobs were obvious function/location/seniority misses. "
-                    "Next batch should search closer title/function/location matches before remote validation."
+                    f"{batch_returned} returned, {batch_static_pass} passed static URL check, "
+                    "but all were obvious function/location/seniority misses before remote validation. "
+                    "Next batch should search closer title/function/location matches."
                 ),
                 "round_mode": round_mode,
+                "stats": {"returned": batch_returned, "static_pass": batch_static_pass, "remote_pass": 0, "approved": 0},
             })
             print("No jobs survived cheap pre-review. Trying next batch.")
             consecutive_zero_approval_batches += 1
@@ -5435,6 +5921,7 @@ def find_jobs_for_user(
                         # Mark the company as dead so the model never retries it.
                         company_norm = re.sub(r"\s+", " ", str(job.get("company", "")).strip().lower())
                         fail_type = str(reason).split(":")[0]
+                        batch_remote_fail_types.append(fail_type)
                         if company_norm and fail_type in {
                             "404_not_found", "soft_404_or_not_found", "expired",
                             "dead_job_url_pattern", "wrong_job",
@@ -5463,21 +5950,26 @@ def find_jobs_for_user(
                 print(f"  Grade: {candidate_job['grade']}")
                 print(f"  URL: {candidate_job['job_url']}")
 
-        print(f"\nLive jobs ready for review after batch {batch_number}: {len(live_jobs_for_review)}")
-        round_metrics["live_jobs_count"] += len(live_jobs_for_review)
-        round_metrics["ai_reviewed_count"] += len(live_jobs_for_review)
+        batch_remote_pass = len(live_jobs_for_review)
+        print(f"\nLive jobs ready for review after batch {batch_number}: {batch_remote_pass}")
+        round_metrics["live_jobs_count"] += batch_remote_pass
+        round_metrics["ai_reviewed_count"] += batch_remote_pass
 
         if not live_jobs_for_review:
+            remote_fail_summary = dict(Counter(batch_remote_fail_types).most_common(5))
             failed_batch_feedback.append({
                 "batch": batch_number,
                 "reason": "all_jobs_failed_remote_validation",
                 "message": (
-                    "Static passed jobs failed remote validation. "
-                    "Next batch should avoid blocked, expired, and homepage URLs. "
-                    "Use direct ATS job posts with visible job IDs."
+                    f"{batch_returned} returned, {batch_static_pass} passed static, "
+                    f"0 survived HTTP check. Failure types: {remote_fail_summary}. "
+                    "These URLs are expired, 404'd, or blocked. "
+                    "Next batch must use fresh ATS job IDs — avoid boards, aggregators, and career pages without specific job IDs."
                 ),
+                "remote_fail_types": remote_fail_summary,
                 "rejected_domains": sorted(rejected_domains)[-50:],
                 "round_mode": round_mode,
+                "stats": {"returned": batch_returned, "static_pass": batch_static_pass, "remote_pass": 0, "approved": 0},
             })
             print("No live jobs to review this batch. Trying next batch.")
             consecutive_zero_approval_batches += 1
@@ -5491,6 +5983,7 @@ def find_jobs_for_user(
             jobs=live_jobs_for_review,
             job_status=job_status,
             search_contract=search_contract,
+            minimum_viable_mode=minimum_viable_mode,
         )
 
         review_rejected_jobs_this_round.extend(review_rejected_jobs)
@@ -5536,34 +6029,59 @@ def find_jobs_for_user(
                     "reason": "post_failed",
                     "message": str(e)[:300],
                     "round_mode": round_mode,
+                    "stats": {"returned": batch_returned, "static_pass": batch_static_pass, "remote_pass": batch_remote_pass, "approved": 0},
                 })
         else:
+            decision_counts = dict(Counter(j.get("review_decision", "unknown") for j in review_rejected_jobs).most_common(5))
+            grades = [j.get("grade", 0) for j in review_rejected_jobs if j.get("grade")]
+            avg_grade = round(sum(grades) / len(grades)) if grades else 0
             failed_batch_feedback.append({
                 "batch": batch_number,
                 "reason": "all_jobs_failed_ai_review",
                 "message": (
-                    "All live jobs failed AI quality review. "
-                    "Next batch should improve match quality, salary/location fit, and role alignment."
+                    f"{batch_returned} returned, {batch_static_pass} static, {batch_remote_pass} remote, "
+                    f"all {len(review_rejected_jobs)} failed AI review (avg grade {avg_grade}). "
+                    f"Decision breakdown: {decision_counts}. "
+                    "Improve title/function/location fit and role alignment in next batch."
                 ),
+                "review_decision_counts": decision_counts,
+                "avg_review_grade": avg_grade,
                 "round_mode": round_mode,
+                "stats": {"returned": batch_returned, "static_pass": batch_static_pass, "remote_pass": batch_remote_pass, "approved": 0},
             })
             print("\nNo jobs passed AI review in this batch. Nothing posted.")
 
-        if approved_this_batch_count > 0:
+        batch_approved = approved_this_batch_count
+        if batch_approved > 0:
             consecutive_zero_approval_batches = 0
+            failed_batch_feedback.append({
+                "batch": batch_number,
+                "reason": "batch_succeeded",
+                "message": f"Approved and posted {batch_approved} jobs.",
+                "round_mode": round_mode,
+                "stats": {"returned": batch_returned, "static_pass": batch_static_pass, "remote_pass": batch_remote_pass, "approved": batch_approved},
+            })
         else:
             consecutive_zero_approval_batches += 1
 
-        print("\nUSER BATCH SUMMARY:")
-        print(f"User: {email}")
-        print(f"Round mode: {round_mode}")
-        print(f"Batch: {batch_number}/{max_batches_for_round}")
-        print(f"Approved and posted this batch: {len(approved_jobs)}")
-        print(f"Rejected by AI review this batch: {len(review_rejected_jobs)}")
-        print(f"Rejected domains tracked: {len(rejected_domains)}")
-        print(f"Consecutive zero-approval batches: {consecutive_zero_approval_batches}")
-        print(f"Posted jobs this round so far: {len(posted_jobs_this_round)}")
-        print(f"Estimated pending today after batch: {pending_today_before + len(posted_jobs_this_round)}")
+        total_after_batch = pending_today_before + len(posted_jobs_this_round)
+        batches_left = max_batches_for_round - batch_number
+        print(
+            f"\nBATCH {batch_number} FUNNEL:  "
+            f"{batch_returned} returned"
+            f" → {batch_static_pass} static"
+            f" → {batch_remote_pass} remote"
+            f" → {len(review_rejected_jobs)} AI rejected"
+            f" → {batch_approved} posted"
+        )
+        outcome = f"✓{batch_approved}" if batch_approved > 0 else "✗0"
+        print(
+            f"BATCH {batch_number} DONE  [{outcome} posted]  "
+            f"{total_after_batch}/{TARGET_JOBS_PER_USER} jobs  ·  "
+            f"{batches_left} batch(es) left  ·  "
+            f"zeros streak: {consecutive_zero_approval_batches}  ·  "
+            f"dead domains: {len(rejected_domains)}"
+        )
 
         if pending_today_before + len(posted_jobs_this_round) < TARGET_JOBS_PER_USER:
             time.sleep(1)
@@ -5571,7 +6089,10 @@ def find_jobs_for_user(
     pending_today_after_estimate = pending_today_before + len(posted_jobs_this_round)
     needs_more = pending_today_after_estimate < TARGET_JOBS_PER_USER
 
-    if round_mode == "first_round" and needs_more:
+    # Only pivot when the round genuinely struggled (≥2 zero-approval batches).
+    # Avoids 2 wasted AI calls when Round 1 simply ran out of time/batches.
+    round_had_enough_failures = consecutive_zero_approval_batches >= 2 or not posted_jobs_this_round
+    if round_mode == "first_round" and needs_more and round_had_enough_failures:
         first_pivot = maybe_create_strategy_pivot(
             user_profile=user_profile,
             automation=automation,
@@ -5596,17 +6117,25 @@ def find_jobs_for_user(
         title="FINAL JOBS POSTED FOR THIS USER THIS ROUND",
     )
 
-    print("\nUSER ROUND SUMMARY:")
-    print(f"User: {email}")
-    print(f"Round mode: {round_mode}")
-    print(f"Detected plan: {user_plan}")
-    print(f"Post status: {job_status}")
-    print(f"Pending today before: {pending_today_before}")
-    print(f"Added this round: {len(posted_jobs_this_round)}")
-    print(f"Estimated pending today after: {pending_today_after_estimate}")
-    print(f"Rejected by AI review this round: {len(review_rejected_jobs_this_round)}")
-    print(f"Round metrics: {json.dumps(round_metrics, indent=2)}")
-    print(f"Needs more: {needs_more}")
+    print("\n============================================================")
+    print(f"ROUND {round_number} COMPLETE  ·  {email}")
+    print(
+        f"Before: {pending_today_before}  +added: {len(posted_jobs_this_round)}"
+        f"  =after: {pending_today_after_estimate}/{TARGET_JOBS_PER_USER}"
+        f"  |  needs_more: {needs_more}"
+    )
+    print(
+        f"Funnel:  {round_metrics['openai_jobs_returned']} returned"
+        f" → {round_metrics['static_pass_count']} static"
+        f" → {round_metrics['live_jobs_count']} remote"
+        f" → {round_metrics['review_rejected_count']} AI rejected"
+        f" → {round_metrics['approved_count']} posted"
+    )
+    print(
+        f"Plan: {user_plan}  |  status: {job_status}  |  pivots: {strategy_pivot_count}"
+        f"  |  dead companies: {len(rejected_companies)}  |  dead domains: {len(rejected_domains)}"
+    )
+    print("============================================================")
 
     return {
         "user": user,
@@ -5708,12 +6237,14 @@ def get_eligible_paid_users():
             print("SKIP: missing uid/email")
             continue
 
+        if normalize_selected_email(email) in {normalize_selected_email(e) for e in EXCLUDED_USER_EMAILS}:
+            print(f"SKIP: excluded user — {email}")
+            continue
+
         if not selected_email_matches(email):
-            print("SKIP: not selected email filter")
             continue
 
         if SINGLE_USER_UID and uid != SINGLE_USER_UID:
-            print("SKIP: not selected single-user uid")
             continue
 
         if not is_paid_user(user):
@@ -5753,6 +6284,8 @@ def run_round(
     max_batches_for_round,
     round_mode,
     previous_results_by_uid=None,
+    minimum_viable_mode=False,
+    accumulated_results=None,
 ):
     previous_results_by_uid = previous_results_by_uid or {}
 
@@ -5796,8 +6329,12 @@ def run_round(
                 max_batches_for_round=max_batches_for_round,
                 round_mode=round_mode,
                 previous_result=previous_results_by_uid.get(uid),
+                minimum_viable_mode=minimum_viable_mode,
             )
             round_results.append(result)
+            if accumulated_results is not None:
+                accumulated_results.append(result)
+                save_run_log(accumulated_results)
 
         except Exception as e:
             print(f"FAILED USER {email}: {e}")
@@ -5939,6 +6476,210 @@ def get_second_round_users_from_first_round(users, first_results_by_uid, thresho
 # LOGGING
 # ============================================================
 
+def build_daily_report_payload(result):
+    user_profile = result.get("user_profile") or {}
+    user = result.get("user") or {}
+    email = user_profile.get("email") or user.get("email") or ""
+    name = (
+        user_profile.get("displayName")
+        or user.get("displayName")
+        or email.split("@")[0]
+    )
+
+    jobs_added = result.get("jobs_added") or []
+    metrics = result.get("round_metrics") or {}
+    strategy_pivots = result.get("strategy_pivots") or []
+    strategy_prompt_patch = (result.get("strategy_prompt_patch") or "").strip()
+    failed_batch_feedback = result.get("failed_batch_feedback") or []
+    pending_after = result.get("pending_today_after_estimate", 0)
+    pending_before = result.get("pending_today_before", 0)
+    needs_more = result.get("needs_more", False)
+
+    # --- Jobs list ---
+    jobs = []
+    for job in jobs_added:
+        title_line = job.get("title", "")
+        company = job.get("company", "")
+        full_title = f"{title_line} @ {company}" if company else title_line
+        job_url = job.get("job_url", "")
+        reason = (job.get("review_reason") or "Matched your profile").strip()
+        if job_url:
+            reason = reason + f"\n\n{job_url}"
+        score = job.get("grade") or job.get("review_confidence") or 0
+        jobs.append({
+            "job_title": full_title,
+            "company": company,
+            "url": job_url,
+            "location": job.get("location", ""),
+            "reason": reason,
+            "score": score,
+        })
+
+    # --- Changed rules ---
+    _field_labels = {
+        "allowed_titles": "Job titles",
+        "forbidden_titles": "Excluded titles",
+        "allowed_functions": "Role types",
+        "forbidden_functions": "Excluded roles",
+        "location_hard_rule": "Location",
+        "salary_hard_rule": "Salary",
+        "source_strategy": "Job sources",
+        "hard_reject_rules": "Filters",
+        "seniority_rules": "Seniority",
+        "search_queries": "Search terms",
+        "broadening_plan_if_zero_results": "Broadening plan",
+    }
+    if strategy_pivots:
+        latest = strategy_pivots[-1]
+        adaptation = latest.get("adaptation") or {}
+        changed_list = adaptation.get("changed_rules") or []
+        readable = []
+        for item in changed_list[:5]:
+            if "unchanged" in item.lower():
+                continue
+            humanized = item
+            for key, label in _field_labels.items():
+                if item.lower().startswith(key):
+                    humanized = label + item[len(key):]
+                    break
+            readable.append(f"• {humanized}")
+        changed_rules = "\n".join(readable) if readable else "Search strategy adjusted based on this run's results."
+    else:
+        changed_rules = "No strategy changes this run."
+
+    # --- Next batch strategy ---
+    if strategy_prompt_patch:
+        next_batch_strategy = strategy_prompt_patch[:400]
+    elif failed_batch_feedback:
+        last_good = next(
+            (f for f in reversed(failed_batch_feedback) if f.get("reason") == "batch_succeeded"),
+            None,
+        )
+        if last_good:
+            next_batch_strategy = f"Continuing the approach from the last successful batch: {last_good.get('message', '')}"
+        else:
+            next_batch_strategy = "Broadening search criteria to find more matches."
+    else:
+        next_batch_strategy = "Continuing current search strategy."
+
+    # --- Comments (human-readable run summary) ---
+    approved = metrics.get("approved_count", len(jobs_added))
+    ai_reviewed = metrics.get("ai_reviewed_count", 0)
+    returned = metrics.get("openai_jobs_returned", 0)
+    static_pass = metrics.get("static_pass_count", 0)
+    review_rejected = metrics.get("review_rejected_count", 0)
+
+    new_jobs = pending_after - pending_before
+    if new_jobs > 0:
+        comments = (
+            f"Great news — {new_jobs} new job{'s' if new_jobs != 1 else ''} added to your queue today! "
+            f"We reviewed {ai_reviewed} job{'s' if ai_reviewed != 1 else ''} (from {returned} sourced), "
+            f"with {review_rejected} rejected by AI before reaching your inbox. "
+        )
+    else:
+        comments = (
+            f"No new jobs were added this run. "
+            f"We sourced {returned} jobs, {static_pass} passed initial filters, "
+            f"and {ai_reviewed} were reviewed by AI — none met the bar this time. "
+            f"We're adjusting the strategy for the next run."
+        )
+
+    if needs_more:
+        comments += f" You still need {TARGET_JOBS_PER_USER - pending_after} more job{'s' if TARGET_JOBS_PER_USER - pending_after != 1 else ''} to hit today's target — we'll keep looking."
+
+    uid = user_profile.get("uid") or user.get("uid") or ""
+    app_url = f"https://app.jobbyo.ai/auto-apply/{uid}" if uid else ""
+    to_email = DAILY_REPORT_OVERRIDE_EMAIL or email
+    return {
+        "email": to_email,
+        "name": name,
+        "report": {
+            "jobs": jobs,
+            "changed_rules": changed_rules,
+            "next_batch_strategy": next_batch_strategy,
+            "comments": comments,
+            "app_url": app_url,
+        },
+    }
+
+
+def send_daily_report(result):
+    payload = build_daily_report_payload(result)
+    jobs_count = len(payload["report"]["jobs"])
+    to = payload["email"]
+    try:
+        resp = requests.post(
+            f"{DAILY_REPORT_API_BASE}/api/reports/daily",
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        print(f"Daily report → {to}  ({jobs_count} job{'s' if jobs_count != 1 else ''})  [{resp.status_code}]")
+    except Exception as e:
+        print(f"Daily report send failed ({to}): {e}")
+
+
+def send_slack_run_report(results_by_uid):
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    users = []
+    total_found = 0
+    total_needed = 0
+    manual_search = []
+
+    for uid, r in results_by_uid.items():
+        user_profile = r.get("user_profile") or {}
+        automation = r.get("automation") or {}
+        prefs = automation.get("jobPreferences") or {}
+        name = user_profile.get("displayName") or (r.get("user") or {}).get("displayName") or ""
+        email = user_profile.get("email") or (r.get("user") or {}).get("email") or ""
+        jobs_found = len(r.get("jobs_added") or [])
+        pending = r.get("pending_today_after_estimate", 0)
+        needs_manual = pending < MIN_ACCEPTABLE_JOBS_PER_USER
+        keywords = prefs.get("jobTitles") or []
+        loc = prefs.get("location") or {}
+        location_places = ", ".join(loc.get("places") or [])
+
+        total_found += jobs_found
+        total_needed += max(0, TARGET_JOBS_PER_USER - pending)
+
+        entry = {
+            "uid": uid,
+            "name": name,
+            "email": email,
+            "jobs_found": jobs_found,
+            "jobs_target": TARGET_JOBS_PER_USER,
+            "pending_today": pending,
+            "needs_manual_search": needs_manual,
+            "search_keywords": keywords[:3],
+            "location": location_places,
+        }
+        users.append(entry)
+        if needs_manual:
+            manual_search.append({"name": name, "email": email, "keywords": keywords[:3], "location": location_places})
+
+    payload = {
+        "run_date": run_date,
+        "users": users,
+        "summary": {
+            "total_jobs_found": total_found,
+            "total_jobs_still_needed": total_needed,
+            "users_processed": len(users),
+            "manual_search_needed": manual_search,
+        },
+    }
+
+    try:
+        resp = requests.post(
+            f"{DAILY_REPORT_API_BASE}/api/notifications/slack/daily-run",
+            json=payload,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        print(f"Slack run report sent  ({len(users)} users)  [{resp.status_code}]")
+    except Exception as e:
+        print(f"Slack run report failed: {e}")
+
+
 def save_run_log(all_results):
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     path = RUN_LOG_DIR / f"job_run_{timestamp}.json"
@@ -5961,6 +6702,8 @@ def save_run_log(all_results):
                 "jobs_rejected_by_review": r.get("jobs_rejected_by_review", []),
                 "all_rejected_jobs": r.get("all_rejected_jobs", []),
                 "rejected_domains": r.get("rejected_domains", []),
+                "rejected_companies": r.get("rejected_companies", []),
+                "seen_companies_round": r.get("seen_companies_round", []),
                 "relaxation_strategy_report": r.get("relaxation_strategy_report"),
                 "strategy_pivots": r.get("strategy_pivots", []),
                 "strategy_prompt_patch": r.get("strategy_prompt_patch", ""),
@@ -5978,6 +6721,37 @@ def save_run_log(all_results):
         json.dump(clean_results, f, indent=2)
 
     print(f"\nSaved run log: {path}")
+
+
+def load_previous_run_log():
+    """Find and load the most recent run log to seed cross-run learning."""
+    if not RUN_LOG_DIR.exists():
+        return []
+    log_files = sorted(RUN_LOG_DIR.glob("job_run_*.json"), reverse=True)
+    if not log_files:
+        return []
+    latest = log_files[0]
+    try:
+        with open(latest, encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"\nPrevious run log: {latest.name}  ({len(data)} result(s))")
+        return data
+    except Exception as e:
+        print(f"\nWarning: could not load previous run log {latest.name}: {e}")
+        return []
+
+
+def build_previous_run_results_by_uid(previous_run_data):
+    """Return a per-uid dict keeping the latest round entry per user."""
+    by_uid = {}
+    for entry in (previous_run_data or []):
+        uid = entry.get("uid")
+        if not uid:
+            continue
+        existing = by_uid.get(uid)
+        if existing is None or (entry.get("round_number") or 0) >= (existing.get("round_number") or 0):
+            by_uid[uid] = entry
+    return by_uid
 
 
 # ============================================================
@@ -6139,10 +6913,27 @@ def main():
         print("Check spelling and active automation. Paid status is trusted from /users/paid when TRUST_USERS_PAID_ENDPOINT=True.")
         return
 
-    if ENABLE_AUTOMATION_TITLE_CLUSTER_PREFETCH and users:
+    # Skip the expensive cluster prefetch when targeting a single user —
+    # the shared inventory only pays off across many users.
+    single_user_mode = bool(selected_email_filter_active() or SINGLE_USER_UID)
+    if ENABLE_AUTOMATION_TITLE_CLUSTER_PREFETCH and users and not single_user_mode:
         initialize_daily_cluster_prefetch(users)
 
     all_results = []
+
+    # Load previous run to carry dead companies/domains/feedback into today's Round 1.
+    previous_run_data = load_previous_run_log()
+    previous_run_by_uid = build_previous_run_results_by_uid(previous_run_data)
+
+    if previous_run_by_uid:
+        print(f"Cross-run learning: {len(previous_run_by_uid)} user(s) with prior data")
+        for _uid, r in previous_run_by_uid.items():
+            n_companies = len(r.get("rejected_companies") or [])
+            n_domains = len(r.get("rejected_domains") or [])
+            n_feedback = len(r.get("failed_batch_feedback") or [])
+            print(f"  {r.get('email', '?')}: {n_companies} dead companies, {n_domains} dead domains, {n_feedback} feedback entries")
+    else:
+        print("No previous run log found — starting fresh.")
 
     # Round 1: every eligible user gets quota-mode batches.
     first_round_results = run_round(
@@ -6150,6 +6941,8 @@ def main():
         round_number=1,
         max_batches_for_round=FIRST_ROUND_BATCHES,
         round_mode="first_round",
+        previous_results_by_uid=previous_run_by_uid,
+        accumulated_results=all_results,
     )
     all_results.extend(first_round_results)
     save_run_log(all_results)
@@ -6181,6 +6974,7 @@ def main():
             max_batches_for_round=SECOND_ROUND_BATCHES,
             round_mode="second_round",
             previous_results_by_uid=first_results_by_uid,
+            accumulated_results=all_results,
         )
         all_results.extend(second_round_results)
         save_run_log(all_results)
@@ -6189,6 +6983,64 @@ def main():
             f"\nNo second round needed. No eligible user is below "
             f"{MIN_JOBS_BEFORE_SECOND_ROUND} plan-status/legacy jobs today."
         )
+
+    # Round 3 (minimum viable): only users still below MIN_ACCEPTABLE_JOBS_PER_USER.
+    latest_results_by_uid = {}
+    for r in all_results:
+        uid = (r.get("user_profile") or {}).get("uid") or (r.get("user") or {}).get("uid")
+        if uid:
+            latest_results_by_uid[uid] = r
+
+    minimum_viable_users = [
+        user for user in users
+        if latest_results_by_uid.get(user.get("uid"), {}).get("pending_today_after_estimate", 0) < MIN_ACCEPTABLE_JOBS_PER_USER
+    ]
+
+    if minimum_viable_users:
+        print(f"\nStarting minimum viable round for {len(minimum_viable_users)} users below {MIN_ACCEPTABLE_JOBS_PER_USER} jobs.")
+        minimum_viable_results = run_round(
+            users=minimum_viable_users,
+            round_number=3,
+            max_batches_for_round=MINIMUM_VIABLE_ROUND_BATCHES,
+            round_mode="minimum_viable",
+            previous_results_by_uid=latest_results_by_uid,
+            minimum_viable_mode=True,
+            accumulated_results=all_results,
+        )
+        all_results.extend(minimum_viable_results)
+        save_run_log(all_results)
+    else:
+        print(f"\nNo minimum viable round needed — all users at or above {MIN_ACCEPTABLE_JOBS_PER_USER} jobs.")
+
+    # Send one daily report per user after ALL rounds are complete.
+    # Merge jobs_added across rounds; use the last round's result for metadata.
+    results_by_uid = {}
+    for r in all_results:
+        uid = (r.get("user_profile") or {}).get("uid") or (r.get("user") or {}).get("uid")
+        if not uid:
+            continue
+        if uid not in results_by_uid:
+            results_by_uid[uid] = r.copy()
+            results_by_uid[uid]["jobs_added"] = list(r.get("jobs_added") or [])
+        else:
+            # Merge jobs from later rounds (deduplicate by job_url).
+            existing_urls = {j.get("job_url") for j in results_by_uid[uid]["jobs_added"]}
+            for j in (r.get("jobs_added") or []):
+                if j.get("job_url") not in existing_urls:
+                    results_by_uid[uid]["jobs_added"].append(j)
+                    existing_urls.add(j.get("job_url"))
+            # Keep latest round's metadata (strategy pivots, estimates).
+            for key in ("strategy_pivots", "strategy_prompt_patch", "pending_today_after_estimate",
+                        "needs_more", "round_metrics", "failed_batch_feedback"):
+                if r.get(key) is not None:
+                    results_by_uid[uid][key] = r[key]
+
+    for uid, merged in results_by_uid.items():
+        send_daily_report(merged)
+
+    # Slack team summary — only for full runs, not single-user tests.
+    if not (SINGLE_USER_EMAIL or SINGLE_USER_EMAILS or SINGLE_USER_UID):
+        send_slack_run_report(results_by_uid)
 
     print("\n\n============================================================")
     print("DONE")
