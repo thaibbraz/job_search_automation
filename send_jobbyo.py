@@ -22,7 +22,7 @@ from openai import OpenAI
 BASE_URL = "https://fastapi-service-03-160893319817.europe-southwest1.run.app"
 
 
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 # Fast search model.
 SEARCH_MODEL = os.getenv("JOBBYO_SEARCH_MODEL", "gpt-4.1-mini")
 
@@ -125,7 +125,7 @@ PERMANENTLY_BLOCKED_COMPANIES = {
 # Hiring.cafe Apify integration — primary source before OpenAI fallback.
 # Set JOBBYO_APIFY_TOKEN in .env to enable. Costs ~$0.25/user vs ~$0.70 for
 # 7 OpenAI search batches, and returns direct ATS URLs (Ashby, Greenhouse, etc.)
-APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "apify_api_bNfdKbWVObeGs2XkVHCZZN4mafgnjh0zQUdh")
+APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "")
 APIFY_HIRING_CAFE_ACTOR_ID = "memo23~apify-hiring-cafe-scraper"
 HIRING_CAFE_MAX_ITEMS = 15           # raw results fetched per user from HC
 HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
@@ -133,7 +133,7 @@ HIRING_CAFE_LOCAL_SCORE_MIN = 28     # same floor as INVENTORY_LOCAL_SCORE_MIN
 ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
 
 JOBO_API_BASE = "https://connect.jobo.world"
-JOBO_API_KEY = os.getenv("JOBO_API_KEY", "jbe_live_QXds10kToWih1Hy5Z_3if_H7MEWgf3mr_GagtJwc3Gly29DZPH4knkJROm-0IBxcI")
+JOBO_API_KEY = os.getenv("JOBO_API_KEY", "")
 JOBO_ATS_MAX_ITEMS = 30           # raw results per call (was 15)
 JOBO_LOCAL_SCORE_MIN = 15         # lower than HC — Jobo URLs are ATS-direct; AI review handles fit
 ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)

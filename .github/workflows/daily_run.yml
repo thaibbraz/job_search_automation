@@ -28,3 +28,7 @@ jobs:
 
       - name: Run script
         run: python send_jobbyo.py
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JOBBYO_APIFY_TOKEN: ${{ secrets.JOBBYO_APIFY_TOKEN }}
+          JOBO_API_KEY: ${{ secrets.JOBO_API_KEY }}
