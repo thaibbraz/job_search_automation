@@ -14,6 +14,12 @@ from datetime import datetime, timezone, timedelta
 import requests
 from openai import OpenAI
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed — rely on env vars being set externally (GitHub Actions, shell export)
+
 
 # ============================================================
 # CONFIG
