@@ -12,13 +12,44 @@ from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 import requests
-from openai import OpenAI
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass  # dotenv not installed — rely on env vars being set externally (GitHub Actions, shell export)
+
+
+def env_truthy(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name, default):
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return int(value)
+    except Exception:
+        print(f"WARNING: invalid integer for {name}={value!r}; using {default}")
+        return default
+
+
+# --nogpt is intentionally detected before full CLI parsing so the script can
+# start without OPENAI_API_KEY when OpenAI is disabled. apply_cli_overrides()
+# normalizes the final value and supports env/CLI aliases.
+NO_GPT_MODE = (
+    env_truthy("JOBBYO_NO_GPT")
+    or any(arg in {"--nogpt", "--no-gpt", "--no-openai"} for arg in sys.argv[1:])
+)
 
 
 # ============================================================
@@ -68,6 +99,15 @@ EXCLUDED_USER_EMAILS = {
     "zakin2time@gmail.com",
     "zachkolp.esl.japan@gmail.com",
     "rosejhickman@gmail.com",
+}
+
+# Users whose automation is forced active regardless of its status flag.
+# Trialing users are also force-included automatically (see should_bypass_automation_check).
+FORCE_USER_EMAILS = {
+    "tayaspencercoo@gmail.com",
+    "scxbrian@gmail.com",
+    "maldonadomanny0907@gmail.com",
+    "selahmosby@gmail.com",
 }
 
 # Target new-match jobs per user per day.
@@ -144,6 +184,39 @@ JOBO_ATS_MAX_ITEMS = 30           # raw results per call (was 15)
 JOBO_LOCAL_SCORE_MIN = 15         # lower than HC — Jobo URLs are ATS-direct; AI review handles fit
 ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 
+# No-GPT mode: replace OpenAI search/review with more structured inventory from
+# Jobo ATS + HiringCafe, then use the same static URL, HTTP, duplicate, location,
+# and posting pipeline. Defaults are intentionally higher because Jobbyo has a
+# large monthly Jobo allowance. Override these in .env/GitHub Actions as needed.
+NOGPT_HIRING_CAFE_MAX_ITEMS = env_int("JOBBYO_NOGPT_HIRING_CAFE_MAX_ITEMS", 120)
+NOGPT_HIRING_CAFE_BATCH_SIZE = env_int("JOBBYO_NOGPT_HIRING_CAFE_BATCH_SIZE", 60)
+NOGPT_HIRING_CAFE_KEYWORDS = env_int("JOBBYO_NOGPT_HIRING_CAFE_KEYWORDS", 3)
+NOGPT_JOBO_PAGE_SIZE = env_int("JOBBYO_NOGPT_JOBO_PAGE_SIZE", 100)
+NOGPT_JOBO_KEYWORDS = env_int("JOBBYO_NOGPT_JOBO_KEYWORDS", 8)
+NOGPT_JOBO_MAX_CALLS_PER_USER = env_int("JOBBYO_NOGPT_JOBO_MAX_CALLS_PER_USER", 12)
+NOGPT_JOBO_US_EXTRA_CALLS = env_int("JOBBYO_NOGPT_JOBO_US_EXTRA_CALLS", 6)
+NOGPT_APPROVE_MIN_GRADE = env_int("JOBBYO_NOGPT_APPROVE_MIN_GRADE", 58)
+NOGPT_APPROVE_MIN_GRADE_MINIMUM_VIABLE = env_int("JOBBYO_NOGPT_APPROVE_MIN_GRADE_MINIMUM_VIABLE", 52)
+# Extra deterministic persona-fit gate for --nogpt mode.
+# This is separate from source/link validation: a job must be live AND fit the
+# user's automation/persona/search contract before it can be posted.
+NOGPT_PERSONA_FIT_MIN_SCORE = env_int("JOBBYO_NOGPT_PERSONA_FIT_MIN_SCORE", 55)
+NOGPT_PERSONA_FIT_MIN_SCORE_MINIMUM_VIABLE = env_int("JOBBYO_NOGPT_PERSONA_FIT_MIN_SCORE_MINIMUM_VIABLE", 48)
+
+if NO_GPT_MODE:
+    # Use much more inventory in no-GPT mode and avoid all OpenAI-powered
+    # resolver/strategy calls. Jobo is the primary volume source; HiringCafe is
+    # a helpful structured supplement when the Apify token is present.
+    HIRING_CAFE_MAX_ITEMS = max(HIRING_CAFE_MAX_ITEMS, NOGPT_HIRING_CAFE_MAX_ITEMS)
+    HIRING_CAFE_BATCH_SIZE = max(HIRING_CAFE_BATCH_SIZE, NOGPT_HIRING_CAFE_BATCH_SIZE)
+    HIRING_CAFE_LOCAL_SCORE_MIN = min(HIRING_CAFE_LOCAL_SCORE_MIN, 18)
+    JOBO_ATS_MAX_ITEMS = max(JOBO_ATS_MAX_ITEMS, NOGPT_JOBO_PAGE_SIZE)
+    JOBO_LOCAL_SCORE_MIN = min(JOBO_LOCAL_SCORE_MIN, 8)
+    MAX_DIRECT_RESOLUTION_ATTEMPTS_PER_BATCH = 0
+    MAX_REMOTE_FAILURE_RESOLUTION_ATTEMPTS_PER_BATCH = 0
+    ENABLE_AUTOMATION_TITLE_CLUSTER_PREFETCH = False
+    ENABLE_SHARED_DAILY_INVENTORY = False
+
 DAILY_REPORT_API_BASE = "https://fastapi-service-03-160893319817.europe-southwest1.run.app"
 # Override to a test inbox; set to "" to deliver to the actual user's email.
 DAILY_REPORT_OVERRIDE_EMAIL = "hello@jobbyo.ai"
@@ -165,6 +238,24 @@ SEARCH_CV_CHAR_LIMIT = 5000
 # Backward-compatible label used in a few logs/prompts. The actual per-round
 # limit is passed into find_jobs_for_user/run_round.
 MAX_BATCHES = FIRST_ROUND_BATCHES
+
+# --- Cost estimation constants (USD) ---
+# Hiring.cafe via Apify: $1.25 per 1,000 raw results
+COST_PER_HC_RESULT = 0.00125
+# Jobo ATS: $49.99/month ÷ 100,000 jobs/month
+COST_PER_JOBO_RESULT = 0.0005
+# OpenAI — gpt-4.1-mini + web_search per search batch (approx input+output tokens)
+COST_PER_OPENAI_SEARCH_CALL = 0.05
+# OpenAI — gpt-5.5 strict AI review per batch (approx, pricing may change)
+COST_PER_OPENAI_REVIEW_CALL = 0.08
+# OpenAI — gpt-4.1 + web_search per URL resolution attempt
+COST_PER_OPENAI_RESOLVER_CALL = 0.02
+# OpenAI — strategy pivot (2 calls: analysis + contract rewrite)
+COST_PER_OPENAI_PIVOT_CALL = 0.06
+# OpenAI — one-time persona creation (gpt-4.1-mini)
+COST_PER_PERSONA_CREATE = 0.01
+# OpenAI — one-time search contract creation (gpt-4.1-mini)
+COST_PER_CONTRACT_CREATE = 0.01
 
 
 def jobs_to_request(jobs_needed, round_mode="first_round"):
@@ -222,14 +313,18 @@ SEARCH_CONTRACT_DIR.mkdir(exist_ok=True)
 STRATEGY_REPORT_DIR = Path("./strategy_reports")
 STRATEGY_REPORT_DIR.mkdir(exist_ok=True)
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is required.")
+if not OPENAI_API_KEY and not NO_GPT_MODE and not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    raise RuntimeError("OPENAI_API_KEY environment variable is required unless --nogpt/JOBBYO_NO_GPT=1 is used.")
+if OpenAI is None and not NO_GPT_MODE and not any(arg in {"-h", "--help"} for arg in sys.argv[1:]):
+    raise RuntimeError("The openai package is required unless --nogpt/JOBBYO_NO_GPT=1 is used.")
 
-client = OpenAI(
-    api_key=OPENAI_API_KEY,
-    timeout=120.0,
-    max_retries=1,
-)
+client = None
+if OPENAI_API_KEY and not NO_GPT_MODE and OpenAI is not None:
+    client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=120.0,
+        max_retries=1,
+    )
 
 
 # ============================================================
@@ -1330,6 +1425,14 @@ def has_active_automation(automation):
 
     return automation.get("isActive") is True
 
+def should_bypass_automation_check(user, email):
+    """True for trialing users and anyone in FORCE_USER_EMAILS."""
+    subscription = (user or {}).get("subscription") or {}
+    if subscription.get("status") == "trialing":
+        return True
+    return normalize_selected_email(email) in {normalize_selected_email(e) for e in FORCE_USER_EMAILS}
+
+
 def automation_debug_summary(automation):
     if not automation:
         return {"exists": False}
@@ -1864,6 +1967,44 @@ def persona_path(uid):
     return PERSONA_DIR / f"{uid}.json"
 
 
+def build_local_persona(user_profile, automation, cv_text):
+    """Create a lightweight persona without OpenAI for --nogpt mode.
+
+    It is intentionally conservative and uses only automation preferences + CV
+    text. This keeps the pipeline candidate-agnostic while avoiding OpenAI calls.
+    """
+    prefs = extract_job_preferences(automation or {})
+    cv = (user_profile or {}).get("cv") or {}
+    titles = extract_automation_job_titles(automation or {}, limit=20)
+    if not titles and cv.get("title"):
+        titles = [str(cv.get("title"))]
+    locations = extract_automation_locations(automation or {})
+    skills = flatten_skills(cv.get("skills", []))[:40]
+    summary = str(cv.get("summary") or "")[:600]
+
+    persona = {
+        "career_hybrid": (
+            "No-GPT local persona built from automation targets"
+            + (f": {', '.join(titles[:5])}" if titles else "")
+        ),
+        "transformation_story": summary or "Candidate profile derived locally from automation preferences and CV.",
+        "target_titles": titles,
+        "best_fit_roles": titles,
+        "avoid_roles": [],
+        "must_have_filters": ["Use the automation config as source of truth for job title, location, job type, and salary."],
+        "nice_to_have_filters": skills[:20],
+        "location_rules": (
+            "Automation locations: " + ", ".join(locations)
+            if locations else
+            "Use automation/CV location policy; do not apply hardcoded country bans."
+        ),
+        "salary_rules": json.dumps(prefs.get("salaryRange") or prefs.get("minimumAcceptableSalary") or {}, default=str),
+        "search_keywords": list(dict.fromkeys(titles + skills[:20]))[:60],
+        "scoring_rules": "Local scoring: prioritize title/function overlap, direct ATS URLs, compatible location, and non-duplicate companies.",
+    }
+    return persona
+
+
 def get_or_create_persona(user_profile, automation, cv_text):
     uid = user_profile["uid"]
     path = persona_path(uid)
@@ -1872,6 +2013,13 @@ def get_or_create_persona(user_profile, automation, cv_text):
         with open(path, "r", encoding="utf-8") as f:
             persona = json.load(f)
         print(f"Loaded local persona: {path}")
+        return persona
+
+    if NO_GPT_MODE:
+        persona = build_local_persona(user_profile, automation, cv_text)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(persona, f, indent=2)
+        print(f"Created local no-GPT persona: {path}")
         return persona
 
     prefs = extract_job_preferences(automation)
@@ -2254,6 +2402,64 @@ def normalize_search_contract_for_automation(search_contract, automation, user_p
     return search_contract, changed
 
 
+def build_local_search_contract(user_profile, automation, cv_text, persona):
+    """Create a strict but usable search contract without OpenAI."""
+    prefs = extract_job_preferences(automation or {})
+    titles = extract_automation_job_titles(automation or {}, limit=30)
+    if not titles and isinstance(persona, dict):
+        titles = list(persona.get("target_titles") or [])[:30]
+    locations = extract_automation_locations(automation or {})
+    salary_min = (
+        prefs.get("minimumAcceptableSalary")
+        or (prefs.get("salaryRange") or {}).get("min")
+        or ""
+    )
+    salary_currency = prefs.get("salaryCurrency") or (prefs.get("salaryRange") or {}).get("currency") or ""
+    job_types = prefs.get("preferredJobTypes") or {}
+    location_rule = (
+        "Allowed automation locations: " + ", ".join(locations) + ". "
+        if locations else
+        "Use automation/CV location policy; no global country ban. "
+    )
+    location_rule += "Remote/hybrid/on-site eligibility must match the automation config and the job page."
+
+    search_queries = []
+    location_text = " OR ".join(locations[:5]) if locations else "remote OR hybrid OR onsite"
+    for title in titles[:12]:
+        search_queries.append(f'"{title}" ({location_text}) direct apply ATS')
+
+    return {
+        "candidate_snapshot": f"No-GPT local contract for {user_profile.get('displayName') or user_profile.get('email')}",
+        "allowed_titles": titles,
+        "forbidden_titles": [],
+        "allowed_functions": titles + list((persona or {}).get("best_fit_roles") or [])[:20],
+        "forbidden_functions": [],
+        "location_hard_rule": location_rule,
+        "salary_hard_rule": (
+            f"Minimum salary from automation: {salary_min} {salary_currency}. Allow missing salary for manual review."
+            if salary_min else
+            "No reliable hard salary floor extracted locally; allow missing salary for manual review."
+        ),
+        "seniority_rules": "Use automation/CV seniority; reject obvious internships, graduate trainee roles, or impossible executive mismatches unless target titles allow them.",
+        "source_strategy": [
+            DIRECT_ATS_CONTRACT_OVERRIDE,
+            "No-GPT mode: source from Jobo ATS and HiringCafe first; use direct ATS/company URLs only.",
+            "Prefer direct ATS providers and company job pages with specific job IDs.",
+        ],
+        "hard_reject_rules": [
+            DIRECT_ATS_HARD_REJECT_OVERRIDE,
+            "Reject aggregators, mirrors, generic search pages, expired/404 pages, duplicates, and clear location conflicts.",
+            "Reject roles with obvious forbidden job type conflicts: " + json.dumps(job_types, default=str),
+        ],
+        "search_queries": search_queries or ["direct ATS jobs matching automation titles and locations"],
+        "broadening_plan_if_zero_results": [
+            "Use more Jobo ATS calls across target title variants.",
+            "Use HiringCafe structured results as a supplement.",
+            "Allow close title variants only when static/remote validation passes and local score remains strong.",
+        ],
+    }
+
+
 def get_or_create_search_contract(user_profile, automation, cv_text, persona):
     uid = user_profile["uid"]
     path = search_contract_path(uid)
@@ -2270,6 +2476,18 @@ def get_or_create_search_contract(user_profile, automation, cv_text, persona):
             save_search_contract(user_profile, search_contract)
             print(f"Normalized local search contract: {path}")
         print(f"Loaded local search contract: {path}")
+        return search_contract
+
+    if NO_GPT_MODE:
+        search_contract = build_local_search_contract(user_profile, automation, cv_text, persona)
+        search_contract, _ = normalize_search_contract_for_automation(
+            search_contract,
+            automation,
+            user_profile=user_profile,
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(search_contract, f, indent=2)
+        print(f"Created local no-GPT search contract: {path}")
         return search_contract
 
     prefs = extract_job_preferences(automation)
@@ -2595,6 +2813,8 @@ def parse_json_output(text):
 
 
 def openai_web_search_call(prompt):
+    if NO_GPT_MODE or client is None:
+        raise RuntimeError("OpenAI web search is disabled in --nogpt mode.")
     try:
         return client.responses.create(
             model=SEARCH_MODEL,
@@ -2639,6 +2859,8 @@ def openai_web_search_call(prompt):
 
 
 def repair_job_json_output(raw_text):
+    if NO_GPT_MODE or client is None:
+        return None
     """Repair malformed JSON returned by the search+web call.
 
     The web-search model can still occasionally emit malformed JSON despite the
@@ -2724,6 +2946,8 @@ RESOLUTION_TIMEOUT_SECONDS = 30.0
 
 
 def openai_direct_resolution_call(prompt):
+    if NO_GPT_MODE or client is None:
+        raise RuntimeError("OpenAI direct resolution is disabled in --nogpt mode.")
     try:
         return client.responses.create(
             model=RESOLUTION_MODEL,
@@ -3879,9 +4103,113 @@ Return strict JSON only.
     return parse_json_output(response.output_text)
 
 
+def review_and_filter_jobs_without_gpt(user_profile, automation, persona, jobs, job_status=DEFAULT_STATUS, search_contract=None, minimum_viable_mode=False):
+    """Deterministic persona-fit review used only in --nogpt mode.
+
+    No-GPT mode still has a real filter before posting. A job must already have
+    passed static URL validation, remote/live validation, and cheap pre-review.
+    This final gate then checks candidate persona/search-contract fit using
+    automation titles, local persona, allowed/forbidden functions, role-family
+    rules, location policy, and a local match score.
+    """
+    approved = []
+    rejected = []
+    grade_floor = NOGPT_APPROVE_MIN_GRADE_MINIMUM_VIABLE if minimum_viable_mode else NOGPT_APPROVE_MIN_GRADE
+    persona_floor = NOGPT_PERSONA_FIT_MIN_SCORE_MINIMUM_VIABLE if minimum_viable_mode else NOGPT_PERSONA_FIT_MIN_SCORE
+    print("\nNO-GPT PERSONA REVIEW BEFORE POSTING:")
+    print(f"Reviewing {len(jobs)} live jobs locally with grade floor {grade_floor} and persona-fit floor {persona_floor}...")
+
+    for job in jobs:
+        persona_ok, persona_score, persona_reason, persona_risk_flags = nogpt_persona_fit_review(
+            job,
+            automation=automation,
+            persona=persona,
+            search_contract=search_contract,
+            user_profile=user_profile,
+            minimum_viable_mode=minimum_viable_mode,
+        )
+
+        local_score = local_inventory_match_score(
+            job,
+            automation=automation,
+            persona=persona,
+            search_contract=search_contract,
+            user_profile=user_profile,
+        )
+        source_grade = normalize_grade(job.get("grade", 0))
+        recommended_grade = max(source_grade, local_score, persona_score)
+
+        if recommended_grade < grade_floor:
+            rejected.append({
+                **job,
+                "grade": recommended_grade,
+                "persona_fit_score": persona_score,
+                "review_decision": "nogpt_persona_reject",
+                "review_confidence": 0,
+                "review_reason": f"No-GPT local grade {recommended_grade} below floor {grade_floor}. {persona_reason}",
+                "risk_flags": persona_risk_flags or ["low_local_grade"],
+            })
+            print(f"LOCAL PERSONA REVIEW SKIP: {job.get('title')} — {job.get('company')} — grade {recommended_grade} < {grade_floor}; persona {persona_score}")
+            continue
+
+        if not persona_ok:
+            rejected.append({
+                **job,
+                "grade": recommended_grade,
+                "persona_fit_score": persona_score,
+                "review_decision": "nogpt_persona_reject",
+                "review_confidence": 0,
+                "review_reason": persona_reason,
+                "risk_flags": persona_risk_flags or ["persona_fit_rejected"],
+            })
+            print(f"LOCAL PERSONA REVIEW SKIP: {job.get('title')} — {job.get('company')} — persona {persona_score}: {persona_reason}")
+            continue
+
+        approved_job = {
+            "job_url": job["job_url"],
+            "title": job["title"],
+            "description": job["description"],
+            "company": job["company"],
+            "grade": recommended_grade,
+            "persona_fit_score": persona_score,
+            "status": DISCOVERY_PENDING_STATUS if minimum_viable_mode else job_status,
+            "review_decision": "nogpt_persona_approved",
+            "match_tier": "nogpt_persona_approved",
+            "review_confidence": min(88, max(60, persona_score, recommended_grade)),
+            "review_reason": (
+                "No-GPT persona approval: passed static URL validation, remote live check, "
+                "candidate-aware pre-review, local grade floor, and deterministic persona-fit gate. "
+                + persona_reason
+            ),
+        }
+        for optional_key in ["location", "source", "inventory_local_score", "cluster_key"]:
+            if job.get(optional_key) not in {None, ""}:
+                approved_job[optional_key] = job.get(optional_key)
+        approved.append(approved_job)
+        print("\nLOCAL PERSONA REVIEW APPROVED:")
+        print(f"• {approved_job['title']} — {approved_job['company']}")
+        print(f"  Grade: {approved_job['grade']}")
+        print(f"  Persona fit: {approved_job['persona_fit_score']}")
+        print(f"  Status stored: {approved_job.get('status')}")
+        print(f"  URL: {approved_job['job_url']}")
+
+    return approved, rejected
+
+
 def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job_status=DEFAULT_STATUS, search_contract=None, minimum_viable_mode=False):
     if not jobs:
         return [], []
+
+    if NO_GPT_MODE:
+        return review_and_filter_jobs_without_gpt(
+            user_profile=user_profile,
+            automation=automation,
+            persona=persona,
+            jobs=jobs,
+            job_status=job_status,
+            search_contract=search_contract,
+            minimum_viable_mode=minimum_viable_mode,
+        )
 
     print("\nAI REVIEW BEFORE POSTING:")
     print(f"Reviewing {len(jobs)} live jobs...")
@@ -4424,6 +4752,10 @@ def maybe_create_strategy_pivot(
     a prompt patch for later batches/rounds.
     """
 
+    if NO_GPT_MODE:
+        print(f"\nSTRATEGY PIVOT SKIPPED: --nogpt mode is active ({pivot_stage}).")
+        return None
+
     if not force:
         return None
 
@@ -4850,6 +5182,197 @@ def local_inventory_match_score(job, automation=None, persona=None, search_contr
     return max(0, min(100, score))
 
 
+def _important_role_words(text):
+    """Tokenize role text for deterministic no-GPT persona-fit scoring."""
+    stop_words = {
+        "and", "or", "the", "for", "with", "from", "into", "role", "jobs",
+        "job", "work", "remote", "hybrid", "onsite", "on", "site", "full",
+        "time", "part", "contract", "senior", "junior", "lead", "manager",
+        "director", "specialist", "associate", "assistant", "coordinator",
+        "executive", "head", "principal", "staff", "global", "regional",
+    }
+    return {
+        w for w in re.findall(r"[a-z0-9+#.-]+", _norm_words(text))
+        if len(w) >= 3 and w not in stop_words
+    }
+
+
+def extract_candidate_role_signals(automation=None, persona=None, search_contract=None):
+    """Return candidate-specific allowed role signals from automation + persona + contract.
+
+    This keeps --nogpt candidate-agnostic in code while still candidate-aware in
+    behavior: different users get different local filters because their
+    automation/persona/search-contract values are different.
+    """
+    signals = []
+    for title in extract_automation_job_titles(automation or {}, limit=80):
+        signals.append(str(title).strip())
+    if isinstance(persona, dict):
+        signals.extend(str(x).strip() for x in (persona.get("target_titles") or []))
+        signals.extend(str(x).strip() for x in (persona.get("best_fit_roles") or []))
+        signals.extend(str(x).strip() for x in (persona.get("search_keywords") or []))
+    if isinstance(search_contract, dict):
+        signals.extend(str(x).strip() for x in (search_contract.get("allowed_titles") or []))
+        signals.extend(str(x).strip() for x in (search_contract.get("allowed_functions") or []))
+
+    seen = set()
+    output = []
+    for signal in signals:
+        norm = re.sub(r"\s+", " ", signal.lower()).strip()
+        if not norm or norm in seen or len(norm) < 3:
+            continue
+        seen.add(norm)
+        output.append(signal)
+    return output[:120]
+
+
+def nogpt_persona_fit_score(job, automation=None, persona=None, search_contract=None, user_profile=None):
+    """Score how closely a live job matches the user's persona without GPT.
+
+    This is intentionally conservative. A job that merely has a valid URL is not
+    enough; it needs title/function overlap with this user's target signals and
+    must not conflict with forbidden functions or location rules.
+    """
+    title = _norm_words(job.get("title", ""))
+    description = _norm_words(job.get("description", ""))
+    company = _norm_words(job.get("company", ""))
+    blob = f"{title} {description} {company}"
+    title_words = _important_role_words(title)
+    blob_words = _important_role_words(blob)
+    signals = extract_candidate_role_signals(automation, persona, search_contract)
+
+    if not signals:
+        # No persona/search-contract to compare against. Keep this conservative
+        # but not impossible, because some imported automations are sparse.
+        return 45, ["no_candidate_role_signals"]
+
+    score = 0
+    reasons = []
+    best_title_overlap = 0
+    best_blob_overlap = 0
+    exact_phrase_hit = False
+    cluster_hit = False
+
+    job_cluster = title_cluster_key(title)
+    for signal in signals:
+        s_norm = _norm_words(signal)
+        if not s_norm:
+            continue
+        signal_words = _important_role_words(s_norm)
+        if not signal_words:
+            continue
+
+        if s_norm and (s_norm in title or title in s_norm):
+            exact_phrase_hit = True
+
+        signal_cluster = title_cluster_key(s_norm)
+        if signal_cluster and signal_cluster == job_cluster and signal_cluster != "uncategorized":
+            cluster_hit = True
+
+        title_overlap = len(title_words & signal_words) / max(1, len(signal_words))
+        blob_overlap = len(blob_words & signal_words) / max(1, len(signal_words))
+        best_title_overlap = max(best_title_overlap, title_overlap)
+        best_blob_overlap = max(best_blob_overlap, blob_overlap)
+
+    if exact_phrase_hit:
+        score += 35
+        reasons.append("exact_or_near_title_phrase_match")
+    if cluster_hit:
+        score += 25
+        reasons.append("same_role_cluster")
+
+    score += int(best_title_overlap * 35)
+    score += int(best_blob_overlap * 15)
+
+    local_score = local_inventory_match_score(
+        job,
+        automation=automation,
+        persona=persona,
+        search_contract=search_contract,
+        user_profile=user_profile,
+    )
+    score += min(15, int(local_score * 0.15))
+
+    if any(marker in title for marker in ["senior", "lead", "manager", "director", "engineer", "analyst", "specialist", "assistant", "coordinator", "executive"]):
+        score += 5
+        reasons.append("recognizable_seniority_title")
+
+    if job.get("source"):
+        source = str(job.get("source", "")).lower()
+        if source.startswith(("jobo_ats", "hiring_cafe")):
+            score += 5
+            reasons.append("structured_source")
+
+    if job_location_conflicts_candidate_policy(job, user_profile=user_profile, automation=automation, search_contract=search_contract):
+        score -= 80
+        reasons.append("location_conflict")
+
+    if candidate_forbids_title_or_function(job, search_contract=search_contract):
+        score -= 70
+        reasons.append("forbidden_title_or_function")
+
+    role_conflict, role_reason = role_family_conflicts_candidate(
+        job,
+        search_contract=search_contract,
+        automation=automation,
+        user_profile=user_profile,
+    )
+    if role_conflict:
+        score -= 55
+        reasons.append(role_reason)
+
+    forbidden_blob = _norm_words(" ".join((search_contract or {}).get("forbidden_titles", []) + (search_contract or {}).get("forbidden_functions", [])))
+    forbidden_words = {w for w in forbidden_blob.split() if len(w) >= 5}
+    forbidden_hits = forbidden_words & blob_words
+    if forbidden_hits:
+        score -= min(30, len(forbidden_hits) * 8)
+        reasons.append("forbidden_keyword_overlap:" + ",".join(sorted(list(forbidden_hits))[:5]))
+
+    if best_title_overlap < 0.20 and not exact_phrase_hit and not cluster_hit:
+        reasons.append("weak_title_overlap")
+
+    if best_blob_overlap < 0.15 and not exact_phrase_hit and not cluster_hit:
+        reasons.append("weak_description_overlap")
+
+    return max(0, min(100, score)), reasons
+
+
+def nogpt_persona_fit_review(job, automation=None, persona=None, search_contract=None, user_profile=None, minimum_viable_mode=False):
+    """Final no-GPT persona gate before posting.
+
+    Returns (ok, score, reason, risk_flags). This is the deterministic equivalent
+    of the AI reviewer for --nogpt runs. It is intentionally stricter than the
+    inventory scorer and runs only after static/remote checks have already
+    proven that the job link is a live direct job post.
+    """
+    min_score = NOGPT_PERSONA_FIT_MIN_SCORE_MINIMUM_VIABLE if minimum_viable_mode else NOGPT_PERSONA_FIT_MIN_SCORE
+    score, reasons = nogpt_persona_fit_score(
+        job,
+        automation=automation,
+        persona=persona,
+        search_contract=search_contract,
+        user_profile=user_profile,
+    )
+    risk_flags = []
+
+    if "location_conflict" in reasons:
+        risk_flags.append("location_conflict")
+    if any(r.startswith("wrong_function_pre_review") for r in reasons):
+        risk_flags.append("wrong_function")
+    if "forbidden_title_or_function" in reasons:
+        risk_flags.append("forbidden_title_or_function")
+    if "weak_title_overlap" in reasons and "weak_description_overlap" in reasons:
+        risk_flags.append("weak_persona_alignment")
+
+    if score < min_score:
+        return False, score, f"No-GPT persona-fit score {score} below floor {min_score}. Signals: {', '.join(reasons[:6])}", risk_flags or ["low_persona_fit_score"]
+
+    if any(flag in risk_flags for flag in ["location_conflict", "wrong_function", "forbidden_title_or_function"]):
+        return False, score, f"No-GPT persona-fit rejected due to hard risk flags: {', '.join(risk_flags)}. Signals: {', '.join(reasons[:6])}", risk_flags
+
+    return True, score, f"No-GPT persona-fit approved with score {score}. Signals: {', '.join(reasons[:6])}", risk_flags
+
+
 INVENTORY_GLOBAL_BAD_REASONS = set(LINK_FAILURE_REASONS) | BAD_SOURCE_REASONS | {
     "aggregator_page",
     "redirected_to_aggregator",
@@ -5003,51 +5526,56 @@ def _build_hc_query(automation, search_contract, user_profile):
 def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, limit=None):
     """Fetch and locally-score Hiring.cafe candidates for one user via Apify.
 
-    Returns a list of job dicts ready for the standard static/remote/AI review
-    pipeline.  Called once per user before the batch loop; results are consumed
-    batch-by-batch so OpenAI search only fires when the pool is exhausted.
+    In normal mode this is a small prefetch before OpenAI fallback. In --nogpt
+    mode it searches multiple automation titles with a higher maxItems budget so
+    HiringCafe can replace part of the GPT sourcing volume.
     """
     if not ENABLE_HIRING_CAFE_PREFETCH:
-        return []
+        return [], 0
 
-    limit = limit or HIRING_CAFE_MAX_ITEMS
+    base_limit = limit or HIRING_CAFE_MAX_ITEMS
     keyword, location, workplace_type = _build_hc_query(automation, search_contract, user_profile)
-
-    if not keyword:
+    keywords = [keyword] if keyword else []
+    if NO_GPT_MODE:
+        extra_keywords = extract_automation_job_titles(automation, limit=NOGPT_HIRING_CAFE_KEYWORDS)
+        keywords = list(dict.fromkeys([k for k in extra_keywords + keywords if k]))[:NOGPT_HIRING_CAFE_KEYWORDS]
+    if not keywords:
         print("Hiring.cafe: no keyword extracted — skipping prefetch")
-        return []
+        return [], 0
 
-    print(f"\nHiring.cafe prefetch  keyword={keyword!r}  location={location!r}  type={workplace_type}")
+    per_keyword_limit = base_limit if not NO_GPT_MODE else max(25, base_limit // max(1, len(keywords)))
+    print(f"\nHiring.cafe prefetch  keywords={keywords!r}  location={location!r}  type={workplace_type}  maxItems/keyword={per_keyword_limit}")
 
-    try:
-        actor_input = {"keyword": keyword, "workplaceType": workplace_type, "maxItems": limit}
-        if location:
-            actor_input["location"] = location
+    raw_items_all = []
+    for kw in keywords:
+        try:
+            actor_input = {"keyword": kw, "workplaceType": workplace_type, "maxItems": per_keyword_limit}
+            if location:
+                actor_input["location"] = location
 
-        resp = requests.post(
-            f"https://api.apify.com/v2/acts/{APIFY_HIRING_CAFE_ACTOR_ID}/run-sync-get-dataset-items",
-            params={"token": APIFY_API_TOKEN},
-            json=actor_input,
-            timeout=180,
-        )
-        resp.raise_for_status()
-        raw_items = resp.json()
-    except Exception as e:
-        print(f"Hiring.cafe API error: {e}")
-        return []
+            resp = requests.post(
+                f"https://api.apify.com/v2/acts/{APIFY_HIRING_CAFE_ACTOR_ID}/run-sync-get-dataset-items",
+                params={"token": APIFY_API_TOKEN},
+                json=actor_input,
+                timeout=180,
+            )
+            resp.raise_for_status()
+            raw_items = resp.json()
+            if isinstance(raw_items, list):
+                raw_items_all.extend(raw_items)
+                print(f"Hiring.cafe: keyword={kw!r} → {len(raw_items)} raw results")
+            else:
+                print(f"Hiring.cafe: unexpected response type {type(raw_items).__name__} for keyword={kw!r}")
+        except Exception as e:
+            print(f"Hiring.cafe API error for keyword={kw!r}: {e}")
 
-    if not isinstance(raw_items, list):
-        print(f"Hiring.cafe: unexpected response type {type(raw_items).__name__}")
-        return []
-
-    print(f"Hiring.cafe: {len(raw_items)} raw results received")
+    raw_items = raw_items_all
+    print(f"Hiring.cafe: {len(raw_items)} total raw results received")
 
     # Parse → dedup by (company, title) → filter seen/blocked → score → sort.
     avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
     blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
 
-    # HC often returns the same job from multiple ATS boards (same company + title,
-    # different URL subdomain). Deduplicate before scoring to avoid wasting batch slots.
     seen_co_title = set()
     deduped = []
     for raw in raw_items:
@@ -5085,8 +5613,7 @@ def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_
     results = [j for _, j in parsed]
 
     print(f"Hiring.cafe: {len(results)} jobs after local scoring (min score {HIRING_CAFE_LOCAL_SCORE_MIN})")
-    return results
-
+    return results, len(raw_items_all)
 
 def _parse_jobo_ats_job(raw_item):
     """Map one raw jobo.world ATS Jobs API item to the internal job dict format."""
@@ -5172,24 +5699,26 @@ def _extract_salary_floor_for_jobo(search_contract):
     return floor if floor >= 40000 else None
 
 
-def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, limit=None):
-    """Fetch and locally-score jobo.world ATS Jobs API candidates via direct API."""
-    if not ENABLE_JOBO_ATS_PREFETCH:
-        return []
-    limit = limit or JOBO_ATS_MAX_ITEMS
-    keywords = extract_automation_job_titles(automation, limit=3)
-    _, location, workplace_type = _build_hc_query(automation, search_contract, user_profile)
-    if not keywords:
-        print("Jobo ATS: no keywords extracted — skipping prefetch")
-        return []
-    salary_floor = _extract_salary_floor_for_jobo(search_contract)
+def is_us_allowed_candidate(user_profile=None, automation=None, search_contract=None):
+    policy = candidate_location_policy(user_profile, automation, search_contract)
+    if "us" in set(policy.get("allowed_regions") or []):
+        return True
+    text = _norm_words(json.dumps({
+        "automation": extract_job_preferences(automation or {}),
+        "profile": user_profile or {},
+        "contract": search_contract or {},
+    }, default=str))
+    return any(marker in text for marker in ["united states", "usa", "u s", " us "])
+
+
+def build_jobo_search_bodies(keywords, location, workplace_type, salary_floor, limit, user_profile, automation, search_contract):
     posted_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    print(f"\nJobo ATS prefetch  queries={keywords}  location={location!r}  type={workplace_type}"
-          f"  salary_min={salary_floor}  posted_after={posted_after[:10]}")
-    try:
+    work_models = ["remote"] if workplace_type == "Remote" else ["remote", "hybrid", "onsite"]
+
+    if not NO_GPT_MODE:
         body = {
             "queries": keywords,
-            "work_models": ["remote"] if workplace_type == "Remote" else ["remote", "hybrid", "onsite"],
+            "work_models": work_models,
             "page_size": limit,
             "posted_after": posted_after,
             "include_fields": ["summary", "description"],
@@ -5198,18 +5727,98 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
             body["locations"] = [location]
         if salary_floor:
             body["salary_usd"] = {"min": salary_floor}
-        resp = requests.post(
-            f"{JOBO_API_BASE}/api/jobs/search",
-            headers={"X-Api-Key": JOBO_API_KEY, "Content-Type": "application/json"},
-            json=body,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        raw_items = resp.json().get("jobs", [])
-    except Exception as e:
-        print(f"Jobo ATS API error: {e}")
-        return []
-    print(f"Jobo ATS: {len(raw_items)} raw results received")
+        return [body]
+
+    # No-GPT: spend more Jobo calls. One query per title gives better recall and
+    # avoids a single broad mixed query crowding out useful roles. For US-allowed
+    # users, add a remote/no-location pass because the US inventory is large.
+    bodies = []
+    max_calls = NOGPT_JOBO_MAX_CALLS_PER_USER + (NOGPT_JOBO_US_EXTRA_CALLS if is_us_allowed_candidate(user_profile, automation, search_contract) else 0)
+    for kw in keywords:
+        if len(bodies) >= max_calls:
+            break
+        base = {
+            "queries": [kw],
+            "work_models": work_models,
+            "page_size": limit,
+            "posted_after": posted_after,
+            "include_fields": ["summary", "description"],
+        }
+        if location:
+            body = dict(base)
+            body["locations"] = [location]
+            bodies.append(body)
+        else:
+            bodies.append(base)
+
+        if len(bodies) >= max_calls:
+            break
+
+        if is_us_allowed_candidate(user_profile, automation, search_contract):
+            # US users usually benefit from both location-filtered and remote/open
+            # passes. This uses the extra quota the user mentioned.
+            remote_body = dict(base)
+            remote_body["work_models"] = ["remote", "hybrid", "onsite"]
+            remote_body["locations"] = ["United States"]
+            bodies.append(remote_body)
+
+    if salary_floor:
+        for body in bodies:
+            body["salary_usd"] = {"min": salary_floor}
+    return bodies[:max_calls]
+
+
+def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, limit=None):
+    """Fetch and locally-score jobo.world ATS Jobs API candidates via direct API.
+
+    In --nogpt mode this intentionally makes more Jobo calls across more target
+    titles, because Jobo becomes the primary source replacing GPT search.
+    """
+    if not ENABLE_JOBO_ATS_PREFETCH:
+        return [], 0
+    limit = limit or (NOGPT_JOBO_PAGE_SIZE if NO_GPT_MODE else JOBO_ATS_MAX_ITEMS)
+    keyword_limit = NOGPT_JOBO_KEYWORDS if NO_GPT_MODE else 3
+    keywords = extract_automation_job_titles(automation, limit=keyword_limit)
+    _, location, workplace_type = _build_hc_query(automation, search_contract, user_profile)
+    if not keywords:
+        print("Jobo ATS: no keywords extracted — skipping prefetch")
+        return [], 0
+    salary_floor = _extract_salary_floor_for_jobo(search_contract)
+    posted_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    bodies = build_jobo_search_bodies(
+        keywords=keywords,
+        location=location,
+        workplace_type=workplace_type,
+        salary_floor=salary_floor,
+        limit=limit,
+        user_profile=user_profile,
+        automation=automation,
+        search_contract=search_contract,
+    )
+    print(
+        f"\nJobo ATS prefetch  queries={keywords}  location={location!r}  type={workplace_type}"
+        f"  salary_min={salary_floor}  posted_after={posted_after[:10]}  calls={len(bodies)}  page_size={limit}"
+    )
+
+    raw_items_all = []
+    for idx, body in enumerate(bodies, start=1):
+        try:
+            resp = requests.post(
+                f"{JOBO_API_BASE}/api/jobs/search",
+                headers={"X-Api-Key": JOBO_API_KEY, "Content-Type": "application/json"},
+                json=body,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            raw_items = resp.json().get("jobs", [])
+            raw_items_all.extend(raw_items)
+            print(f"Jobo ATS call {idx}/{len(bodies)}: query={body.get('queries')} locations={body.get('locations')} → {len(raw_items)} raw results")
+        except Exception as e:
+            print(f"Jobo ATS API error on call {idx}/{len(bodies)}: {e}")
+            continue
+
+    raw_items = raw_items_all
+    print(f"Jobo ATS: {len(raw_items)} total raw results received")
     avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
     blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
     seen_co_title = set()
@@ -5242,8 +5851,7 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
     parsed.sort(key=lambda x: x[0], reverse=True)
     results = [j for _, j in parsed]
     print(f"Jobo ATS: {len(results)} jobs after local scoring (min score {JOBO_LOCAL_SCORE_MIN})")
-    return results
-
+    return results, len(raw_items_all)
 
 def get_inventory_candidates_for_user(user_profile, automation, persona, search_contract, avoid_urls, limit=INVENTORY_CANDIDATES_PER_USER):
     if not DAILY_PREFETCH_INVENTORY:
@@ -5306,6 +5914,33 @@ def merge_jobs_dedup(primary_jobs, secondary_jobs):
     return output
 
 # ============================================================
+# COST + SOURCE HELPERS
+# ============================================================
+
+def classify_job_source(source_str):
+    s = str(source_str or "").lower()
+    if s.startswith("hiring_cafe"):
+        return "hc"
+    if s.startswith("jobo_ats"):
+        return "jobo"
+    if "direct_url_resolver" in s:
+        return "resolver"
+    return "openai"
+
+
+def compute_source_success_rates(round_results):
+    totals = {src: {"sourced": 0, "added": 0} for src in ("hc", "jobo", "openai", "resolver")}
+    for r in (round_results or []):
+        funnel = (r.get("round_metrics") or {}).get("source_funnel", {})
+        for src, counts in funnel.items():
+            if src not in totals:
+                continue
+            totals[src]["sourced"] += counts.get("sourced", 0)
+            totals[src]["added"] += counts.get("added", 0)
+    return {src: d["added"] / max(1, d["sourced"]) for src, d in totals.items()}
+
+
+# ============================================================
 # PROCESS ONE USER
 # ============================================================
 
@@ -5316,6 +5951,7 @@ def find_jobs_for_user(
     round_mode="first_round",
     previous_result=None,
     minimum_viable_mode=False,
+    source_limit_overrides=None,
 ):
     uid = user.get("uid")
     email = user.get("email")
@@ -5356,7 +5992,7 @@ def find_jobs_for_user(
     if automation is not None:
         user["_automation_cache"] = automation
 
-    if not has_active_automation(automation):
+    if not should_bypass_automation_check(user, email) and not has_active_automation(automation):
         print(f"SKIP: no active automation — {email}")
         print("  automation debug:", json.dumps(automation_debug_summary(automation), indent=2, default=str))
         empty_result["automation"] = automation
@@ -5412,9 +6048,13 @@ def find_jobs_for_user(
         }
 
     cv_text = cv_to_text(user_profile)
+    _persona_existed = persona_path(uid).exists()
     persona = get_or_create_persona(user_profile, automation, cv_text)
+    round_metrics["persona_created_this_run"] = not _persona_existed
 
+    _contract_existed = search_contract_path(uid).exists()
     search_contract = get_or_create_search_contract(user_profile, automation, cv_text, persona)
+    round_metrics["contract_created_this_run"] = not _contract_existed
 
     existing_urls, existing_company_titles = existing_duplicate_sets(existing_jobs)
 
@@ -5452,6 +6092,21 @@ def find_jobs_for_user(
         "direct_resolution_attempts": 0,
         "direct_resolution_successes": 0,
         "cheap_pre_review_rejections": 0,
+        "openai_search_calls": 0,
+        "openai_review_calls": 0,
+        "openai_pivot_calls": 0,
+        "hc_raw_results": 0,
+        "jobo_raw_results": 0,
+        "persona_created_this_run": False,
+        "contract_created_this_run": False,
+        "source_funnel": {
+            "hc":       {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
+            "jobo":     {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
+            "openai":   {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
+            "resolver": {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
+        },
+        "estimated_cost_usd": 0.0,
+        "cost_breakdown": {},
     }
 
     # Company names whose every URL attempt 404'd/expired/hallucinated this run.
@@ -5482,6 +6137,7 @@ def find_jobs_for_user(
             strategy_prompt_patch = pivot["prompt_patch"]
 
         strategy_pivot_count += 1
+        round_metrics["openai_pivot_calls"] += 1
         print("\nContinuing automatically with adapted search contract/prompt patch.")
         return True
 
@@ -5507,22 +6163,28 @@ def find_jobs_for_user(
     # Pre-fetch candidates once per user before the batch loop.
     # HC and Jobo ATS are merged into one pool; OpenAI fires only when pool empties.
     hc_inventory = []
+    _hc_limit = (source_limit_overrides or {}).get("hc")
     if ENABLE_HIRING_CAFE_PREFETCH and round_mode in ("first_round", "second_round"):
-        hc_inventory = fetch_hiring_cafe_for_user(
+        hc_inventory, _hc_raw = fetch_hiring_cafe_for_user(
             automation=automation,
             search_contract=search_contract,
             user_profile=user_profile,
             avoid_urls=avoid_urls,
             rejected_companies=rejected_companies,
+            limit=_hc_limit,
         )
+        round_metrics["hc_raw_results"] += _hc_raw
+    _jobo_limit = (source_limit_overrides or {}).get("jobo")
     if ENABLE_JOBO_ATS_PREFETCH and round_mode in ("first_round", "second_round", "minimum_viable"):
-        jobo_jobs = fetch_jobo_ats_for_user(
+        jobo_jobs, _jobo_raw = fetch_jobo_ats_for_user(
             automation=automation,
             search_contract=search_contract,
             user_profile=user_profile,
             avoid_urls=avoid_urls,
             rejected_companies=rejected_companies,
+            limit=_jobo_limit,
         )
+        round_metrics["jobo_raw_results"] += _jobo_raw
         if jobo_jobs:
             hc_inventory = hc_inventory + jobo_jobs
             print(f"Pre-fetch pool: {len(hc_inventory)} total jobs in pre-fetch pool (HC + Jobo ATS)")
@@ -5584,15 +6246,20 @@ def find_jobs_for_user(
             for item in rejected_jobs[-200:]
         ]
 
-        # --- SOURCE JOBS: Hiring.cafe first, OpenAI as fallback ---
+        # --- SOURCE JOBS: structured inventory first, OpenAI only when allowed ---
         if hc_inventory:
-            # Consume next slice of pre-fetched HC candidates.
+            # Consume next slice of pre-fetched structured candidates.
             jobs = hc_inventory[:HIRING_CAFE_BATCH_SIZE]
             hc_inventory = hc_inventory[HIRING_CAFE_BATCH_SIZE:]
-            batch_source = "hiring_cafe"
-            print(f"Hiring.cafe: {len(jobs)} jobs  ({len(hc_inventory)} remaining in pool)")
+            batch_source = "structured_inventory"
+            print(f"Structured inventory: {len(jobs)} jobs  ({len(hc_inventory)} remaining in pool)")
+        elif NO_GPT_MODE:
+            # In no-GPT mode, never fall back to OpenAI. We simply mark the
+            # structured pool as exhausted and continue to the next batch/round.
+            batch_source = "nogpt_inventory_exhausted"
+            jobs = []
         else:
-            # HC pool exhausted (or disabled) — fall back to OpenAI web search.
+            # HC/Jobo pool exhausted (or disabled) — fall back to OpenAI web search.
             batch_source = "openai_search"
             try:
                 result = ask_openai_for_jobs(
@@ -5651,8 +6318,16 @@ def find_jobs_for_user(
         round_metrics["openai_jobs_returned"] += batch_returned
         round_metrics["static_candidates"] += batch_returned
 
+        if batch_source == "openai_search":
+            round_metrics["openai_search_calls"] += 1
+
+        # Track sourced count per source
+        for _job in jobs:
+            _src = classify_job_source(_job.get("source", ""))
+            round_metrics["source_funnel"][_src]["sourced"] += 1
+
         if not jobs:
-            zero_reason = "hc_returned_zero_candidates" if batch_source == "hiring_cafe" else "openai_returned_zero_jobs"
+            zero_reason = "nogpt_structured_inventory_exhausted" if batch_source == "nogpt_inventory_exhausted" else ("structured_inventory_returned_zero_candidates" if batch_source == "structured_inventory" else "openai_returned_zero_jobs")
             failed_batch_feedback.append({
                 "batch": batch_number,
                 "reason": zero_reason,
@@ -5709,7 +6384,8 @@ def find_jobs_for_user(
                 resolved_any = False
 
                 if (
-                    should_attempt_direct_resolution(job, reason)
+                    not NO_GPT_MODE
+                    and should_attempt_direct_resolution(job, reason)
                     and direct_resolution_attempts_this_batch < MAX_DIRECT_RESOLUTION_ATTEMPTS_PER_BATCH
                 ):
                     direct_resolution_attempts_this_batch += 1
@@ -5768,6 +6444,9 @@ def find_jobs_for_user(
         batch_static_pass = len(static_pass_jobs)
         print(f"Static passed: {batch_static_pass}")
         round_metrics["static_pass_count"] += batch_static_pass
+        for _job in static_pass_jobs:
+            _src = classify_job_source(_job.get("source", ""))
+            round_metrics["source_funnel"][_src]["static_pass"] += 1
 
         if not static_pass_jobs:
             failed_batch_feedback.append({
@@ -5839,7 +6518,8 @@ def find_jobs_for_user(
                     resolved_live_job = None
 
                     if (
-                        should_attempt_direct_resolution(job, reason)
+                        not NO_GPT_MODE
+                        and should_attempt_direct_resolution(job, reason)
                         and remote_resolution_attempts_this_batch < MAX_REMOTE_FAILURE_RESOLUTION_ATTEMPTS_PER_BATCH
                     ):
                         remote_resolution_attempts_this_batch += 1
@@ -5960,6 +6640,9 @@ def find_jobs_for_user(
         print(f"\nLive jobs ready for review after batch {batch_number}: {batch_remote_pass}")
         round_metrics["live_jobs_count"] += batch_remote_pass
         round_metrics["ai_reviewed_count"] += batch_remote_pass
+        for _job in live_jobs_for_review:
+            _src = classify_job_source(_job.get("source", ""))
+            round_metrics["source_funnel"][_src]["remote_pass"] += 1
 
         if not live_jobs_for_review:
             remote_fail_summary = dict(Counter(batch_remote_fail_types).most_common(5))
@@ -5991,6 +6674,7 @@ def find_jobs_for_user(
             search_contract=search_contract,
             minimum_viable_mode=minimum_viable_mode,
         )
+        round_metrics["openai_review_calls"] += 1
 
         review_rejected_jobs_this_round.extend(review_rejected_jobs)
         rejected_jobs.extend({**job, "round_mode": round_mode, "batch": batch_number} for job in review_rejected_jobs)
@@ -6027,6 +6711,8 @@ def find_jobs_for_user(
                     existing_urls.add(normalize_url(posted_job["job_url"]))
                     existing_company_titles.add(company_title_key(posted_job))
                     avoid_urls.add(normalize_url(posted_job["job_url"]))
+                    _src = classify_job_source(posted_job.get("source", ""))
+                    round_metrics["source_funnel"][_src]["added"] += 1
 
             except Exception as e:
                 print(f"POST FAILED for {email}. Jobs not counted as posted. Error: {e}")
@@ -6142,6 +6828,19 @@ def find_jobs_for_user(
         f"  |  dead companies: {len(rejected_companies)}  |  dead domains: {len(rejected_domains)}"
     )
     print("============================================================")
+
+    _cost_breakdown = {
+        "openai_search":   round(round_metrics["openai_search_calls"]       * COST_PER_OPENAI_SEARCH_CALL,   4),
+        "openai_review":   round(round_metrics["openai_review_calls"]        * COST_PER_OPENAI_REVIEW_CALL,   4),
+        "openai_resolver": round(round_metrics["direct_resolution_attempts"] * COST_PER_OPENAI_RESOLVER_CALL, 4),
+        "openai_pivot":    round(round_metrics["openai_pivot_calls"]         * COST_PER_OPENAI_PIVOT_CALL,    4),
+        "openai_persona":  round(COST_PER_PERSONA_CREATE  if round_metrics["persona_created_this_run"]  else 0, 4),
+        "openai_contract": round(COST_PER_CONTRACT_CREATE if round_metrics["contract_created_this_run"] else 0, 4),
+        "apify_hc":        round(round_metrics["hc_raw_results"]   * COST_PER_HC_RESULT,   4),
+        "jobo":            round(round_metrics["jobo_raw_results"]  * COST_PER_JOBO_RESULT, 4),
+    }
+    round_metrics["cost_breakdown"] = _cost_breakdown
+    round_metrics["estimated_cost_usd"] = round(sum(_cost_breakdown.values()), 4)
 
     return {
         "user": user,
@@ -6265,7 +6964,7 @@ def get_eligible_paid_users():
             print(f"SKIP: could not fetch automation — {e}")
             continue
 
-        if not has_active_automation(automation):
+        if not should_bypass_automation_check(user, email) and not has_active_automation(automation):
             print("SKIP: no active automation")
             print("  automation debug:", json.dumps(automation_debug_summary(automation), indent=2, default=str))
             continue
@@ -6292,6 +6991,7 @@ def run_round(
     previous_results_by_uid=None,
     minimum_viable_mode=False,
     accumulated_results=None,
+    source_limit_overrides=None,
 ):
     previous_results_by_uid = previous_results_by_uid or {}
 
@@ -6315,7 +7015,7 @@ def run_round(
             automation = user.get("_automation_cache") or get_user_automation(uid)
             if automation is not None:
                 user["_automation_cache"] = automation
-            if not has_active_automation(automation):
+            if not should_bypass_automation_check(user, email) and not has_active_automation(automation):
                 print("SKIP: no active automation")
                 print("  automation debug:", json.dumps(automation_debug_summary(automation), indent=2, default=str))
                 continue
@@ -6336,6 +7036,7 @@ def run_round(
                 round_mode=round_mode,
                 previous_result=previous_results_by_uid.get(uid),
                 minimum_viable_mode=minimum_viable_mode,
+                source_limit_overrides=(source_limit_overrides or {}).get(user.get("uid")),
             )
             round_results.append(result)
             if accumulated_results is not None:
@@ -6652,12 +7353,12 @@ def send_slack_run_report(results_by_uid):
             "uid": uid,
             "name": name,
             "email": email,
-            "jobs_found": jobs_found,
+            "jobs_found_today": jobs_found,
             "jobs_target": TARGET_JOBS_PER_USER,
-            "pending_today": pending,
-            "needs_manual_search": needs_manual,
+            "location_preference": location_places,
             "search_keywords": keywords[:3],
-            "location": location_places,
+            "daily_report_sent": True,
+            "needs_manual_search": needs_manual,
         }
         users.append(entry)
         if needs_manual:
@@ -6665,13 +7366,12 @@ def send_slack_run_report(results_by_uid):
 
     payload = {
         "run_date": run_date,
-        "users": users,
-        "summary": {
-            "total_jobs_found": total_found,
-            "total_jobs_still_needed": total_needed,
-            "users_processed": len(users),
-            "manual_search_needed": manual_search,
-        },
+        "total_jobs_found": total_found,
+        "total_jobs_still_needed": total_needed,
+        "users_processed": len(users),
+        "emails_sent": len(users),
+        "run_duration_minutes": 0,
+        "user_results": users,
     }
 
     try:
@@ -6765,7 +7465,7 @@ def build_previous_run_results_by_uid(previous_run_data):
 # ============================================================
 
 def apply_cli_overrides():
-    global SINGLE_USER_EMAIL, SINGLE_USER_EMAILS, SINGLE_USER_UID, MAX_USERS_TO_PROCESS
+    global SINGLE_USER_EMAIL, SINGLE_USER_EMAILS, SINGLE_USER_UID, MAX_USERS_TO_PROCESS, NO_GPT_MODE
 
     # Load env-based multi-email filter first. CLI values are added to this set.
     env_email_values = []
@@ -6792,14 +7492,26 @@ def apply_cli_overrides():
   python3 send_jobbyo.py --uid=FirebaseUidHere
   python3 send_jobbyo.py --max-users 3
   python3 send_jobbyo.py --max-users=3
+  python3 send_jobbyo.py --nogpt
 
 Environment alternatives:
   JOBBYO_SINGLE_USER_EMAIL=user@example.com python3 send_jobbyo.py
   JOBBYO_SINGLE_USER_EMAILS=user1@example.com,user2@example.com python3 send_jobbyo.py
   JOBBYO_SINGLE_USER_UID=FirebaseUidHere python3 send_jobbyo.py
   OPENAI_API_KEY=your_key_here python3 send_jobbyo.py
+  JOBBYO_NO_GPT=1 JOBO_API_KEY=your_key python3 send_jobbyo.py
 """)
             sys.exit(0)
+
+        if arg in {"--nogpt", "--no-gpt", "--no-openai"}:
+            NO_GPT_MODE = True
+            i += 1
+            continue
+
+        if arg.startswith("--nogpt=") or arg.startswith("--no-gpt=") or arg.startswith("--no-openai="):
+            NO_GPT_MODE = str(arg.split("=", 1)[1]).strip().lower() not in {"0", "false", "no", "off"}
+            i += 1
+            continue
 
         if arg in {"--email", "--single-email", "--emails"}:
             if i + 1 >= len(args) or args[i + 1].startswith("--"):
@@ -6881,6 +7593,7 @@ def main():
 
     print("Starting paid-user job automation script...")
     print(f"DRY_RUN={DRY_RUN}")
+    print(f"NO_GPT_MODE={NO_GPT_MODE}")
     print(f"SEARCH_MODEL={SEARCH_MODEL}")
     print(f"REVIEW_MODEL={REVIEW_MODEL}")
     print(f"MAX_USERS_TO_PROCESS={MAX_USERS_TO_PROCESS}")
@@ -6904,6 +7617,10 @@ def main():
     print(f"INVENTORY_CANDIDATES_PER_USER={INVENTORY_CANDIDATES_PER_USER}")
     print(f"SAFE_FALLBACK_MIN_GRADE={SAFE_FALLBACK_MIN_GRADE}")
     print(f"DISCOVERY_PENDING_MIN_GRADE={DISCOVERY_PENDING_MIN_GRADE}")
+    print(f"ENABLE_HIRING_CAFE_PREFETCH={ENABLE_HIRING_CAFE_PREFETCH} HIRING_CAFE_MAX_ITEMS={HIRING_CAFE_MAX_ITEMS} HIRING_CAFE_BATCH_SIZE={HIRING_CAFE_BATCH_SIZE}")
+    print(f"ENABLE_JOBO_ATS_PREFETCH={ENABLE_JOBO_ATS_PREFETCH} JOBO_ATS_MAX_ITEMS={JOBO_ATS_MAX_ITEMS} JOBO_LOCAL_SCORE_MIN={JOBO_LOCAL_SCORE_MIN}")
+    if NO_GPT_MODE:
+        print(f"NO-GPT limits: JOBO_KEYWORDS={NOGPT_JOBO_KEYWORDS}, JOBO_MAX_CALLS_PER_USER={NOGPT_JOBO_MAX_CALLS_PER_USER}, US_EXTRA_CALLS={NOGPT_JOBO_US_EXTRA_CALLS}, HC_KEYWORDS={NOGPT_HIRING_CAFE_KEYWORDS}")
 
     users = get_eligible_paid_users()
 
@@ -6950,7 +7667,6 @@ def main():
         previous_results_by_uid=previous_run_by_uid,
         accumulated_results=all_results,
     )
-    all_results.extend(first_round_results)
     save_run_log(all_results)
 
     first_results_by_uid = {}
@@ -6969,6 +7685,31 @@ def main():
         threshold=MIN_JOBS_BEFORE_SECOND_ROUND,
     )
 
+    # Compute per-source success rates from Round 1 to adapt Round 2 fetch budgets.
+    _r1_source_rates = compute_source_success_rates(first_round_results)
+    print(f"\nRound 1 source rates:  " + "  ·  ".join(f"{s} {v:.0%}" for s, v in _r1_source_rates.items()))
+
+    _best_source = max(_r1_source_rates, key=_r1_source_rates.get)
+    _r2_source_limit_overrides = {}
+    for r in first_round_results:
+        _uid = (r.get("user_profile") or {}).get("uid") or (r.get("user") or {}).get("uid")
+        if not _uid:
+            continue
+        _overrides = {}
+        if _r1_source_rates.get("hc", 0) == max(_r1_source_rates.values()) and _r1_source_rates["hc"] > 0:
+            _overrides["hc"] = max(10, int(HIRING_CAFE_MAX_ITEMS * 1.5))
+        elif _r1_source_rates.get("hc", 0) == 0:
+            _overrides["hc"] = max(10, int(HIRING_CAFE_MAX_ITEMS * 0.5))
+        if _r1_source_rates.get("jobo", 0) == max(_r1_source_rates.values()) and _r1_source_rates["jobo"] > 0:
+            _overrides["jobo"] = max(10, int(JOBO_ATS_MAX_ITEMS * 1.5))
+        elif _r1_source_rates.get("jobo", 0) == 0:
+            _overrides["jobo"] = max(10, int(JOBO_ATS_MAX_ITEMS * 0.5))
+        if _overrides:
+            _r2_source_limit_overrides[_uid] = _overrides
+
+    if _best_source in ("hc", "jobo") and _r1_source_rates[_best_source] > 0:
+        print(f"Round 2 budget adjustment:  {_best_source.upper()} +50%  (best performer at {_r1_source_rates[_best_source]:.0%})")
+
     if second_round_users:
         print(
             f"\nStarting automatic second round for {len(second_round_users)} users "
@@ -6981,8 +7722,8 @@ def main():
             round_mode="second_round",
             previous_results_by_uid=first_results_by_uid,
             accumulated_results=all_results,
+            source_limit_overrides=_r2_source_limit_overrides,
         )
-        all_results.extend(second_round_results)
         save_run_log(all_results)
     else:
         print(
@@ -7013,7 +7754,6 @@ def main():
             minimum_viable_mode=True,
             accumulated_results=all_results,
         )
-        all_results.extend(minimum_viable_results)
         save_run_log(all_results)
     else:
         print(f"\nNo minimum viable round needed — all users at or above {MIN_ACCEPTABLE_JOBS_PER_USER} jobs.")
@@ -7048,15 +7788,104 @@ def main():
     if not (SINGLE_USER_EMAIL or SINGLE_USER_EMAILS or SINGLE_USER_UID):
         send_slack_run_report(results_by_uid)
 
+    total_new = sum(len(v.get("jobs_added") or []) for v in results_by_uid.values())
+    total_rejected = sum(len(r.get("jobs_rejected_by_review") or []) for r in all_results)
+
+    # Write run_costs JSON
+    import datetime as _dt
+    _run_ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    _run_date = _dt.datetime.now().strftime("%Y-%m-%d")
+    _cost_report_users = []
+    _total_cost = 0.0
+    for _uid, _merged in results_by_uid.items():
+        _up = _merged.get("user_profile") or {}
+        _u = _merged.get("user") or {}
+        _rm = _merged.get("round_metrics") or {}
+        _funnel = _rm.get("source_funnel", {})
+        _jobs_by_source = {src: counts.get("added", 0) for src, counts in _funnel.items()}
+        _cost = _rm.get("estimated_cost_usd", 0.0)
+        _total_cost += _cost
+        _cost_report_users.append({
+            "uid": _uid,
+            "email": _up.get("email") or _u.get("email") or "",
+            "name": _up.get("displayName") or _u.get("displayName") or _uid,
+            "jobs_added": len(_merged.get("jobs_added") or []),
+            "jobs_by_source": _jobs_by_source,
+            "estimated_cost_usd": _cost,
+            "cost_breakdown": _rm.get("cost_breakdown", {}),
+            "source_funnel": _funnel,
+        })
+    _cost_payload = {
+        "run_date": _run_date,
+        "run_timestamp": _run_ts,
+        "total_estimated_cost_usd": round(_total_cost, 4),
+        "source_rates": _r1_source_rates,
+        "users": _cost_report_users,
+    }
+    try:
+        import os as _os
+        _os.makedirs("run_logs", exist_ok=True)
+        _cost_file = f"run_logs/run_costs_{_run_ts}.json"
+        with open(_cost_file, "w") as _f:
+            json.dump(_cost_payload, _f, indent=2)
+        print(f"\nCost report saved: {_cost_file}")
+    except Exception as _e:
+        print(f"WARNING: could not write cost report: {_e}")
+
     print("\n\n============================================================")
-    print("DONE")
+    print("RUN COMPLETE")
     print("============================================================")
-    print(f"Max rounds allowed per user: {MAX_ROUNDS_PER_USER}")
-    print(f"Total result groups: {len(all_results)}")
-    print(f"Total jobs approved and posted/found: {sum(len(r.get('jobs_added', [])) for r in all_results)}")
-    print(f"Total jobs rejected by AI review: {sum(len(r.get('jobs_rejected_by_review', [])) for r in all_results)}")
-    print(f"DRY_RUN: {DRY_RUN}")
+
+    for uid, merged in results_by_uid.items():
+        user_profile = merged.get("user_profile") or {}
+        user = merged.get("user") or {}
+        name = user_profile.get("displayName") or user.get("displayName") or uid
+        email = user_profile.get("email") or user.get("email") or ""
+        new_jobs = len(merged.get("jobs_added") or [])
+        pending = merged.get("pending_today_after_estimate", 0)
+        rm = merged.get("round_metrics") or {}
+        funnel = rm.get("source_funnel", {})
+        cost = rm.get("estimated_cost_usd", 0.0)
+        breakdown = rm.get("cost_breakdown", {})
+
+        if pending >= TARGET_JOBS_PER_USER:
+            icon = "✅"
+        elif pending >= MIN_ACCEPTABLE_JOBS_PER_USER:
+            icon = "⚠️ "
+        else:
+            icon = "🔴"
+
+        print(f"{icon} {name} ({email})")
+        print(f"   {new_jobs} new job(s) added this run  ·  {pending}/{TARGET_JOBS_PER_USER} total in queue")
+        _src_parts = "  ·  ".join(
+            f"{s.upper()} {counts.get('added', 0)}"
+            for s, counts in funnel.items()
+        )
+        if _src_parts:
+            print(f"   Sources:  {_src_parts}")
+        _bd_parts = (
+            f"HC ${breakdown.get('apify_hc', 0):.4f}"
+            f"  ·  ChatGPT search ${breakdown.get('openai_search', 0):.4f}"
+            f"  ·  ChatGPT review ${breakdown.get('openai_review', 0):.4f}"
+            f"  ·  Jobo ${breakdown.get('jobo', 0):.4f}"
+        )
+        print(f"   Est. cost: ${cost:.4f}  →  {_bd_parts}")
+
+    print()
+    print(f"Source rates this run:  " + "  ·  ".join(f"{s.upper()} {v:.0%}" for s, v in _r1_source_rates.items()))
+    print()
+    print(f"Users processed : {len(results_by_uid)}")
+    print(f"New jobs posted : {total_new}")
+    print(f"Jobs rejected   : {total_rejected}")
+    print(f"Total est. cost : ${_total_cost:.4f}  (approx — update COST_PER_* constants to calibrate)")
+    try:
+        print(f"Cost report     : {_cost_file}")
+    except NameError:
+        pass
+    if DRY_RUN:
+        print("DRY RUN — nothing was actually posted")
 
 
 if __name__ == "__main__":
     main()
+
