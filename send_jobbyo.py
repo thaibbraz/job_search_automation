@@ -4313,8 +4313,20 @@ def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job
         normal_post_decisions = {"exact_match", "strong_adjacent", "safe_fallback", "good_match"}
         manual_review_statuses = {STARTER_MAX_STATUS, DEFAULT_STATUS, DISCOVERY_PENDING_STATUS, "waiting_approval"}
 
-        grade_floor = MIN_VIABLE_SAFE_FALLBACK_GRADE if minimum_viable_mode else SAFE_FALLBACK_MIN_GRADE
-        conf_floor = MIN_VIABLE_CONFIDENCE if minimum_viable_mode else MIN_REVIEW_CONFIDENCE
+        # ATS-direct sources (Jobo, HC, LinkedIn Apify, resolver) are already
+        # verified real open positions — apply a slightly lower floor than OpenAI.
+        _is_ats_direct = str(job.get("source", "")).startswith(
+            ("jobo_ats", "hiring_cafe", "linkedin_apify", "direct_url_resolver")
+        )
+        if minimum_viable_mode:
+            grade_floor = MIN_VIABLE_SAFE_FALLBACK_GRADE
+            conf_floor  = MIN_VIABLE_CONFIDENCE
+        elif _is_ats_direct:
+            grade_floor = 62
+            conf_floor  = 60
+        else:
+            grade_floor = SAFE_FALLBACK_MIN_GRADE
+            conf_floor  = MIN_REVIEW_CONFIDENCE
 
         allow_normal_post = (
             decision in normal_post_decisions
