@@ -112,7 +112,7 @@ FORCE_USER_EMAILS = {
 }
 
 # Target new-match jobs per user per day.
-TARGET_JOBS_PER_USER = 10
+TARGET_JOBS_PER_USER = env_int("JOBBYO_TARGET_JOBS", 9)
 
 # The second overnight round only runs for users still below this count after
 # the first round AND only when Round 1 had enough live/direct-source signal.
