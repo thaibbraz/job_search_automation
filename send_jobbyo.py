@@ -173,7 +173,7 @@ APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "")
 APIFY_HIRING_CAFE_ACTOR_ID = "memo23~apify-hiring-cafe-scraper"
 HIRING_CAFE_MAX_ITEMS = 50           # raw results fetched per user from HC
 HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
-HIRING_CAFE_LOCAL_SCORE_MIN = 28     # same floor as INVENTORY_LOCAL_SCORE_MIN
+HIRING_CAFE_LOCAL_SCORE_MIN = 15     # same floor as Jobo/LinkedIn — AI review handles fit
 ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
 
 JOBO_API_BASE = "https://connect.jobo.world"
@@ -7218,6 +7218,14 @@ def get_eligible_paid_users():
             print("  automation debug:", json.dumps(automation_debug_summary(automation), indent=2, default=str))
             continue
 
+        # Skip users with no job titles — we have nothing to search with.
+        # Send them a one-time nudge email to complete their profile.
+        _titles = extract_automation_job_titles(automation, limit=3)
+        if not _titles:
+            print(f"SKIP: no job titles configured — sending profile-incomplete email to {email}")
+            send_incomplete_profile_email(email, display_name or email)
+            continue
+
         plan = get_user_plan(user=user, automation=automation)
         job_status = status_for_user_plan(plan)
         existing_jobs = extract_existing_jobs(automation)
@@ -7557,6 +7565,28 @@ def build_daily_report_payload(result):
             "app_url": app_url,
         },
     }
+
+
+def send_incomplete_profile_email(email, name):
+    """Notify a user that their profile has no job titles and we couldn't search for them."""
+    payload = {
+        "email": email,
+        "name": name,
+        "type": "incomplete_profile",
+        "message": (
+            "We tried to find jobs for you today but your profile doesn't have any job titles set. "
+            "Please log in and add your target job titles so we can start finding matches for you."
+        ),
+    }
+    try:
+        resp = requests.post(
+            f"{DAILY_REPORT_API_BASE}/api/notifications/incomplete-profile",
+            json=payload,
+            timeout=15,
+        )
+        print(f"Incomplete-profile email → {email}  [{resp.status_code}]")
+    except Exception as e:
+        print(f"Incomplete-profile email failed ({email}): {e}")
 
 
 def send_daily_report(result):

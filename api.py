@@ -76,12 +76,14 @@ class TopJob(BaseModel):
     url:      Optional[str] = None
     location: Optional[str] = None
     grade:    Optional[int] = None
+    reason:   Optional[str] = None
 
 
 class TopJobsResponse(BaseModel):
-    accepted: bool
-    message:  str
-    jobs:     list[TopJob]
+    accepted:        bool
+    message:         str
+    duration_seconds: float
+    jobs:            list[TopJob]
 
 class StatusResponse(BaseModel):
     full_run_active:            bool
@@ -205,6 +207,7 @@ async def run_user_top_jobs(target: UserTarget, limit: int = 3):
         args, label = ["--email", target.email], f"run:user:{target.email}"
 
     existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
+    started_at = asyncio.get_event_loop().time()
 
     try:
         code = await asyncio.wait_for(
@@ -216,6 +219,8 @@ async def run_user_top_jobs(target: UserTarget, limit: int = 3):
             status_code=504,
             detail=f"Run for {target.uid or target.email} did not finish within {SYNC_RUN_TIMEOUT_SECONDS}s.",
         )
+
+    duration_seconds = round(asyncio.get_event_loop().time() - started_at, 1)
 
     if code != 0:
         raise HTTPException(status_code=500, detail=f"Run failed with exit code {code}. Check server logs for '{label}'.")
@@ -236,14 +241,31 @@ async def run_user_top_jobs(target: UserTarget, limit: int = 3):
             break
 
     if match is None:
-        return TopJobsResponse(accepted=True, message=f"Run finished for {target.uid or target.email}, but no run log entry was found.", jobs=[])
+        return TopJobsResponse(
+            accepted=True,
+            message=f"Run finished for {target.uid or target.email}, but no run log entry was found.",
+            duration_seconds=duration_seconds,
+            jobs=[],
+        )
 
     jobs_added = sorted(match.get("jobs_added") or [], key=lambda j: j.get("grade") or 0, reverse=True)[:limit]
     jobs = [
-        TopJob(title=j.get("title"), company=j.get("company"), url=j.get("job_url"), location=j.get("location"), grade=j.get("grade"))
+        TopJob(
+            title=j.get("title"),
+            company=j.get("company"),
+            url=j.get("job_url"),
+            location=j.get("location"),
+            grade=j.get("grade"),
+            reason=j.get("review_reason"),
+        )
         for j in jobs_added
     ]
-    return TopJobsResponse(accepted=True, message=f"Found {len(jobs)} job(s) for {target.uid or target.email}.", jobs=jobs)
+    return TopJobsResponse(
+        accepted=True,
+        message=f"Found {len(jobs)} job(s) for {target.uid or target.email}.",
+        duration_seconds=duration_seconds,
+        jobs=jobs,
+    )
 
 
 # --- Approve + email -------------------------------------------------------
