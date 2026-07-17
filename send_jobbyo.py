@@ -7220,7 +7220,7 @@ def get_eligible_paid_users():
 
         # Skip users with no job titles — we have nothing to search with.
         # Send them a one-time nudge email to complete their profile.
-        _titles = extract_automation_job_titles(automation, limit=3)
+        _titles = extract_automation_job_titles(automation, limit=3) if automation else []
         if not _titles:
             print(f"SKIP: no job titles configured — sending profile-incomplete email to {email}")
             send_incomplete_profile_email(email, display_name or email)
