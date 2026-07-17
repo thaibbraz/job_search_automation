@@ -171,7 +171,7 @@ PERMANENTLY_BLOCKED_COMPANIES = {
 # 7 OpenAI search batches, and returns direct ATS URLs (Ashby, Greenhouse, etc.)
 APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "")
 APIFY_HIRING_CAFE_ACTOR_ID = "memo23~apify-hiring-cafe-scraper"
-HIRING_CAFE_MAX_ITEMS = 15           # raw results fetched per user from HC
+HIRING_CAFE_MAX_ITEMS = 50           # raw results fetched per user from HC
 HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
 HIRING_CAFE_LOCAL_SCORE_MIN = 28     # same floor as INVENTORY_LOCAL_SCORE_MIN
 ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
@@ -184,10 +184,6 @@ ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 
 # Jobicy — free public API for remote jobs; used as discovery source only.
 # Top-scored candidates are sent through the resolver to obtain ATS-direct URLs.
-JOBICY_MAX_ITEMS = 30            # raw results per API call (free, no key required)
-JOBICY_LOCAL_SCORE_MIN = 15      # same floor as Jobo — resolver + AI review handle fit
-JOBICY_RESOLVE_LIMIT = 10        # max top-scored Jobicy candidates to resolve per round
-ENABLE_JOBICY_PREFETCH = True    # always on (free API, no key needed)
 
 # LinkedIn via Apify — highest-priority source (direct ATS apply URLs, rich metadata)
 # Reuses the same APIFY_API_TOKEN as Hiring Cafe.
@@ -296,7 +292,7 @@ def jobs_to_request(jobs_needed, round_mode="first_round"):
 
 # Maximum number of internal strategy pivots per user per run. Round 1 can create
 # the first pivot after its final batch. Round 2 starts with the second pivot.
-MAX_STRATEGY_PIVOTS_PER_USER = 2
+MAX_STRATEGY_PIVOTS_PER_USER = 1
 
 REMOTE_TIMEOUT_SECONDS = 8
 REMOTE_WORKERS = 14
@@ -5966,115 +5962,6 @@ def _parse_linkedin_apify_job(raw_item):
     }
 
 
-def _parse_jobicy_job(raw_item):
-    """Map one Jobicy API result to the internal job dict format.
-
-    Jobicy URLs point to jobicy.com — callers must resolve them to ATS URLs
-    before adding to the pool. This parser is for local scoring only.
-    """
-    if not isinstance(raw_item, dict):
-        return None
-    job_url = str(raw_item.get("url") or "").strip()
-    if not job_url.startswith("http"):
-        return None
-    title = str(raw_item.get("jobTitle") or "").strip()
-    company = str(raw_item.get("companyName") or "").strip()
-    if not title or not company:
-        return None
-    description = str(raw_item.get("jobDescription") or "")[:3000]
-    location = str(raw_item.get("jobGeo") or "").strip()
-    salary = str(raw_item.get("salary") or "").strip()
-    if salary:
-        description = f"Salary: {salary}\n\n" + description
-    return {
-        "job_url": job_url,
-        "title": title,
-        "company": company,
-        "description": description,
-        "location": location,
-        "source": f"jobicy/{str(raw_item.get('id', ''))}"[:80],
-        "grade": 70,
-    }
-
-
-def fetch_jobicy_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
-    """Fetch Jobicy remote jobs as a free discovery source.
-
-    Returns locally-scored candidates whose URLs still point to jobicy.com.
-    The caller is responsible for resolving the top candidates to ATS-direct URLs
-    via resolve_direct_job_urls() before adding them to the pre-fetch pool.
-    """
-    if not ENABLE_JOBICY_PREFETCH:
-        return [], 0
-
-    limit = limit or JOBICY_MAX_ITEMS
-
-    # Three-tier keyword extraction — same priority as HC/LinkedIn
-    keywords = []
-    if persona and isinstance(persona, dict):
-        _target = persona.get("target_titles") or []
-        keywords = [str(t).strip() for t in _target if str(t).strip()][:2]
-    if not keywords:
-        keywords = extract_automation_job_titles(automation, limit=2)
-    if not keywords:
-        _prefs = extract_job_preferences(automation)
-        _raw = _prefs.get("jobTitles") or []
-        keywords = [str(t).strip() for t in _raw if str(t).strip()][:2]
-
-    if not keywords:
-        print("Jobicy: no keywords extracted — skipping prefetch")
-        return [], 0
-
-    keyword = keywords[0]  # Jobicy search param is a single string
-
-    try:
-        resp = requests.get(
-            "https://jobicy.com/api/v2/remote-jobs",
-            params={"count": limit, "search": keyword},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        raw_items = data.get("jobs") or []
-    except Exception as e:
-        print(f"Jobicy API error: {e}")
-        return [], 0
-
-    print(f"\nJobicy prefetch  keyword={keyword!r}  count={limit}  → {len(raw_items)} raw results")
-
-    avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
-    blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
-
-    seen_co_title = set()
-    parsed = []
-    for raw in raw_items:
-        job = _parse_jobicy_job(raw)
-        if not job:
-            continue
-        co = re.sub(r"\s+", " ", job["company"].strip().lower())
-        ti = re.sub(r"\s+", " ", job["title"].strip().lower())
-        if (co, ti) in seen_co_title:
-            continue
-        seen_co_title.add((co, ti))
-        norm = normalize_url(job["job_url"])
-        if norm and norm in avoid_norm:
-            continue
-        if co and co in blocked_cos:
-            continue
-        score = local_inventory_match_score(
-            job, automation=automation, search_contract=search_contract, user_profile=user_profile
-        )
-        if score < JOBICY_LOCAL_SCORE_MIN:
-            continue
-        job["grade"] = max(job["grade"], score)
-        job["inventory_local_score"] = score
-        parsed.append((score, job))
-
-    parsed.sort(key=lambda x: x[0], reverse=True)
-    results = [j for _, j in parsed]
-    print(f"Jobicy: {len(results)} candidates after local scoring (min score {JOBICY_LOCAL_SCORE_MIN})")
-    return results, len(raw_items)
-
 
 def fetch_linkedin_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
     """Fetch and locally-score LinkedIn jobs via Apify actor (2rJKkhh7vjpX7pvjg).
@@ -6422,7 +6309,6 @@ def find_jobs_for_user(
         "linkedin_raw_results": 0,
         "hc_raw_results": 0,
         "jobo_raw_results": 0,
-        "jobicy_raw_results": 0,
         "persona_created_this_run": False,
         "contract_created_this_run": False,
         "source_funnel": {
@@ -6522,37 +6408,7 @@ def find_jobs_for_user(
         round_metrics["jobo_raw_results"] += _jobo_raw
         hc_inventory.extend(_jobo_jobs)
 
-    # 2.5. Jobicy — free remote-job discovery → resolver → ATS-direct URLs.
-    # Fetch + local-score Jobicy results; resolve the top N to real ATS URLs.
-    # Only runs when pool still needs more candidates.
-    if ENABLE_JOBICY_PREFETCH and round_mode in ("first_round", "second_round"):
-        _jobicy_candidates, _jobicy_raw = fetch_jobicy_for_user(
-            automation=automation,
-            search_contract=search_contract,
-            user_profile=user_profile,
-            avoid_urls=avoid_urls,
-            rejected_companies=rejected_companies,
-            persona=persona,
-        )
-        round_metrics["jobicy_raw_results"] += _jobicy_raw
-        if _jobicy_candidates:
-            _to_resolve = _jobicy_candidates[:JOBICY_RESOLVE_LIMIT]
-            print(f"Jobicy → resolver: resolving {len(_to_resolve)} top-scored candidates")
-            for _jc_job in _to_resolve:
-                round_metrics["direct_resolution_attempts"] += 1
-                _resolved = resolve_direct_job_urls(
-                    _jc_job,
-                    avoid_urls=avoid_urls,
-                    rejected_domains=rejected_domains,
-                )
-                if _resolved:
-                    round_metrics["direct_resolution_successes"] += 1
-                    hc_inventory.extend(_resolved)
-                    print(f"  ✓ {_jc_job['company']} — {_jc_job['title']} → {len(_resolved)} ATS URL(s)")
-                else:
-                    print(f"  ✗ No ATS URL found: {_jc_job['company']} — {_jc_job['title']}")
-
-    # 3. LinkedIn — only when HC+Jobo+Jobicy pool is too thin to fill the user's quota.
+    # 3. LinkedIn — only when HC+Jobo pool is too thin to fill the user's quota.
     # Skipping saves ~$0.09/user when cheaper sources already have enough candidates.
     _li_limit = (source_limit_overrides or {}).get("linkedin")
     _hc_jobo_pool_size = len(hc_inventory)
@@ -7231,7 +7087,6 @@ def find_jobs_for_user(
         "apify_linkedin":  round(round_metrics["linkedin_raw_results"] * COST_PER_LINKEDIN_RESULT, 4),
         "apify_hc":        round(round_metrics["hc_raw_results"]      * COST_PER_HC_RESULT,        4),
         "jobo":            round(round_metrics["jobo_raw_results"]     * COST_PER_JOBO_RESULT,      4),
-        "jobicy":          0.0,  # free public API
     }
     round_metrics["cost_breakdown"] = _cost_breakdown
     round_metrics["estimated_cost_usd"] = round(sum(_cost_breakdown.values()), 4)
