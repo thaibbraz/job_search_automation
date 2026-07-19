@@ -4067,6 +4067,12 @@ Strict rejection rules:
 - Do not reject just because it is not perfect; use strong_adjacent or safe_fallback when it is useful and safe.
 - recommended_grade must be an integer from 1 to 100. Never use a 1-5 or 1-10 scale. Example: a strong match should be 80-95, not 4 or 5.
 
+REASON FIELD (required):
+Write 1-2 sentences addressed directly to the candidate, as a career manager explaining why you selected this specific role for them.
+Be specific: reference something from their CV or profile and connect it to this exact role.
+Example: "Your background running multi-channel marketing campaigns aligns well with what this team needs — they're scaling events across EMEA and want someone who has done this before."
+Do NOT write generic phrases like "This role matches your skills." Make it personal and concrete.
+
 USER:
 {json.dumps({
     "uid": user_profile.get("uid"),
@@ -4340,7 +4346,7 @@ def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job
                 "review_decision": stored_decision,
                 "match_tier": stored_decision,
                 "review_confidence": confidence,
-                "review_reason": reason[:500],
+                "review_reason": (reason or job.get("review_reason") or "")[:500],
             }
 
             # Preserve useful metadata for audit/debug in selectedJobs.
@@ -4372,6 +4378,105 @@ def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job
                     print(f"    - {flag}")
 
     return approved, rejected
+
+
+def regrade_ungraded_jobs(user_profile, automation, cv_text, persona, email, job_status):
+    """AI-review any of today's selectedJobs with grade=0 or null, and post back updated grades/reasons.
+
+    Called at the end of each user's run to ensure every job has a grade and
+    review_reason, regardless of whether it was sourced before the current
+    review pipeline was in place.
+    """
+    uid = user_profile.get("uid") or ""
+    fresh_auto = get_user_automation(uid) or automation
+    all_jobs = extract_existing_jobs(fresh_auto)
+
+    today = date.today()
+
+    def _job_is_today(j):
+        for field in ("addedAt", "createdAt", "added_at", "created_at"):
+            val = j.get(field)
+            if val:
+                try:
+                    dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+                    return dt.date() == today
+                except Exception:
+                    pass
+        return False
+
+    ungraded = [
+        j for j in all_jobs
+        if isinstance(j, dict)
+        and not int(j.get("grade") or 0)
+        and _job_is_today(j)
+        and j.get("job_url")
+        and j.get("title")
+    ]
+
+    if not ungraded:
+        print("Grade check: all today's jobs have grades ✓")
+        return 0
+
+    print(f"\n⚠  REGRADE: {len(ungraded)} of today's jobs have grade=0 — running AI review")
+
+    candidates = [
+        {
+            "job_url": j["job_url"],
+            "title": j.get("title") or "",
+            "description": (j.get("description") or "")[:800],
+            "company": j.get("company") or "",
+            "grade": 70,
+            "location": j.get("location") or "",
+            "source": j.get("source") or "",
+        }
+        for j in ungraded
+    ]
+
+    try:
+        review = review_jobs_with_ai(
+            user_profile=user_profile,
+            automation=automation,
+            cv_text=cv_text,
+            persona=persona,
+            jobs=candidates,
+            minimum_viable_mode=True,
+        )
+    except Exception as e:
+        print(f"Regrade review error: {e}")
+        return 0
+
+    reviews_by_url = {
+        normalize_url(r.get("job_url", "")): r
+        for r in (review.get("reviews") or [])
+    }
+
+    updated = []
+    for orig in ungraded:
+        norm = normalize_url(orig.get("job_url", ""))
+        item = reviews_by_url.get(norm)
+        if not item:
+            continue
+        grade = normalize_grade(item.get("recommended_grade") or 65)
+        reason = (item.get("reason") or "").strip()[:500]
+        updated.append({
+            **orig,
+            "grade": grade,
+            "review_reason": reason,
+            "review_decision": item.get("decision") or "regraded",
+            "review_confidence": int(item.get("confidence") or 0),
+        })
+
+    if not updated:
+        print("Regrade: AI returned no matches")
+        return 0
+
+    try:
+        api_post_jobs(email, updated, default_status=job_status)
+        print(f"✓ Regrade: {len(updated)}/{len(ungraded)} jobs updated with AI grades + reasons")
+        return len(updated)
+    except Exception as e:
+        print(f"Regrade post failed: {e}")
+        return 0
 
 
 # ============================================================
@@ -6241,6 +6346,55 @@ def find_jobs_for_user(
         _pool_sources = "HC + Jobo ATS"
         print(f"Pre-fetch pool: {len(hc_inventory)} total jobs ({_pool_sources})")
 
+    # PROPER FIX: pre-grade the full HC/Jobo pool with a single AI review call
+    # before batching. Every pool job gets an AI grade + reason upfront so that:
+    #   - The per-batch review can use the pre-grade as a baseline (via candidate_job["grade"])
+    #   - If the per-batch AI returns no reason, the pre-grade reason is used as fallback
+    #   - The end-of-run regrade pass can skip jobs that already have grades
+    if hc_inventory and not NO_GPT_MODE and cv_text:
+        print(f"\nPool pre-grade: running AI review on {len(hc_inventory)} HC/Jobo pool jobs...")
+        _pool_candidates = [
+            {
+                "job_url": j["job_url"],
+                "title": j.get("title") or "",
+                "description": (j.get("description") or "")[:800],
+                "company": j.get("company") or "",
+                "grade": normalize_grade(j.get("grade") or 70),
+                "location": j.get("location") or "",
+                "source": j.get("source") or "",
+            }
+            for j in hc_inventory
+            if j.get("job_url") and j.get("title")
+        ]
+        try:
+            _pool_review = review_jobs_with_ai(
+                user_profile=user_profile,
+                automation=automation,
+                cv_text=cv_text,
+                persona=persona,
+                jobs=_pool_candidates,
+                minimum_viable_mode=False,
+            )
+            _pool_pregrade = {
+                normalize_url(r.get("job_url", "")): r
+                for r in (_pool_review.get("reviews") or [])
+            }
+            _pregraded = 0
+            for j in hc_inventory:
+                norm = normalize_url(j.get("job_url", ""))
+                item = _pool_pregrade.get(norm)
+                if item:
+                    j["grade"] = normalize_grade(item.get("recommended_grade") or j.get("grade") or 70)
+                    if item.get("reason"):
+                        j["review_reason"] = item["reason"].strip()[:500]
+                    j["review_decision"] = item.get("decision") or ""
+                    j["review_confidence"] = int(item.get("confidence") or 0)
+                    _pregraded += 1
+            round_metrics["openai_review_calls"] += 1
+            print(f"Pool pre-grade: {_pregraded}/{len(hc_inventory)} jobs pre-graded with AI grades + reasons")
+        except Exception as e:
+            print(f"Pool pre-grade failed (non-fatal, continuing with local scores): {e}")
+
     for batch_number in range(1, max_batches_for_round + 1):
         current_total_estimate = pending_today_before + len(posted_jobs_this_round)
 
@@ -6683,6 +6837,9 @@ def find_jobs_for_user(
                     "status": job_status,
                     "location": job.get("location", ""),
                     "source": job.get("source", ""),
+                    # Pre-grade reason (from pool pre-review) — used as fallback
+                    # in approved_job if the per-batch AI doesn't return a reason.
+                    "review_reason": job.get("review_reason") or "",
                 }
 
                 live_jobs_for_review.append(candidate_job)
@@ -6836,6 +6993,12 @@ def find_jobs_for_user(
 
     pending_today_after_estimate = pending_today_before + len(posted_jobs_this_round)
     needs_more = pending_today_after_estimate < TARGET_JOBS_PER_USER
+
+    # QUICK FIX: after the batch loop, re-grade any of today's jobs that still
+    # have grade=0 or null (from previous pipeline versions, failed reviews, or
+    # any source that bypassed the current review flow).
+    if not NO_GPT_MODE and cv_text:
+        regrade_ungraded_jobs(user_profile, automation, cv_text, persona, email, job_status)
 
     # Only pivot when the round genuinely struggled (≥2 zero-approval batches).
     # Avoids 2 wasted AI calls when Round 1 simply ran out of time/batches.

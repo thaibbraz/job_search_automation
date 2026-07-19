@@ -34,7 +34,11 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 BASE_URL = "https://fastapi-service-03-160893319817.europe-southwest1.run.app"
-DAILY_REPORT_API_BASE = BASE_URL
+
+BREVO_API_KEY = os.getenv("BREVO_API_KEY", "")
+BREVO_API_URL = "https://api.brevo.com/v3"
+SENDER_EMAIL = "hello@jobbyo.ai"
+SENDER_NAME = "Jobbyo"
 
 MIN_JOBS_TO_EMAIL = 8
 PREMIUM_STATUS = "pending"
@@ -44,7 +48,7 @@ MAX_STATUS = "waiting_approval"
 STATUSES_TO_COUNT = {"applied", "pending", "waiting_approval"}
 STATUSES_TO_EMAIL = {"pending", "waiting_approval"}
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/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")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 RUN_LOGS_DIR = Path("run_logs")
 
 # ---------------------------------------------------------------------------
@@ -196,46 +200,87 @@ def promote_jobs(email, jobs_to_promote, new_status):
 # ---------------------------------------------------------------------------
 
 def send_email(user_profile, automation, jobs, override_email=None):
-    """Send the daily report email via the existing API endpoint."""
+    """Send the daily report email directly via Brevo."""
     email = override_email or user_profile.get("email") or ""
     name = user_profile.get("displayName") or (user_profile.get("email") or "").split("@")[0]
+    first_name = name.split()[0] if name else "there"
 
-    job_list = []
+    jobs_html = ""
     for j in jobs:
         title = j.get("title", "")
         company = j.get("company", "")
         url = j.get("job_url") or j.get("url") or ""
         reason = (j.get("review_reason") or j.get("reason") or "").strip()
-        score = int(j.get("grade") or j.get("review_confidence") or 0)
+        grade = int(j.get("grade") or 0)
+
+        # Fallback reason when none stored
+        if not reason:
+            if grade >= 80:
+                reason = f"Strong match ({grade}/100) — selected based on your background and search preferences."
+            elif grade >= 60:
+                reason = f"Good fit ({grade}/100) — aligns with your target roles and location."
+            else:
+                reason = "Selected based on your search preferences and profile."
 
         if url:
-            title_html = f'<a href="{url}" style="color:#111827;text-decoration:none;">{title}</a>'
-            company_html = f'<a href="{url}" style="color:#4b5563;text-decoration:none;">{company}</a>' if company else ""
-            job_title = f'{title_html} · {company_html}' if company_html else title_html
+            title_link = f'<a href="{url}" style="color:#3A56E2;text-decoration:underline;font-weight:700;">{title}</a>'
         else:
-            job_title = f"{title} · {company}" if company else title
+            title_link = f'<strong style="color:#3A56E2;">{title}</strong>'
 
-        job_list.append({
-            "job_title": job_title,
-            "reason": reason,
-            "score": score,
-        })
+        company_part = f' at {company}' if company else ""
+        jobs_html += f'<p style="margin:0 0 20px 0;font-size:15px;color:#111827;line-height:1.7;">{title_link}{company_part}: <span style="color:#374151;">{reason}</span></p>'
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family:Georgia,serif;background:#ffffff;margin:0;padding:0;color:#111827;">
+  <div style="max-width:580px;margin:0 auto;padding:40px 24px;">
+
+    <p style="margin:0 0 6px 0;font-size:12px;font-weight:700;color:#3A56E2;text-transform:uppercase;letter-spacing:0.08em;font-family:Arial,sans-serif;">Jobbyo</p>
+    <p style="margin:0 0 24px 0;font-size:15px;line-height:1.7;">Hi {first_name},</p>
+    <p style="margin:0 0 28px 0;font-size:15px;line-height:1.7;">Here are the roles I found for you today.</p>
+
+    {jobs_html if jobs_html else '<p style="font-size:15px;color:#6b7280;font-style:italic;">No new roles in this batch.</p>'}
+
+    <p style="margin:28px 0 0 0;font-size:15px;line-height:1.7;">Best,<br>Jobbyo</p>
+
+    <hr style="border:none;border-top:1px solid #e5e7eb;margin:32px 0;">
+
+    <div style="text-align:center;margin-bottom:16px;">
+      <a href="https://app.jobbyo.ai/auto-apply" style="display:inline-block;background:#3A56E2;color:#ffffff;text-decoration:none;padding:12px 32px;border-radius:6px;font-size:14px;font-family:Arial,sans-serif;font-weight:600;">
+        Review &amp; Approve Jobs
+      </a>
+    </div>
+    <p style="text-align:center;font-size:12px;color:#9ca3af;font-family:Arial,sans-serif;">
+      <a href="https://app.jobbyo.ai/settings" style="color:#9ca3af;">Manage preferences</a>
+    </p>
+
+  </div>
+</body>
+</html>"""
 
     payload = {
-        "email": email,
-        "name": name,
-        "report": {
-            "jobs": job_list,
-            "changed_rules": "",
-            "next_batch_strategy": "",
-        },
+        "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+        "to": [{"email": email, "name": name}, {"email": "hello@jobbyo.ai", "name": "Jobbyo"}],
+        "subject": f"Your job matches for today, {first_name}",
+        "htmlContent": html_content,
     }
 
-    res = _post(f"{DAILY_REPORT_API_BASE}/api/reports/daily", payload)
-    if res is not None:
+    try:
+        res = requests.post(
+            f"{BREVO_API_URL}/smtp/email",
+            headers={"accept": "application/json", "api-key": BREVO_API_KEY, "content-type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        if res.status_code >= 400:
+            print(f"  Brevo error {res.status_code}: {res.text[:200]}")
+            return False
         print(f"  Email sent → {email}  ({len(jobs)} jobs)")
         return True
-    return False
+    except Exception as e:
+        print(f"  Email failed for {email}: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +349,6 @@ def process_user(user):
     jobs_for_email = [
         j for j in today_jobs
         if _status(j) in STATUSES_TO_EMAIL
-        and int(j.get("grade") or j.get("review_confidence") or 0) > 0
     ]
 
     count = len(jobs_for_count)
