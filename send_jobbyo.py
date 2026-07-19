@@ -6395,6 +6395,8 @@ def find_jobs_for_user(
         except Exception as e:
             print(f"Pool pre-grade failed (non-fatal, continuing with local scores): {e}")
 
+    _hc_jobo_pool_size = len(hc_inventory)  # capture before batch loop consumes slices
+
     for batch_number in range(1, max_batches_for_round + 1):
         current_total_estimate = pending_today_before + len(posted_jobs_this_round)
 
