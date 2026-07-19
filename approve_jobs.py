@@ -40,14 +40,11 @@ MIN_JOBS_TO_EMAIL = 8
 PREMIUM_STATUS = "pending"
 MAX_STATUS = "waiting_approval"
 
-# Statuses that count toward the threshold (has the user been served enough jobs?)
-STATUSES_TO_COUNT = {"pending_review", "waiting_approval", "pending", "applied"}
-# Statuses whose jobs go into the email body (new/unreviewed jobs)
-STATUSES_TO_EMAIL = {"pending_review", "waiting_approval"}
-# Only pending_review needs promotion; waiting_approval/pending are already correct
-STATUS_TO_PROMOTE = "pending_review"
+# Only jobs added TODAY count toward the threshold and email
+STATUSES_TO_COUNT = {"applied", "pending", "waiting_approval"}
+STATUSES_TO_EMAIL = {"pending", "waiting_approval"}
 
-SLACK_WEBHOOK_URL="https://hooks.slack.com/services/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"
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/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")
 RUN_LOGS_DIR = Path("run_logs")
 
 # ---------------------------------------------------------------------------
@@ -67,6 +64,23 @@ def cleanup_old_emailed_logs():
                 print(f"Deleted old log: {f.name}")
         except ValueError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Date helpers
+# ---------------------------------------------------------------------------
+
+def _is_today(job):
+    """Return True if the job was added today (UTC)."""
+    for field in ("addedAt", "createdAt", "added_at", "created_at"):
+        val = job.get(field)
+        if val:
+            try:
+                dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+                return dt.date() == date.today()
+            except Exception:
+                pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -191,13 +205,20 @@ def send_email(user_profile, automation, jobs, override_email=None):
         title = j.get("title", "")
         company = j.get("company", "")
         url = j.get("job_url") or j.get("url") or ""
-        reason = (j.get("review_reason") or j.get("reason") or "Matched your profile").strip()
+        reason = (j.get("review_reason") or j.get("reason") or "").strip()
+        score = int(j.get("grade") or j.get("review_confidence") or 0)
+
         if url:
-            reason = f"{reason}\n\n{url}"
+            title_html = f'<a href="{url}" style="color:#111827;text-decoration:none;">{title}</a>'
+            company_html = f'<a href="{url}" style="color:#4b5563;text-decoration:none;">{company}</a>' if company else ""
+            job_title = f'{title_html} · {company_html}' if company_html else title_html
+        else:
+            job_title = f"{title} · {company}" if company else title
+
         job_list.append({
-            "job_title": f"{title} @ {company}" if company else title,
+            "job_title": job_title,
             "reason": reason,
-            "score": int(j.get("grade") or j.get("review_confidence") or 0),
+            "score": score,
         })
 
     payload = {
@@ -278,12 +299,16 @@ def process_user(user):
     def _status(j):
         return str(j.get("status", "")).lower()
 
-    jobs_for_count = [j for j in selected_jobs if isinstance(j, dict) and _status(j) in STATUSES_TO_COUNT]
-    jobs_for_email = [j for j in selected_jobs if isinstance(j, dict) and _status(j) in STATUSES_TO_EMAIL]
-    jobs_to_promote = [j for j in selected_jobs if isinstance(j, dict) and _status(j) == STATUS_TO_PROMOTE]
+    today_jobs = [j for j in selected_jobs if isinstance(j, dict) and _is_today(j)]
+    jobs_for_count = [j for j in today_jobs if _status(j) in STATUSES_TO_COUNT]
+    jobs_for_email = [
+        j for j in today_jobs
+        if _status(j) in STATUSES_TO_EMAIL
+        and int(j.get("grade") or j.get("review_confidence") or 0) > 0
+    ]
 
     count = len(jobs_for_count)
-    print(f"  {name} ({email})  plan={plan}  eligible={count}  to_email={len(jobs_for_email)}  to_promote={len(jobs_to_promote)}")
+    print(f"  {name} ({email})  plan={plan}  today={count}  emailable={len(jobs_for_email)}")
 
     if count < MIN_JOBS_TO_EMAIL or not jobs_for_email:
         return {
@@ -294,13 +319,6 @@ def process_user(user):
             "emailed": False,
         }
 
-    # Promote pending_review → target status
-    if jobs_to_promote:
-        promoted = promote_jobs(email, jobs_to_promote, new_status)
-        if promoted is None:
-            print(f"  WARNING: status promotion failed for {email}")
-
-    # Send email with all new/unreviewed jobs
     emailed = send_email(user_profile, automation, jobs_for_email)
 
     return {
