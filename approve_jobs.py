@@ -4,10 +4,13 @@ approve_jobs.py — Promote pending_review jobs and send email notifications.
 Run after send_jobbyo.py has staged jobs as pending_review.
 
 For each paid user:
+  - Skip if already emailed today (dedup via run_logs/emailed_YYYY-MM-DD.json)
   - Fetch their selectedJobs
   - Find pending_review jobs
-  - If ≥ MIN_JOBS_TO_EMAIL: promote to plan-appropriate status and send email
-  - Send a Slack summary of who got emailed vs who is still waiting
+  - If >= MIN_JOBS_TO_EMAIL: promote to plan-appropriate status and send email
+  - Post a Slack summary of this run's results
+
+On startup, deletes emailed_*.json logs older than yesterday to avoid accumulation.
 
 Usage:
     python3 approve_jobs.py
@@ -18,7 +21,8 @@ import json
 import os
 import sys
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -32,10 +36,55 @@ load_dotenv()
 BASE_URL = "https://fastapi-service-03-160893319817.europe-southwest1.run.app"
 DAILY_REPORT_API_BASE = BASE_URL
 
-MIN_JOBS_TO_EMAIL = 5          # minimum pending_review jobs before we send the email
+MIN_JOBS_TO_EMAIL = 8          # minimum pending_review jobs before we send the email
 PENDING_REVIEW_STATUS = "pending_review"
 PREMIUM_STATUS = "pending"             # for premium plan users
 MAX_STATUS = "waiting_approval"        # for max/starter plan users
+
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+RUN_LOGS_DIR = Path("run_logs")
+
+# ---------------------------------------------------------------------------
+# Log cleanup
+# ---------------------------------------------------------------------------
+
+def cleanup_old_emailed_logs():
+    """Delete emailed_*.json files older than yesterday."""
+    if not RUN_LOGS_DIR.exists():
+        return
+    cutoff = date.today() - timedelta(days=1)
+    for f in RUN_LOGS_DIR.glob("emailed_*.json"):
+        try:
+            file_date = date.fromisoformat(f.stem.replace("emailed_", ""))
+            if file_date < cutoff:
+                f.unlink()
+                print(f"Deleted old log: {f.name}")
+        except ValueError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Emailed-today deduplication
+# ---------------------------------------------------------------------------
+
+def _emailed_today_path():
+    return RUN_LOGS_DIR / f"emailed_{date.today().isoformat()}.json"
+
+
+def load_emailed_today():
+    path = _emailed_today_path()
+    if path.exists():
+        try:
+            return set(json.loads(path.read_text()).get("uids", []))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_emailed_today(uid_set):
+    RUN_LOGS_DIR.mkdir(exist_ok=True)
+    _emailed_today_path().write_text(json.dumps({"uids": sorted(uid_set)}, indent=2))
+
 
 # ---------------------------------------------------------------------------
 # API helpers
@@ -168,50 +217,43 @@ def send_email(user_profile, automation, jobs):
 
 
 # ---------------------------------------------------------------------------
-# Slack report
+# Slack summary
 # ---------------------------------------------------------------------------
 
-def send_slack_report(emailed_users, pending_users):
-    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def post_slack(text):
+    if not SLACK_WEBHOOK_URL:
+        return
+    try:
+        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+    except Exception as e:
+        print(f"Slack post failed: {e}")
 
-    user_results = []
-    for u in emailed_users:
-        user_results.append({
-            "name": u["name"],
-            "email": u["email"],
-            "jobs_found_today": u["jobs_promoted"],
-            "jobs_target": 10,
-            "daily_report_sent": True,
-            "needs_manual_search": False,
-        })
-    for u in pending_users:
-        user_results.append({
-            "name": u["name"],
-            "email": u["email"],
-            "jobs_found_today": u["pending_count"],
-            "jobs_target": 10,
-            "daily_report_sent": False,
-            "needs_manual_search": True,
-        })
 
-    payload = {
-        "run_date": run_date,
-        "total_jobs_found": sum(u["jobs_promoted"] for u in emailed_users),
-        "total_jobs_still_needed": sum(
-            max(0, 10 - u.get("pending_count", 0)) for u in pending_users
-        ),
-        "users_processed": len(emailed_users) + len(pending_users),
-        "emails_sent": len(emailed_users),
-        "user_results": user_results,
-    }
+def send_slack_summary(emailed_users, skipped_users, pending_users):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"📧 *approve_jobs* — {now}"]
 
-    res = _post(f"{DAILY_REPORT_API_BASE}/api/notifications/slack/daily-run", payload)
-    if res is not None:
-        print(f"Slack report sent  ({len(emailed_users)} emailed, {len(pending_users)} still pending)")
+    if emailed_users:
+        lines.append(f"✅ *{len(emailed_users)} email(s) sent this run:*")
+        for u in emailed_users:
+            lines.append(f"  • {u['name']} ({u['email']}) — {u['jobs_promoted']} jobs → {u['new_status']}")
+    else:
+        lines.append("No new emails sent this run.")
+
+    if skipped_users:
+        names = ", ".join(u["name"] for u in skipped_users)
+        lines.append(f"⏭️ *{len(skipped_users)} already emailed today* (skipped): {names}")
+
+    if pending_users:
+        lines.append(f"⚠️ *{len(pending_users)} below threshold ({MIN_JOBS_TO_EMAIL} jobs):*")
+        for u in pending_users:
+            lines.append(f"  • {u['name']} ({u['email']}) — {u['pending_count']}/{MIN_JOBS_TO_EMAIL} jobs")
+
+    post_slack("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Process one user
 # ---------------------------------------------------------------------------
 
 def process_user(user):
@@ -245,6 +287,7 @@ def process_user(user):
         return {
             "name": name,
             "email": email,
+            "uid": uid,
             "pending_count": count,
             "emailed": False,
         }
@@ -260,11 +303,16 @@ def process_user(user):
     return {
         "name": name,
         "email": email,
+        "uid": uid,
         "jobs_promoted": count,
         "new_status": new_status,
         "emailed": emailed,
     }
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     single_email = None
@@ -279,6 +327,12 @@ def main():
     print(f"MIN_JOBS_TO_EMAIL={MIN_JOBS_TO_EMAIL}")
     print()
 
+    # Cleanup logs older than yesterday
+    cleanup_old_emailed_logs()
+
+    # Load UIDs already emailed today (dedup guard)
+    emailed_today_uids = load_emailed_today() if not single_email else set()
+
     paid_users = get_paid_users()
     if not paid_users:
         print("No paid users found.")
@@ -291,13 +345,26 @@ def main():
             return
 
     emailed_users = []
+    skipped_users = []
     pending_users = []
 
     for user in paid_users:
+        uid = user.get("uid") or user.get("id") or ""
+        email = user.get("email") or ""
+        name = user.get("displayName") or email.split("@")[0]
+
+        if uid and uid in emailed_today_uids:
+            print(f"  {name} ({email}) — already emailed today, skipping")
+            skipped_users.append({"name": name, "email": email})
+            continue
+
         result = process_user(user)
         if result is None:
             continue
+
         if result["emailed"]:
+            emailed_today_uids.add(uid)
+            save_emailed_today(emailed_today_uids)
             emailed_users.append(result)
         else:
             pending_users.append(result)
@@ -309,12 +376,16 @@ def main():
     print(f"Emailed ({len(emailed_users)}):")
     for u in emailed_users:
         print(f"  ✅ {u['name']} ({u['email']})  {u['jobs_promoted']} jobs → {u['new_status']}")
+    if skipped_users:
+        print(f"Already emailed today ({len(skipped_users)}):")
+        for u in skipped_users:
+            print(f"  ⏭️  {u['name']} ({u['email']})")
     print(f"Still pending ({len(pending_users)}):")
     for u in pending_users:
         print(f"  🔴 {u['name']} ({u['email']})  {u['pending_count']}/{MIN_JOBS_TO_EMAIL} jobs")
 
     if not single_email:
-        send_slack_report(emailed_users, pending_users)
+        send_slack_summary(emailed_users, skipped_users, pending_users)
 
 
 if __name__ == "__main__":
