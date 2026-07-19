@@ -47,7 +47,7 @@ RUN_LOG_DIR = SCRIPT_DIR / "run_logs"
 SYNC_RUN_TIMEOUT_SECONDS = 600
 
 BACKEND_BASE = os.getenv("JOBBYO_BACKEND_URL", "https://fastapi-service-03-160893319817.europe-southwest1.run.app")
-SLACK_WEBHOOK_URL="https://hooks.slack.com/services/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"
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 # ---------------------------------------------------------------------------
 # Run state — in-memory, resets on restart
 # ---------------------------------------------------------------------------
