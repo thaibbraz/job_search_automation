@@ -138,7 +138,7 @@ MAX_DIRECT_RESOLUTION_ATTEMPTS_PER_BATCH = 2
 MAX_REMOTE_FAILURE_RESOLUTION_ATTEMPTS_PER_BATCH = 2
 MAX_DIRECT_RESOLUTION_CANDIDATES = 8
 MIN_DIRECT_RESOLUTION_GRADE = 65
-PENDING_REVIEW_MIN_GRADE = 66
+PENDING_REVIEW_MIN_GRADE = 62
 
 # 15-day quota mode: temporary production bridge until full ATS inventory/scraper is built.
 ENABLE_QUOTA_MODE = True
@@ -149,7 +149,7 @@ MAX_AUTOMATION_TITLE_CLUSTERS = 14
 MAX_PREFETCH_INVENTORY_JOBS = 350
 INVENTORY_CANDIDATES_PER_USER = 45
 INVENTORY_LOCAL_SCORE_MIN = 28
-SAFE_FALLBACK_MIN_GRADE = 66
+SAFE_FALLBACK_MIN_GRADE = 62
 DISCOVERY_PENDING_MIN_GRADE = 62
 DISCOVERY_PENDING_STATUS = "pending_review"
 
@@ -190,7 +190,7 @@ ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 APIFY_LINKEDIN_ACTOR_ID = "2rJKkhh7vjpX7pvjg"
 LINKEDIN_MAX_ITEMS = 150
 LINKEDIN_LOCAL_SCORE_MIN = 15     # same floor as Jobo — AI review handles fit
-ENABLE_LINKEDIN_PREFETCH = bool(APIFY_API_TOKEN)
+ENABLE_LINKEDIN_PREFETCH = False  # disabled: 6.4% end-to-end yield, cost not justified
 
 # No-GPT mode: replace OpenAI search/review with more structured inventory from
 # Jobo ATS + HiringCafe, then use the same static URL, HTTP, duplicate, location,
@@ -309,7 +309,7 @@ LEGACY_PENDING_STATUSES = {"pending_review", "pending", "waiting_approval"}
 REVIEW_APPROVED_DECISIONS = {"exact_match", "strong_adjacent", "safe_fallback", "good_match"}
 
 # Minimum AI review confidence required before posting.
-MIN_REVIEW_CONFIDENCE = 65
+MIN_REVIEW_CONFIDENCE = 60
 
 PERSONA_DIR = Path("./personas")
 PERSONA_DIR.mkdir(exist_ok=True)
@@ -7219,12 +7219,14 @@ def get_eligible_paid_users():
             continue
 
         # Skip users with no job titles — we have nothing to search with.
-        # Send them a one-time nudge email to complete their profile.
+        # When --email is active we skip this gate and let the run attempt proceed.
         _titles = extract_automation_job_titles(automation, limit=3) if automation else []
-        if not _titles:
+        if not _titles and not selected_email_filter_active():
             print(f"SKIP: no job titles configured — sending profile-incomplete email to {email}")
             send_incomplete_profile_email(email, display_name or email)
             continue
+        if not _titles and selected_email_filter_active():
+            print("NOTE: no job titles configured — proceeding anyway because --email mode is active")
 
         plan = get_user_plan(user=user, automation=automation)
         job_status = status_for_user_plan(plan)
@@ -7236,6 +7238,35 @@ def get_eligible_paid_users():
         print(f"Counted {job_status}/legacy jobs today: {pending_today}")
 
         eligible.append(user)
+
+    # If --email was used and some requested emails weren't found in the paid list,
+    # try to fetch them directly via /users/email/{email}/ so we can still process them.
+    if selected_email_filter_active():
+        found_emails = {normalize_selected_email(u.get("email", "")) for u in eligible}
+        requested = set(SINGLE_USER_EMAILS)
+        if SINGLE_USER_EMAIL:
+            requested.add(normalize_selected_email(SINGLE_USER_EMAIL))
+        missing = requested - found_emails
+        for missing_email in missing:
+            print(f"\nRequested email not found in paid list — attempting direct fetch: {missing_email}")
+            try:
+                user_data = api_get(f"{BASE_URL}/users/email/{urllib.parse.quote(missing_email)}/")
+                if not user_data or not isinstance(user_data, dict) or user_data.get("detail"):
+                    print(f"  SKIP: could not fetch user profile for {missing_email}")
+                    continue
+                uid = user_data.get("uid")
+                if not uid:
+                    print(f"  SKIP: no uid in profile for {missing_email}")
+                    continue
+                automation = get_user_automation(uid)
+                if not automation:
+                    print(f"  SKIP: no automation for {missing_email}")
+                    continue
+                user_data["_automation_cache"] = automation
+                print(f"  Found via direct fetch: {user_data.get('displayName')} ({missing_email})")
+                eligible.append(user_data)
+            except Exception as e:
+                print(f"  SKIP: direct fetch failed for {missing_email} — {e}")
 
     return eligible
 
