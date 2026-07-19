@@ -28,12 +28,15 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import requests
+
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 load_dotenv()
@@ -42,6 +45,9 @@ SCRIPT_DIR = Path(__file__).parent
 PYTHON = sys.executable
 RUN_LOG_DIR = SCRIPT_DIR / "run_logs"
 SYNC_RUN_TIMEOUT_SECONDS = 600
+
+BACKEND_BASE = os.getenv("JOBBYO_BACKEND_URL", "https://fastapi-service-03-160893319817.europe-southwest1.run.app")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 # ---------------------------------------------------------------------------
 # Run state — in-memory, resets on restart
@@ -145,6 +151,18 @@ async def _single_run(script: str, args: list[str], label: str):
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Jobbyo Runner API", version="1.0.0")
+
+# Called directly from the browser (jobbyo-webapp-frontend), so the browser's
+# CORS preflight (OPTIONS) needs an explicit answer — FastAPI returns a bare
+# 405 for OPTIONS on any route unless this is registered. No cookies/auth
+# tokens go through this endpoint (just an email in the body), so a wildcard
+# origin is fine here.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -293,3 +311,318 @@ async def email_user(target: UserTarget, background_tasks: BackgroundTasks):
         _single_run, "approve_jobs.py", ["--email", target.email], f"email:user:{target.email}"
     )
     return RunResponse(accepted=True, message=f"Approval + email started for {target.email}.")
+
+
+# ---------------------------------------------------------------------------
+# Coverage helpers
+# ---------------------------------------------------------------------------
+
+_TODAY_STATUSES = {"applied", "pending", "waiting_approval", "pending_review", "legacy"}
+_APPLIED_STATUSES = {"applied", "approved"}
+
+_DATE_FORMATS = [
+    "%Y-%m-%dT%H:%M:%S.%fZ",
+    "%Y-%m-%dT%H:%M:%SZ",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d",
+    "%a, %d %b %Y %H:%M:%S GMT",
+    "%a, %d %b %Y %H:%M:%S %Z",
+]
+
+
+def _parse_job_date(date_str: str) -> Optional[datetime]:
+    """Parse ISO 8601 or RFC 2822 date strings into UTC-aware datetime."""
+    if not date_str:
+        return None
+    for fmt in _DATE_FORMATS:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _fetch_paid_users_sync() -> list[dict]:
+    resp = requests.get(f"{BACKEND_BASE}/users/paid", timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, list) else data.get("users", [])
+
+
+def _fetch_user_automation_sync(uid: str) -> dict:
+    resp = requests.get(f"{BACKEND_BASE}/automations/users/{uid}", timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _send_slack_sync(text: str) -> bool:
+    if not SLACK_WEBHOOK_URL:
+        print("[slack] SLACK_WEBHOOK_URL not set — skipping notification.")
+        return False
+    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+    ok = resp.status_code == 200
+    if not ok:
+        print(f"[slack] Webhook returned {resp.status_code}: {resp.text[:200]}")
+    return ok
+
+
+def _uid_of(user: dict) -> Optional[str]:
+    return user.get("uid") or user.get("id") or user.get("_id")
+
+
+# ---------------------------------------------------------------------------
+# Coverage endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/coverage/today")
+async def coverage_today(send_slack: bool = False):
+    """Count jobs in active statuses added TODAY per paid user.
+
+    Statuses counted: applied, pending, waiting_approval, pending_review, legacy.
+    Query ?send_slack=true posts a summary to Slack.
+    """
+    today_utc = datetime.now(timezone.utc).date()
+    users = await asyncio.to_thread(_fetch_paid_users_sync)
+
+    result_users: list[dict] = []
+    covered = partial = missing = 0
+
+    for user in users:
+        uid = _uid_of(user)
+        if not uid:
+            continue
+
+        try:
+            automation = await asyncio.to_thread(_fetch_user_automation_sync, uid)
+        except Exception as exc:
+            print(f"[coverage/today] Could not fetch automation for {uid}: {exc}")
+            continue
+
+        jobs = automation.get("selectedJobs") or []
+        total = applied_c = pending_c = waiting_c = 0
+
+        for job in jobs:
+            status = job.get("status", "")
+            if status not in _TODAY_STATUSES:
+                continue
+            added = _parse_job_date(job.get("addedAt", ""))
+            if added is None or added.date() != today_utc:
+                continue
+            total += 1
+            if status == "applied":
+                applied_c += 1
+            elif status == "pending":
+                pending_c += 1
+            elif status == "waiting_approval":
+                waiting_c += 1
+
+        if total >= 10:
+            covered += 1
+        elif total >= 1:
+            partial += 1
+        else:
+            missing += 1
+
+        result_users.append({
+            "name": user.get("displayName") or user.get("name") or "",
+            "email": user.get("email", ""),
+            "total": total,
+            "applied": applied_c,
+            "pending": pending_c,
+            "waiting_approval": waiting_c,
+        })
+
+    if send_slack:
+        ok_lines = [
+            f"  • {u['name']} ({u['email']}): {u['total']} jobs"
+            for u in result_users if u["total"] >= 10
+        ]
+        warn_lines = [
+            f"  • {u['name']} ({u['email']}): {u['total']} jobs"
+            for u in result_users if u["total"] < 10
+        ]
+        slack_text = (
+            f"*Coverage Report — {today_utc.isoformat()}*\n"
+            f"Total: {len(result_users)} | ✅ Covered (≥10): {covered} | "
+            f"⚠️ Partial (1-9): {partial} | ❌ Missing (0): {missing}\n"
+        )
+        if ok_lines:
+            slack_text += "\n✅ *At 10+ jobs:*\n" + "\n".join(ok_lines)
+        if warn_lines:
+            slack_text += "\n\n⚠️ *Below 10 jobs:*\n" + "\n".join(warn_lines)
+        await asyncio.to_thread(_send_slack_sync, slack_text)
+
+    return {
+        "date": today_utc.isoformat(),
+        "total_users": len(result_users),
+        "covered": covered,
+        "partial": partial,
+        "missing": missing,
+        "users": result_users,
+    }
+
+
+@app.get("/coverage/applied")
+async def coverage_applied(send_slack: bool = False):
+    """Count jobs with status applied or approved added TODAY per paid user.
+
+    Query ?send_slack=true posts counts to Slack.
+    """
+    today_utc = datetime.now(timezone.utc).date()
+    users = await asyncio.to_thread(_fetch_paid_users_sync)
+
+    result_users: list[dict] = []
+
+    for user in users:
+        uid = _uid_of(user)
+        if not uid:
+            continue
+
+        try:
+            automation = await asyncio.to_thread(_fetch_user_automation_sync, uid)
+        except Exception as exc:
+            print(f"[coverage/applied] Could not fetch automation for {uid}: {exc}")
+            continue
+
+        jobs = automation.get("selectedJobs") or []
+        applied_today = 0
+        for job in jobs:
+            if job.get("status") not in _APPLIED_STATUSES:
+                continue
+            added = _parse_job_date(job.get("addedAt", ""))
+            if added is not None and added.date() == today_utc:
+                applied_today += 1
+
+        result_users.append({
+            "name": user.get("displayName") or user.get("name") or "",
+            "email": user.get("email", ""),
+            "applied_today": applied_today,
+        })
+
+    if send_slack:
+        has_applied = [u for u in result_users if u["applied_today"] > 0]
+        no_applied = [u for u in result_users if u["applied_today"] == 0]
+        slack_text = f"*Applied Jobs Report — {today_utc.isoformat()}*\n"
+        if has_applied:
+            lines = [f"  • {u['name']} ({u['email']}): {u['applied_today']}" for u in has_applied]
+            slack_text += "\n✅ *Users with applied jobs today:*\n" + "\n".join(lines)
+        if no_applied:
+            lines = [f"  • {u['name']} ({u['email']})" for u in no_applied]
+            slack_text += "\n\n⚠️ *No applied jobs yet:*\n" + "\n".join(lines)
+        await asyncio.to_thread(_send_slack_sync, slack_text)
+
+    return {
+        "date": today_utc.isoformat(),
+        "users": result_users,
+    }
+
+
+@app.get("/coverage/complete")
+async def coverage_complete(send_email: bool = False, warn_stale: bool = False):
+    """Check if every actionable user (has job titles) has ≥10 jobs today.
+
+    Also surfaces users with waiting_approval jobs from YESTERDAY (stale approvals).
+
+    Query params:
+      ?send_email=true  — if all covered, POST /api/reports/daily for each user.
+      ?warn_stale=true  — POST /api/notifications/incomplete-profile for users
+                          with stale waiting_approval jobs from yesterday.
+    """
+    today_utc = datetime.now(timezone.utc).date()
+    yesterday_utc = today_utc - timedelta(days=1)
+
+    users = await asyncio.to_thread(_fetch_paid_users_sync)
+
+    covered_count = missing_count = actionable_count = 0
+    stale_approvals: list[dict] = []
+
+    for user in users:
+        uid = _uid_of(user)
+        if not uid:
+            continue
+
+        try:
+            automation = await asyncio.to_thread(_fetch_user_automation_sync, uid)
+        except Exception as exc:
+            print(f"[coverage/complete] Could not fetch automation for {uid}: {exc}")
+            continue
+
+        # Only count users that have job titles configured (actionable)
+        job_titles = automation.get("jobTitles") or automation.get("job_titles") or []
+        if not job_titles:
+            continue
+
+        actionable_count += 1
+        jobs = automation.get("selectedJobs") or []
+
+        today_total = 0
+        stale_count = 0
+        for job in jobs:
+            status = job.get("status", "")
+            added = _parse_job_date(job.get("addedAt", ""))
+            if added is None:
+                continue
+            job_date = added.date()
+            if job_date == today_utc and status in _TODAY_STATUSES:
+                today_total += 1
+            if job_date == yesterday_utc and status == "waiting_approval":
+                stale_count += 1
+
+        if today_total >= 10:
+            covered_count += 1
+        else:
+            missing_count += 1
+
+        if stale_count > 0:
+            stale_approvals.append({
+                "name": user.get("displayName") or user.get("name") or "",
+                "email": user.get("email", ""),
+                "count": stale_count,
+            })
+
+    all_covered = actionable_count > 0 and missing_count == 0
+
+    if send_email and all_covered:
+        for user in users:
+            email = user.get("email", "")
+            name = user.get("name", "")
+            if not email:
+                continue
+            try:
+                payload = {"email": email, "name": name}
+                await asyncio.to_thread(
+                    lambda p=payload: requests.post(
+                        f"{BACKEND_BASE}/api/reports/daily", json=p, timeout=15
+                    )
+                )
+            except Exception as exc:
+                print(f"[coverage/complete] Failed to send daily report for {email}: {exc}")
+
+    if warn_stale and stale_approvals:
+        for entry in stale_approvals:
+            try:
+                payload = {
+                    "email": entry["email"],
+                    "name": entry["name"],
+                    "reason": "stale_approvals",
+                    "stale_count": entry["count"],
+                }
+                await asyncio.to_thread(
+                    lambda p=payload: requests.post(
+                        f"{BACKEND_BASE}/api/notifications/incomplete-profile",
+                        json=p,
+                        timeout=15,
+                    )
+                )
+            except Exception as exc:
+                print(f"[coverage/complete] Failed to warn stale for {entry['email']}: {exc}")
+
+    return {
+        "all_covered": all_covered,
+        "covered_count": covered_count,
+        "missing_count": missing_count,
+        "stale_approvals": stale_approvals,
+    }
