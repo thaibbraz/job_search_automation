@@ -36,12 +36,18 @@ load_dotenv()
 BASE_URL = "https://fastapi-service-03-160893319817.europe-southwest1.run.app"
 DAILY_REPORT_API_BASE = BASE_URL
 
-MIN_JOBS_TO_EMAIL = 8          # minimum pending_review jobs before we send the email
-PENDING_REVIEW_STATUS = "pending_review"
-PREMIUM_STATUS = "pending"             # for premium plan users
-MAX_STATUS = "waiting_approval"        # for max/starter plan users
+MIN_JOBS_TO_EMAIL = 8
+PREMIUM_STATUS = "pending"
+MAX_STATUS = "waiting_approval"
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+# Statuses that count toward the threshold (has the user been served enough jobs?)
+STATUSES_TO_COUNT = {"pending_review", "waiting_approval", "pending", "applied"}
+# Statuses whose jobs go into the email body (new/unreviewed jobs)
+STATUSES_TO_EMAIL = {"pending_review", "waiting_approval"}
+# Only pending_review needs promotion; waiting_approval/pending are already correct
+STATUS_TO_PROMOTE = "pending_review"
+
+SLACK_WEBHOOK_URL="https://hooks.slack.com/services/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"
 RUN_LOGS_DIR = Path("run_logs")
 
 # ---------------------------------------------------------------------------
@@ -175,10 +181,10 @@ def promote_jobs(email, jobs_to_promote, new_status):
 # Email
 # ---------------------------------------------------------------------------
 
-def send_email(user_profile, automation, jobs):
+def send_email(user_profile, automation, jobs, override_email=None):
     """Send the daily report email via the existing API endpoint."""
-    email = user_profile.get("email") or ""
-    name = user_profile.get("displayName") or email.split("@")[0]
+    email = override_email or user_profile.get("email") or ""
+    name = user_profile.get("displayName") or (user_profile.get("email") or "").split("@")[0]
 
     job_list = []
     for j in jobs:
@@ -187,25 +193,20 @@ def send_email(user_profile, automation, jobs):
         url = j.get("job_url") or j.get("url") or ""
         reason = (j.get("review_reason") or j.get("reason") or "Matched your profile").strip()
         if url:
-            reason = reason + f"\n\n{url}"
+            reason = f"{reason}\n\n{url}"
         job_list.append({
             "job_title": f"{title} @ {company}" if company else title,
-            "company": company,
-            "url": url,
-            "location": j.get("location", ""),
             "reason": reason,
-            "score": j.get("grade") or j.get("review_confidence") or 0,
+            "score": int(j.get("grade") or j.get("review_confidence") or 0),
         })
 
     payload = {
         "email": email,
+        "name": name,
         "report": {
-            "user_name": name,
             "jobs": job_list,
             "changed_rules": "",
             "next_batch_strategy": "",
-            "pending_count": len(jobs),
-            "needs_more": False,
         },
     }
 
@@ -270,20 +271,21 @@ def process_user(user):
     plan = get_user_plan(user, automation)
     new_status = target_status(plan)
 
-    # Extract pending_review jobs from selectedJobs
     selected_jobs = automation.get("selectedJobs") or []
     if not isinstance(selected_jobs, list):
         selected_jobs = []
 
-    pending_review_jobs = [
-        j for j in selected_jobs
-        if isinstance(j, dict) and str(j.get("status", "")).lower() == PENDING_REVIEW_STATUS
-    ]
+    def _status(j):
+        return str(j.get("status", "")).lower()
 
-    count = len(pending_review_jobs)
-    print(f"  {name} ({email})  plan={plan}  pending_review={count}")
+    jobs_for_count = [j for j in selected_jobs if isinstance(j, dict) and _status(j) in STATUSES_TO_COUNT]
+    jobs_for_email = [j for j in selected_jobs if isinstance(j, dict) and _status(j) in STATUSES_TO_EMAIL]
+    jobs_to_promote = [j for j in selected_jobs if isinstance(j, dict) and _status(j) == STATUS_TO_PROMOTE]
 
-    if count < MIN_JOBS_TO_EMAIL:
+    count = len(jobs_for_count)
+    print(f"  {name} ({email})  plan={plan}  eligible={count}  to_email={len(jobs_for_email)}  to_promote={len(jobs_to_promote)}")
+
+    if count < MIN_JOBS_TO_EMAIL or not jobs_for_email:
         return {
             "name": name,
             "email": email,
@@ -292,19 +294,20 @@ def process_user(user):
             "emailed": False,
         }
 
-    # Promote status
-    promoted = promote_jobs(email, pending_review_jobs, new_status)
-    if promoted is None:
-        print(f"  WARNING: status promotion failed for {email}")
+    # Promote pending_review → target status
+    if jobs_to_promote:
+        promoted = promote_jobs(email, jobs_to_promote, new_status)
+        if promoted is None:
+            print(f"  WARNING: status promotion failed for {email}")
 
-    # Send email
-    emailed = send_email(user_profile, automation, pending_review_jobs)
+    # Send email with all new/unreviewed jobs
+    emailed = send_email(user_profile, automation, jobs_for_email)
 
     return {
         "name": name,
         "email": email,
         "uid": uid,
-        "jobs_promoted": count,
+        "jobs_promoted": len(jobs_for_email),
         "new_status": new_status,
         "emailed": emailed,
     }
