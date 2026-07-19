@@ -72,9 +72,6 @@ RESOLUTION_MODEL = os.getenv("JOBBYO_RESOLUTION_MODEL", "gpt-4.1-nano")
 SEARCH_CONTEXT_SIZE = os.getenv("JOBBYO_SEARCH_CONTEXT_SIZE", "high")
 RESOLUTION_SEARCH_CONTEXT_SIZE = os.getenv("JOBBYO_RESOLUTION_SEARCH_CONTEXT_SIZE", "high")
 
-# DRY_RUN=False means jobs will actually be posted.
-DRY_RUN = False
-
 # None = process all paid users with active automation.
 # For testing, set to 1.
 MAX_USERS_TO_PROCESS = None
@@ -182,16 +179,6 @@ JOBO_ATS_MAX_ITEMS = 45           # raw results per call (was 30)
 JOBO_LOCAL_SCORE_MIN = 15         # lower than HC — Jobo URLs are ATS-direct; AI review handles fit
 ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 
-# Jobicy — free public API for remote jobs; used as discovery source only.
-# Top-scored candidates are sent through the resolver to obtain ATS-direct URLs.
-
-# LinkedIn via Apify — highest-priority source (direct ATS apply URLs, rich metadata)
-# Reuses the same APIFY_API_TOKEN as Hiring Cafe.
-APIFY_LINKEDIN_ACTOR_ID = "2rJKkhh7vjpX7pvjg"
-LINKEDIN_MAX_ITEMS = 150
-LINKEDIN_LOCAL_SCORE_MIN = 15     # same floor as Jobo — AI review handles fit
-ENABLE_LINKEDIN_PREFETCH = False  # disabled: 6.4% end-to-end yield, cost not justified
-
 # No-GPT mode: replace OpenAI search/review with more structured inventory from
 # Jobo ATS + HiringCafe, then use the same static URL, HTTP, duplicate, location,
 # and posting pipeline. Defaults are intentionally higher because Jobbyo has a
@@ -252,8 +239,6 @@ MAX_BATCHES = FIRST_ROUND_BATCHES
 COST_PER_HC_RESULT = 0.00125
 # Jobo ATS: $49.99/month ÷ 100,000 jobs/month
 COST_PER_JOBO_RESULT = 0.0005
-# LinkedIn via Apify: $0.60 per 1,000 results
-COST_PER_LINKEDIN_RESULT = 0.0006
 # OpenAI — gpt-4.1-mini + web_search per search batch (approx input+output tokens)
 COST_PER_OPENAI_SEARCH_CALL = 0.05
 # OpenAI — gpt-4.1 strict AI review per batch (approx ~1500 input + 200 output tokens)
@@ -383,15 +368,6 @@ def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS):
 
     print("\nPOSTING PAYLOAD:")
     print(json.dumps(payload, indent=2))
-
-    if DRY_RUN:
-        print("\nDRY_RUN=True, not posting.")
-        return {
-            "dry_run": True,
-            "added_count": len(jobs),
-            "skipped_count": 0,
-            "payload": payload,
-        }
 
     res = requests.post(
         post_jobs_url(email),
@@ -1271,7 +1247,7 @@ def static_check(
     if domain == "jobs.workable.com" and "/view/" not in path_lower:
         return False, "career_homepage"
 
-    is_prefetch_job = str(job.get("source", "")).startswith(("hiring_cafe", "jobo_ats", "linkedin_apify"))
+    is_prefetch_job = str(job.get("source", "")).startswith(("hiring_cafe", "jobo_ats"))
     if not is_prefetch_job and not has_job_identifier(url) and not looks_like_specific_company_job_url(url):
         return False, "generic_or_homepage_url"
 
@@ -4309,10 +4285,10 @@ def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job
         normal_post_decisions = {"exact_match", "strong_adjacent", "safe_fallback", "good_match"}
         manual_review_statuses = {STARTER_MAX_STATUS, DEFAULT_STATUS, DISCOVERY_PENDING_STATUS, "waiting_approval"}
 
-        # ATS-direct sources (Jobo, HC, LinkedIn Apify, resolver) are already
+        # ATS-direct sources (Jobo, HC, resolver) are already
         # verified real open positions — apply a slightly lower floor than OpenAI.
         _is_ats_direct = str(job.get("source", "")).startswith(
-            ("jobo_ats", "hiring_cafe", "linkedin_apify", "direct_url_resolver")
+            ("jobo_ats", "hiring_cafe", "direct_url_resolver")
         )
         if minimum_viable_mode:
             grade_floor = MIN_VIABLE_SAFE_FALLBACK_GRADE
@@ -5344,7 +5320,7 @@ def nogpt_persona_fit_score(job, automation=None, persona=None, search_contract=
 
     if job.get("source"):
         source = str(job.get("source", "")).lower()
-        if source.startswith(("jobo_ats", "hiring_cafe", "linkedin_apify")):
+        if source.startswith(("jobo_ats", "hiring_cafe")):
             score += 5
             reasons.append("structured_source")
 
@@ -5543,8 +5519,7 @@ def _parse_hiring_cafe_job(raw_item):
 def _build_hc_query(automation, search_contract, user_profile, persona=None):
     """Extract keyword(s), location, and workplace_type for the Apify HC actor.
 
-    Returns (keywords_list, location, workplace_type). Uses the same three-tier
-    priority as fetch_linkedin_for_user so HC gets the same quality signal.
+    Returns (keywords_list, location, workplace_type).
     """
     # Priority 1: persona target_titles (AI-generated, specific)
     keywords = []
@@ -5921,156 +5896,6 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
     print(f"Jobo ATS: {len(results)} jobs after local scoring (min score {JOBO_LOCAL_SCORE_MIN})")
     return results, len(raw_items_all)
 
-def _parse_linkedin_apify_job(raw_item):
-    """Map one raw LinkedIn Apify actor item to the internal job dict format."""
-    if not isinstance(raw_item, dict):
-        return None
-
-    # Prefer the direct ATS apply URL. Easy Apply jobs have no applyUrl (or a
-    # linkedin.com URL) — skip them: they can't be applied to outside LinkedIn.
-    apply_url = str(raw_item.get("applyUrl") or "").strip()
-    job_url_fallback = str(raw_item.get("jobUrl") or "").strip()
-    if apply_url and not urllib.parse.urlparse(apply_url).netloc.endswith("linkedin.com"):
-        job_url = apply_url
-    else:
-        return None  # Easy Apply — no external ATS URL, skip
-
-    if not job_url.startswith("http"):
-        return None
-
-    title = str(raw_item.get("jobTitle") or "").strip()
-    company = str(raw_item.get("companyName") or "").strip()
-    if not title or not company:
-        return None
-
-    location = str(raw_item.get("location") or "").strip()
-    description = str(raw_item.get("jobDescription") or "")[:3000]
-
-    # Prepend salary info if available
-    salary_info = raw_item.get("salaryInfo") or []
-    if salary_info and isinstance(salary_info, list):
-        salary_str = " – ".join(str(s) for s in salary_info if s)
-        if salary_str:
-            description = f"Salary: {salary_str}\n\n" + description
-
-    job_id = str(raw_item.get("jobId") or "")
-    source = f"linkedin_apify/{job_id}"[:120]
-
-    return {
-        "job_url": job_url,
-        "title": title,
-        "company": company,
-        "description": description,
-        "location": location,
-        "source": source,
-        "grade": 70,
-        "_hc_workplace_type": "on-site",   # conservative default; not exposed by this actor
-        "_hc_object_id": job_id,
-    }
-
-
-
-def fetch_linkedin_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
-    """Fetch and locally-score LinkedIn jobs via Apify actor (2rJKkhh7vjpX7pvjg).
-
-    This is the highest-priority source — LinkedIn has direct ATS apply URLs and
-    rich structured metadata. Results are merged into the pre-fetch pool before
-    Hiring Cafe and Jobo, so they are consumed first in the batch loop.
-    """
-    if not ENABLE_LINKEDIN_PREFETCH:
-        return [], 0
-
-    limit = limit or LINKEDIN_MAX_ITEMS
-
-    # Priority 1: persona target_titles — AI-generated, specific, searchable titles
-    keywords = []
-    if persona and isinstance(persona, dict):
-        _target = persona.get("target_titles") or []
-        keywords = [str(t).strip() for t in _target if str(t).strip()][:3]
-
-    # Priority 2: extract from automation (works for most users with standard titles)
-    if not keywords:
-        keywords = extract_automation_job_titles(automation, limit=3)
-
-    # Priority 3: raw jobTitles from preferences (catches simple values like "Retail")
-    if not keywords:
-        _prefs = extract_job_preferences(automation)
-        _raw_titles = _prefs.get("jobTitles") or []
-        keywords = [str(t).strip() for t in _raw_titles if str(t).strip()][:3]
-
-    _, location, _ = _build_hc_query(automation, search_contract, user_profile)
-    if not keywords:
-        print("LinkedIn: no keywords extracted — skipping prefetch")
-        return [], 0
-
-    actor_input = {
-        "keyword": keywords,
-        "publishedAt": "r604800",   # last 7 days
-        "maxItems": limit,
-        "enrichCompanyData": False,
-        "excludeRecruitingAgencies": False,
-        "filterEasyApply": False,
-        "saveOnlyUniqueItems": False,
-    }
-    if location:
-        actor_input["locations"] = [location]
-
-    print(f"\nLinkedIn prefetch  keywords={keywords!r}  location={location!r}  maxResults={limit}")
-
-    try:
-        resp = requests.post(
-            f"https://api.apify.com/v2/acts/{APIFY_LINKEDIN_ACTOR_ID}/run-sync-get-dataset-items",
-            params={"token": APIFY_API_TOKEN},
-            json=actor_input,
-            timeout=180,
-        )
-        resp.raise_for_status()
-        raw_items_all = resp.json()
-        if not isinstance(raw_items_all, list):
-            print(f"LinkedIn: unexpected response type {type(raw_items_all).__name__}")
-            raw_items_all = []
-    except Exception as e:
-        print(f"LinkedIn Apify error: {e}")
-        return [], 0
-
-    # Client-side limit guard in case the actor ignores maxResults
-    raw_items_all = raw_items_all[:limit]
-    print(f"LinkedIn: {len(raw_items_all)} raw results received")
-
-    avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
-    blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
-    seen_co_title = set()
-    parsed = []
-    for raw in raw_items_all:
-        job = _parse_linkedin_apify_job(raw)
-        if not job:
-            continue
-        co = re.sub(r"\s+", " ", job["company"].strip().lower())
-        ti = re.sub(r"\s+", " ", job["title"].strip().lower())
-        if (co, ti) in seen_co_title:
-            continue
-        seen_co_title.add((co, ti))
-        norm = normalize_url(job["job_url"])
-        if norm and norm in avoid_norm:
-            continue
-        if co and co in blocked_cos:
-            continue
-        score = local_inventory_match_score(
-            job,
-            automation=automation,
-            search_contract=search_contract,
-            user_profile=user_profile,
-        )
-        if score < LINKEDIN_LOCAL_SCORE_MIN:
-            continue
-        job["grade"] = max(job["grade"], score)
-        job["inventory_local_score"] = score
-        parsed.append((score, job))
-
-    parsed.sort(key=lambda x: x[0], reverse=True)
-    results = [j for _, j in parsed]
-    print(f"LinkedIn: {len(results)} jobs after local scoring (min score {LINKEDIN_LOCAL_SCORE_MIN})")
-    return results, len(raw_items_all)
 
 
 def get_inventory_candidates_for_user(user_profile, automation, persona, search_contract, avoid_urls, limit=INVENTORY_CANDIDATES_PER_USER):
@@ -6139,7 +5964,6 @@ def merge_jobs_dedup(primary_jobs, secondary_jobs):
 
 def classify_job_source(source_str):
     s = str(source_str or "").lower()
-    if s.startswith("linkedin_apify"):  return "linkedin"
     if s.startswith("hiring_cafe"):     return "hc"
     if s.startswith("jobo_ats"):        return "jobo"
     if "direct_url_resolver" in s:      return "resolver"
@@ -6147,7 +5971,7 @@ def classify_job_source(source_str):
 
 
 def compute_source_success_rates(round_results):
-    totals = {src: {"sourced": 0, "added": 0} for src in ("linkedin", "hc", "jobo", "openai", "resolver")}
+    totals = {src: {"sourced": 0, "added": 0} for src in ("hc", "jobo", "openai", "resolver")}
     for r in (round_results or []):
         funnel = (r.get("round_metrics") or {}).get("source_funnel", {})
         for src, counts in funnel.items():
@@ -6313,13 +6137,11 @@ def find_jobs_for_user(
         "openai_search_calls": 0,
         "openai_review_calls": 0,
         "openai_pivot_calls": 0,
-        "linkedin_raw_results": 0,
         "hc_raw_results": 0,
         "jobo_raw_results": 0,
         "persona_created_this_run": False,
         "contract_created_this_run": False,
         "source_funnel": {
-            "linkedin": {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
             "hc":       {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
             "jobo":     {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
             "openai":   {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
@@ -6415,29 +6237,8 @@ def find_jobs_for_user(
         round_metrics["jobo_raw_results"] += _jobo_raw
         hc_inventory.extend(_jobo_jobs)
 
-    # 3. LinkedIn — only when HC+Jobo pool is too thin to fill the user's quota.
-    # Skipping saves ~$0.09/user when cheaper sources already have enough candidates.
-    _li_limit = (source_limit_overrides or {}).get("linkedin")
-    _hc_jobo_pool_size = len(hc_inventory)
-    _linkedin_needed = ENABLE_LINKEDIN_PREFETCH and round_mode in ("first_round", "second_round") and _hc_jobo_pool_size < TARGET_JOBS_PER_USER
-    if _linkedin_needed:
-        print(f"HC+Jobo pool only {_hc_jobo_pool_size} jobs — running LinkedIn to supplement")
-        _li_jobs, _li_raw = fetch_linkedin_for_user(
-            automation=automation,
-            search_contract=search_contract,
-            user_profile=user_profile,
-            avoid_urls=avoid_urls,
-            rejected_companies=rejected_companies,
-            persona=persona,
-            limit=_li_limit,
-        )
-        round_metrics["linkedin_raw_results"] += _li_raw
-        hc_inventory.extend(_li_jobs)
-    elif ENABLE_LINKEDIN_PREFETCH and not _linkedin_needed:
-        print(f"HC+Jobo pool has {_hc_jobo_pool_size} jobs — skipping LinkedIn to save cost")
-
     if hc_inventory:
-        _pool_sources = "HC + Jobo ATS + Jobicy" + (" + LinkedIn" if _linkedin_needed else "")
+        _pool_sources = "HC + Jobo ATS"
         print(f"Pre-fetch pool: {len(hc_inventory)} total jobs ({_pool_sources})")
 
     for batch_number in range(1, max_batches_for_round + 1):
@@ -7091,7 +6892,6 @@ def find_jobs_for_user(
         "openai_pivot":    round(round_metrics["openai_pivot_calls"]         * COST_PER_OPENAI_PIVOT_CALL,    4),
         "openai_persona":  round(COST_PER_PERSONA_CREATE  if round_metrics["persona_created_this_run"]  else 0, 4),
         "openai_contract": round(COST_PER_CONTRACT_CREATE if round_metrics["contract_created_this_run"] else 0, 4),
-        "apify_linkedin":  round(round_metrics["linkedin_raw_results"] * COST_PER_LINKEDIN_RESULT, 4),
         "apify_hc":        round(round_metrics["hc_raw_results"]      * COST_PER_HC_RESULT,        4),
         "jobo":            round(round_metrics["jobo_raw_results"]     * COST_PER_JOBO_RESULT,      4),
     }
@@ -7909,7 +7709,6 @@ def main():
     apply_cli_overrides()
 
     print("Starting paid-user job automation script...")
-    print(f"DRY_RUN={DRY_RUN}")
     print(f"NO_GPT_MODE={NO_GPT_MODE}")
     print(f"SEARCH_MODEL={SEARCH_MODEL}")
     print(f"REVIEW_MODEL={REVIEW_MODEL}")
@@ -7934,7 +7733,6 @@ def main():
     print(f"INVENTORY_CANDIDATES_PER_USER={INVENTORY_CANDIDATES_PER_USER}")
     print(f"SAFE_FALLBACK_MIN_GRADE={SAFE_FALLBACK_MIN_GRADE}")
     print(f"DISCOVERY_PENDING_MIN_GRADE={DISCOVERY_PENDING_MIN_GRADE}")
-    print(f"ENABLE_LINKEDIN_PREFETCH={ENABLE_LINKEDIN_PREFETCH} LINKEDIN_MAX_ITEMS={LINKEDIN_MAX_ITEMS}")
     print(f"ENABLE_HIRING_CAFE_PREFETCH={ENABLE_HIRING_CAFE_PREFETCH} HIRING_CAFE_MAX_ITEMS={HIRING_CAFE_MAX_ITEMS} HIRING_CAFE_BATCH_SIZE={HIRING_CAFE_BATCH_SIZE}")
     print(f"ENABLE_JOBO_ATS_PREFETCH={ENABLE_JOBO_ATS_PREFETCH} JOBO_ATS_MAX_ITEMS={JOBO_ATS_MAX_ITEMS} JOBO_LOCAL_SCORE_MIN={JOBO_LOCAL_SCORE_MIN}")
     if NO_GPT_MODE:
@@ -8015,10 +7813,6 @@ def main():
             continue
         _overrides = {}
         _max_rate = max(_r1_source_rates.values()) if _r1_source_rates else 0
-        if _r1_source_rates.get("linkedin", 0) == _max_rate and _r1_source_rates["linkedin"] > 0:
-            _overrides["linkedin"] = max(10, int(LINKEDIN_MAX_ITEMS * 1.5))
-        elif _r1_source_rates.get("linkedin", 0) == 0:
-            _overrides["linkedin"] = max(10, int(LINKEDIN_MAX_ITEMS * 0.5))
         if _r1_source_rates.get("hc", 0) == _max_rate and _r1_source_rates["hc"] > 0:
             _overrides["hc"] = max(10, int(HIRING_CAFE_MAX_ITEMS * 1.5))
         elif _r1_source_rates.get("hc", 0) == 0:
@@ -8030,7 +7824,7 @@ def main():
         if _overrides:
             _r2_source_limit_overrides[_uid] = _overrides
 
-    if _best_source in ("linkedin", "hc", "jobo") and _r1_source_rates[_best_source] > 0:
+    if _best_source in ("hc", "jobo") and _r1_source_rates[_best_source] > 0:
         print(f"Round 2 budget adjustment:  {_best_source.upper()} +50%  (best performer at {_r1_source_rates[_best_source]:.0%})")
 
     if second_round_users:
@@ -8214,8 +8008,6 @@ def main():
 
     print()
     print(f"Users: {len(results_by_uid)}  ·  Jobs added: {total_new}  ·  Rejected: {total_rejected}")
-    if DRY_RUN:
-        print("DRY RUN — nothing was actually posted")
 
 
 if __name__ == "__main__":
