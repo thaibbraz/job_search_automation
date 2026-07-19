@@ -64,11 +64,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 SEARCH_MODEL = os.getenv("JOBBYO_SEARCH_MODEL", "gpt-4.1-mini")
 
 # Strict review model. gpt-4.1 handles the classification tiers well at ~15× lower cost than gpt-5.5.
-REVIEW_MODEL = os.getenv("JOBBYO_REVIEW_MODEL", "gpt-4.1")
+REVIEW_MODEL = os.getenv("JOBBYO_REVIEW_MODEL", "gpt-4.1-mini")
 
 # Resolver can use a stronger model because it replaces manual sourcing:
 # company + exact title -> direct ATS/company URL. Keep configurable for GitHub Actions.
-RESOLUTION_MODEL = os.getenv("JOBBYO_RESOLUTION_MODEL", "gpt-4.1")
+RESOLUTION_MODEL = os.getenv("JOBBYO_RESOLUTION_MODEL", "gpt-4.1-nano")
 SEARCH_CONTEXT_SIZE = os.getenv("JOBBYO_SEARCH_CONTEXT_SIZE", "high")
 RESOLUTION_SEARCH_CONTEXT_SIZE = os.getenv("JOBBYO_RESOLUTION_SEARCH_CONTEXT_SIZE", "high")
 
@@ -4802,6 +4802,13 @@ def maybe_create_strategy_pivot(
             f"\nSTRATEGY PIVOT SKIPPED: reached MAX_STRATEGY_PIVOTS_PER_USER="
             f"{MAX_STRATEGY_PIVOTS_PER_USER} for this user."
         )
+        return None
+
+    # Skip pivot if one was already generated for this user (strategy is generated once,
+    # the saved adapted search contract is reused on future runs).
+    uid = (user_profile or {}).get("uid", "")
+    if uid and list(STRATEGY_REPORT_DIR.glob(f"adaptation_{uid}_*.json")):
+        print(f"\nSTRATEGY PIVOT SKIPPED: adaptation already exists for {uid} — reusing saved search contract.")
         return None
 
     print(
