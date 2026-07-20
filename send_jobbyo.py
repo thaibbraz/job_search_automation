@@ -9,7 +9,7 @@ import urllib.parse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 
 import requests
 
