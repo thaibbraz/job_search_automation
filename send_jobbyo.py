@@ -68,7 +68,7 @@ REVIEW_MODEL = os.getenv("JOBBYO_REVIEW_MODEL", "gpt-4.1-mini")
 
 # Resolver can use a stronger model because it replaces manual sourcing:
 # company + exact title -> direct ATS/company URL. Keep configurable for GitHub Actions.
-RESOLUTION_MODEL = os.getenv("JOBBYO_RESOLUTION_MODEL", "gpt-4.1-nano")
+RESOLUTION_MODEL = os.getenv("JOBBYO_RESOLUTION_MODEL", "gpt-4.1-mini")
 SEARCH_CONTEXT_SIZE = os.getenv("JOBBYO_SEARCH_CONTEXT_SIZE", "high")
 RESOLUTION_SEARCH_CONTEXT_SIZE = os.getenv("JOBBYO_RESOLUTION_SEARCH_CONTEXT_SIZE", "high")
 
