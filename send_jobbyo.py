@@ -464,6 +464,35 @@ AGGREGATOR_DOMAINS = {
     "jobgether.com",
     "tealhq.com",
 
+    # Boards that were still reaching users' queues via Jobo/HC. A job must
+    # arrive as a direct employer/ATS apply link, never as a board listing.
+    "jobs.workable.com",
+    "swooped.co",
+    "jobtoday.com",
+    "remoteanywherejob.com",
+    "remoteleaf.com",
+    "breakroom.cc",
+    "mediabistro.com",
+    "opentalent.in",
+    "harnham.com",
+    "crossover.com",
+    "weekday.works",
+    "builtin.com",
+    "wellfound.com",
+    "angel.co",
+    "otta.com",
+    "welcometothejungle.com",
+    "himalayas.app",
+    "remoteok.com",
+    "weworkremotely.com",
+    "flexjobs.com",
+    "jobrapido.com",
+    "neuvoo.com",
+    "adzuna.com",
+    "whatjobs.com",
+    "jobvertise.com",
+    "resume-library.com",
+
     # Permanently blocked sources requested by Jobbyo
     "bebee.com",
     "usajobs.gov",
@@ -693,6 +722,17 @@ ADDITIONAL_BLOCKED_FINAL_DOMAINS = {
     "medium.com",
     "substack.com",
     "dev.to",
+}
+
+# Job boards that host their listings on a legitimate ATS domain. Blocking the
+# domain would kill every real employer on that ATS, so match the employer slug.
+REPOSTER_ATS_SLUGS = {
+    "jobgether",
+    "swooped",
+    "jobot",
+    "crossover",
+    "remoterocketship",
+    "talentify",
 }
 
 DISCOVERY_ONLY_DOMAINS = set(AGGREGATOR_DOMAINS) | ADDITIONAL_BLOCKED_FINAL_DOMAINS
@@ -1231,6 +1271,13 @@ def static_check(
         return False, "aggregator_page"
 
     path_lower = urllib.parse.unquote(parsed.path.lower())
+
+    # Reposters run their own board on a real ATS domain (e.g.
+    # jobs.lever.co/jobgether/...), so the domain looks legitimate. The employer
+    # slug is what gives them away.
+    if any(f"/{slug}/" in path_lower or path_lower.startswith(f"/{slug}")
+           for slug in REPOSTER_ATS_SLUGS):
+        return False, "aggregator_page"
     query_lower = parsed.query.lower()
 
     if any(
