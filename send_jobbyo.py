@@ -288,6 +288,12 @@ REMOTE_WORKERS = 14
 DEFAULT_STATUS = "waiting_approval"
 STARTER_MAX_STATUS = "waiting_approval"
 PREMIUM_STATUS = "pending"
+
+# Dry run: collect what would be posted into a JSON file instead of sending it
+# to real user queues. Everything upstream (sourcing, review, cost) runs for real.
+DRY_RUN = os.getenv("JOBBYO_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+DRY_RUN_FILE = os.getenv("JOBBYO_DRY_RUN_FILE", "run_logs/dry_run_jobs.json")
+DRY_RUN_BUCKET = {}
 LEGACY_PENDING_STATUSES = {"pending_review", "pending", "waiting_approval"}
 
 # Only these AI review decisions will be posted.
@@ -365,6 +371,21 @@ def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS):
         "jobs": jobs,
         "default_status": default_status,
     }
+
+    if DRY_RUN:
+        # Collect instead of posting, so a run can be reviewed before anything
+        # reaches a real user's queue.
+        DRY_RUN_BUCKET.setdefault(email, []).extend(jobs)
+        Path(DRY_RUN_FILE).write_text(json.dumps(DRY_RUN_BUCKET, indent=2))
+        print(f"\n[DRY RUN] would post {len(jobs)} job(s) to {email} "
+              f"(status={default_status}) → {DRY_RUN_FILE}")
+        return {
+            "user_id": "dry-run",
+            "added_count": len(jobs),
+            "skipped_count": 0,
+            "added": jobs,
+            "skipped": [],
+        }
 
     print("\nPOSTING PAYLOAD:")
     print(json.dumps(payload, indent=2))
@@ -5004,6 +5025,17 @@ TITLE_EXTRACTION_KEYWORDS = [
     "jobtitle", "jobtitles", "desired", "preferred",
 ]
 
+# Leaf keys whose values ARE role titles by definition. The user (or the persona
+# generator) put them there on purpose, so ROLE_TITLE_HINT_WORDS must not get a
+# vote — it is a 40-word whitelist that rejects real titles like "investment
+# banker" or "medical technologist" while accepting industry names like "Finance".
+AUTHORITATIVE_TITLE_KEYS = {
+    "jobtitle", "jobtitles", "title", "titles",
+    "targettitle", "targettitles", "targetrole", "targetroles",
+    "desiredtitle", "desiredtitles", "desiredrole", "desiredroles",
+    "role", "roles", "position", "positions",
+}
+
 
 def split_possible_titles(value):
     if value is None:
@@ -5054,6 +5086,9 @@ def extract_automation_job_titles(automation, limit=40):
     def walk(value, key_path=""):
         key_l = key_path.lower().replace("_", "")
         key_relevant = any(k in key_l for k in TITLE_EXTRACTION_KEYWORDS)
+        # An explicit titles field is trusted as-is; anything else still has to
+        # look like a role title to get in.
+        authoritative = key_path.rsplit(".", 1)[-1].lower().replace("_", "") in AUTHORITATIVE_TITLE_KEYS
 
         if isinstance(value, dict):
             for k, v in value.items():
@@ -5064,7 +5099,7 @@ def extract_automation_job_titles(automation, limit=40):
             if key_relevant:
                 for item in value:
                     for title in split_possible_titles(item):
-                        if looks_like_role_title(title):
+                        if authoritative or looks_like_role_title(title):
                             titles.append(title)
             else:
                 for item in value:
@@ -5073,7 +5108,7 @@ def extract_automation_job_titles(automation, limit=40):
 
         if key_relevant:
             for title in split_possible_titles(value):
-                if looks_like_role_title(title):
+                if authoritative or looks_like_role_title(title):
                     titles.append(title)
 
     walk(prefs)
@@ -5648,25 +5683,34 @@ def _build_hc_query(automation, search_contract, user_profile, persona=None):
         if _q:
             keywords = [_q]
 
-    # Derive workplace_type from the location/remote policy.
     policy = candidate_location_policy(user_profile, automation, search_contract)
-    if policy.get("worldwide") or policy.get("remote_allowed"):
+    _prefs_loc = (extract_job_preferences(automation).get("location") or {})
+
+    # Workplace type: honour what the user actually ticked. Deriving it from
+    # policy.remote_allowed sent "Remote" to an on-site-only candidate.
+    loc_types = {str(t).strip().lower() for t in (_prefs_loc.get("type") or []) if str(t).strip()}
+    if loc_types:
+        workplace_type = "Remote" if loc_types == {"remote"} else "Any"
+    elif policy.get("worldwide") or policy.get("remote_allowed"):
         workplace_type = "Remote"
     else:
         workplace_type = "Any"
 
-    # Build a location string: if no strong region, leave blank so HC searches globally.
-    allowed_regions = policy.get("allowed_regions", [])
-    location = ""
-    if "us" in allowed_regions:
-        location = "United States"
-    elif "uk" in allowed_regions:
-        location = "United Kingdom"
-    elif "eu" in allowed_regions:
-        location = "Europe"
-    # Otherwise blank = no geo filter on HC side (let our own policy filter do it).
+    # Locations: the places the user actually chose. The old us/uk/eu enum
+    # dropped everyone else — a Nairobi candidate got an unfiltered worldwide
+    # search, and a UAE+UK candidate got UK only — and the reviewer then
+    # rejected the whole batch on location.
+    locations = [str(p).strip() for p in (_prefs_loc.get("places") or []) if str(p).strip()][:3]
+    if not locations:
+        allowed_regions = policy.get("allowed_regions", [])
+        if "us" in allowed_regions:
+            locations = ["United States"]
+        elif "uk" in allowed_regions:
+            locations = ["United Kingdom"]
+        elif "eu" in allowed_regions:
+            locations = ["Europe"]
 
-    return keywords, location, workplace_type
+    return keywords, locations, workplace_type
 
 
 def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
@@ -5680,7 +5724,9 @@ def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_
         return [], 0
 
     base_limit = limit or HIRING_CAFE_MAX_ITEMS
-    keywords, location, workplace_type = _build_hc_query(automation, search_contract, user_profile, persona=persona)
+    keywords, _locations, workplace_type = _build_hc_query(automation, search_contract, user_profile, persona=persona)
+    # The Apify HC actor takes a single location string.
+    location = _locations[0] if _locations else ""
     if NO_GPT_MODE:
         extra_keywords = extract_automation_job_titles(automation, limit=NOGPT_HIRING_CAFE_KEYWORDS)
         keywords = list(dict.fromkeys([k for k in extra_keywords + keywords if k]))[:NOGPT_HIRING_CAFE_KEYWORDS]
@@ -5859,7 +5905,7 @@ def is_us_allowed_candidate(user_profile=None, automation=None, search_contract=
     return any(marker in text for marker in ["united states", "usa", "u s", " us "])
 
 
-def build_jobo_search_bodies(keywords, location, workplace_type, salary_floor, limit, user_profile, automation, search_contract):
+def build_jobo_search_bodies(keywords, locations, workplace_type, salary_floor, limit, user_profile, automation, search_contract):
     posted_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     work_models = ["remote"] if workplace_type == "Remote" else ["remote", "hybrid", "onsite"]
 
@@ -5871,8 +5917,8 @@ def build_jobo_search_bodies(keywords, location, workplace_type, salary_floor, l
             "posted_after": posted_after,
             "include_fields": ["summary", "description"],
         }
-        if location:
-            body["locations"] = [location]
+        if locations:
+            body["locations"] = list(locations)
         if salary_floor:
             body["salary_usd"] = {"min": salary_floor}
         return [body]
@@ -5892,9 +5938,9 @@ def build_jobo_search_bodies(keywords, location, workplace_type, salary_floor, l
             "posted_after": posted_after,
             "include_fields": ["summary", "description"],
         }
-        if location:
+        if locations:
             body = dict(base)
-            body["locations"] = [location]
+            body["locations"] = list(locations)
             bodies.append(body)
         else:
             bodies.append(base)
@@ -5907,7 +5953,7 @@ def build_jobo_search_bodies(keywords, location, workplace_type, salary_floor, l
             # passes. This uses the extra quota the user mentioned.
             remote_body = dict(base)
             remote_body["work_models"] = ["remote", "hybrid", "onsite"]
-            remote_body["locations"] = ["United States"]
+            remote_body["locations"] = list(locations) or ["United States"]
             bodies.append(remote_body)
 
     if salary_floor:
@@ -5916,7 +5962,7 @@ def build_jobo_search_bodies(keywords, location, workplace_type, salary_floor, l
     return bodies[:max_calls]
 
 
-def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, limit=None):
+def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
     """Fetch and locally-score jobo.world ATS Jobs API candidates via direct API.
 
     In --nogpt mode this intentionally makes more Jobo calls across more target
@@ -5926,8 +5972,9 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
         return [], 0
     limit = limit or (NOGPT_JOBO_PAGE_SIZE if NO_GPT_MODE else JOBO_ATS_MAX_ITEMS)
     keyword_limit = NOGPT_JOBO_KEYWORDS if NO_GPT_MODE else 3
-    keywords = extract_automation_job_titles(automation, limit=keyword_limit)
-    _, location, workplace_type = _build_hc_query(automation, search_contract, user_profile)
+    # Same keyword source as Hiring.cafe: persona titles first, prefs as fallback.
+    keywords, locations, workplace_type = _build_hc_query(automation, search_contract, user_profile, persona)
+    keywords = keywords[:keyword_limit] or extract_automation_job_titles(automation, limit=keyword_limit)
     if not keywords:
         print("Jobo ATS: no keywords extracted — skipping prefetch")
         return [], 0
@@ -5935,7 +5982,7 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
     posted_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     bodies = build_jobo_search_bodies(
         keywords=keywords,
-        location=location,
+        locations=locations,
         workplace_type=workplace_type,
         salary_floor=salary_floor,
         limit=limit,
@@ -5944,7 +5991,7 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
         search_contract=search_contract,
     )
     print(
-        f"\nJobo ATS prefetch  queries={keywords}  location={location!r}  type={workplace_type}"
+        f"\nJobo ATS prefetch  queries={keywords}  locations={locations!r}  type={workplace_type}"
         f"  salary_min={salary_floor}  posted_after={posted_after[:10]}  calls={len(bodies)}  page_size={limit}"
     )
 
@@ -6337,6 +6384,7 @@ def find_jobs_for_user(
             user_profile=user_profile,
             avoid_urls=avoid_urls,
             rejected_companies=rejected_companies,
+            persona=persona,
             limit=_jobo_limit,
         )
         round_metrics["jobo_raw_results"] += _jobo_raw
