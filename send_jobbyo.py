@@ -291,6 +291,23 @@ PREMIUM_STATUS = "pending"
 
 # Dry run: collect what would be posted into a JSON file instead of sending it
 # to real user queues. Everything upstream (sourcing, review, cost) runs for real.
+RUN_DATE_OFFSET_DAYS = env_int("JOBBYO_RUN_DATE_OFFSET_DAYS", 0)
+
+# OpenAI web search is a fallback for candidates the structured sources cannot
+# supply, not a default source. Measured over two full runs it produced 9.7% of
+# delivered jobs for ~67% of spend, because it ran for everyone regardless of
+# whether Jobo/HC had already found plenty.
+#
+# A user is an "exception" when the structured pool came back thinner than
+# OPENAI_EXCEPTION_POOL_FLOOR. Only they get OpenAI, and only for
+# OPENAI_MAX_BATCHES_PER_USER batches across the whole run.
+OPENAI_EXCEPTION_ONLY = os.getenv("JOBBYO_OPENAI_EXCEPTION_ONLY", "1").strip().lower() in ("1", "true", "yes")
+OPENAI_EXCEPTION_POOL_FLOOR = env_int("JOBBYO_OPENAI_EXCEPTION_POOL_FLOOR", 0) or None
+OPENAI_MAX_BATCHES_PER_USER = env_int("JOBBYO_OPENAI_MAX_BATCHES_PER_USER", 1)
+
+# uid -> OpenAI batches spent, carried across rounds within a single run.
+_OPENAI_BATCHES_USED = {}
+
 DRY_RUN = os.getenv("JOBBYO_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 DRY_RUN_FILE = os.getenv("JOBBYO_DRY_RUN_FILE", "run_logs/dry_run_jobs.json")
 DRY_RUN_BUCKET = {}
@@ -1841,8 +1858,17 @@ def statuses_counted_for_today(job_status):
     return {str(job_status or "").lower(), "pending_review"}
 
 
+def run_today():
+    """The date the run treats as 'today'.
+
+    JOBBYO_RUN_DATE_OFFSET_DAYS=1 makes a run behave as if it were tomorrow, so
+    quota checks ignore jobs already delivered today. Defaults to 0.
+    """
+    return (datetime.now(timezone.utc) + timedelta(days=RUN_DATE_OFFSET_DAYS)).date()
+
+
 def count_jobs_today(existing_jobs, job_status=None):
-    today = datetime.now(timezone.utc).date()
+    today = run_today()
     count = 0
     accepted_statuses = statuses_counted_for_today(job_status or DEFAULT_STATUS)
 
@@ -4459,7 +4485,7 @@ def regrade_ungraded_jobs(user_profile, automation, cv_text, persona, email, job
     fresh_auto = get_user_automation(uid) or automation
     all_jobs = extract_existing_jobs(fresh_auto)
 
-    today = date.today()
+    today = run_today()
 
     def _job_is_today(j):
         for field in ("addedAt", "createdAt", "added_at", "created_at"):
@@ -6491,6 +6517,9 @@ def find_jobs_for_user(
             print(f"Pool pre-grade failed (non-fatal, continuing with local scores): {e}")
 
     _hc_jobo_pool_size = len(hc_inventory)  # capture before batch loop consumes slices
+    # Below this many structured candidates the user counts as a supply
+    # exception and may spend an OpenAI batch. Defaults to the round's target.
+    _openai_exception_floor = OPENAI_EXCEPTION_POOL_FLOOR or TARGET_JOBS_PER_USER
 
     for batch_number in range(1, max_batches_for_round + 1):
         current_total_estimate = pending_today_before + len(posted_jobs_this_round)
@@ -6565,8 +6594,28 @@ def find_jobs_for_user(
             # structured pool as exhausted and continue to the next batch/round.
             batch_source = "nogpt_inventory_exhausted"
             jobs = []
+        elif OPENAI_EXCEPTION_ONLY and _hc_jobo_pool_size >= _openai_exception_floor:
+            # Jobo/HC found plenty for this candidate, so a shortfall here is a
+            # fit problem, not a supply problem — more OpenAI results would meet
+            # the same reviewer and the same verdict.
+            print(
+                f"Structured pool supplied {_hc_jobo_pool_size} candidates "
+                f"(>= {_openai_exception_floor}) — not a supply exception; skipping OpenAI."
+            )
+            break
+        elif _OPENAI_BATCHES_USED.get(uid, 0) >= OPENAI_MAX_BATCHES_PER_USER:
+            print(
+                f"OpenAI budget spent for this candidate "
+                f"({OPENAI_MAX_BATCHES_PER_USER} batch(es)) — stopping."
+            )
+            break
         else:
-            # HC/Jobo pool exhausted (or disabled) — fall back to OpenAI web search.
+            # Genuine supply exception: structured sources came back thin.
+            _OPENAI_BATCHES_USED[uid] = _OPENAI_BATCHES_USED.get(uid, 0) + 1
+            print(
+                f"Supply exception: pool had only {_hc_jobo_pool_size} candidates — "
+                f"OpenAI batch {_OPENAI_BATCHES_USED[uid]}/{OPENAI_MAX_BATCHES_PER_USER}"
+            )
             batch_source = "openai_search"
             try:
                 result = ask_openai_for_jobs(
