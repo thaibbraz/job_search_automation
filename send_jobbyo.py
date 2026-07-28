@@ -131,8 +131,12 @@ MIN_VIABLE_CONFIDENCE = 55
 
 # Direct URL resolver: when search finds a promising mirror/job-board lead,
 # spend a small extra call trying to find the real ATS/company URL.
-MAX_DIRECT_RESOLUTION_ATTEMPTS_PER_BATCH = 2
-MAX_REMOTE_FAILURE_RESOLUTION_ATTEMPTS_PER_BATCH = 2
+#
+# Off by default. Measured on the 2026-07-27 run it was the single most
+# expensive line ($2.22) and returned 2 of 192 jobs, while Jobo returned 141
+# for $1.52. Set JOBBYO_RESOLVER_ATTEMPTS to a positive number to re-enable.
+MAX_DIRECT_RESOLUTION_ATTEMPTS_PER_BATCH = env_int("JOBBYO_RESOLVER_ATTEMPTS", 0)
+MAX_REMOTE_FAILURE_RESOLUTION_ATTEMPTS_PER_BATCH = env_int("JOBBYO_RESOLVER_ATTEMPTS", 0)
 MAX_DIRECT_RESOLUTION_CANDIDATES = 8
 MIN_DIRECT_RESOLUTION_GRADE = 65
 PENDING_REVIEW_MIN_GRADE = 62
