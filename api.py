@@ -74,6 +74,9 @@ _state = _State()
 class UserTarget(BaseModel):
     uid:   Optional[str] = None
     email: Optional[str] = None
+    # When true, /run/user/top-jobs emails the results straight to the
+    # candidate via Brevo, so a webhook caller needs only this one request.
+    send_email: bool = False
 
 class RunResponse(BaseModel):
     accepted: bool
@@ -94,6 +97,7 @@ class TopJobsResponse(BaseModel):
     message:         str
     duration_seconds: float
     jobs:            list[TopJob]
+    emailed:         bool = False
 
 class StatusResponse(BaseModel):
     full_run_active:            bool
@@ -296,11 +300,35 @@ async def run_user_top_jobs(target: UserTarget, limit: int = 3):
         )
         for j in jobs_added
     ]
+    emailed = False
+    if target.send_email and jobs_added:
+        # Send straight from here so a webhook caller needs one request, not a
+        # round trip back with the results.
+        try:
+            import send_jobbyo, approve_jobs
+
+            resolved_uid = match.get("uid")
+            profile = send_jobbyo.get_user_profile(resolved_uid) or {}
+            automation = send_jobbyo.get_user_automation(resolved_uid) or {}
+            emailed = bool(
+                await asyncio.to_thread(
+                    approve_jobs.send_email,
+                    profile,
+                    automation,
+                    jobs_added,
+                    match.get("email") or target.email,
+                )
+            )
+        except Exception as exc:
+            print(f"[{label}] email send failed: {exc}")
+
+    suffix = " Emailed." if emailed else (" Email failed." if target.send_email and jobs_added else "")
     return TopJobsResponse(
         accepted=True,
-        message=f"Found {len(jobs)} job(s) for {target.uid or target.email}.",
+        message=f"Found {len(jobs)} job(s) for {target.uid or target.email}.{suffix}",
         duration_seconds=duration_seconds,
         jobs=jobs,
+        emailed=emailed,
     )
 
 
