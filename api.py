@@ -49,6 +49,9 @@ SYNC_RUN_TIMEOUT_SECONDS = 600
 # /run/user/top-jobs runs the whole pipeline, so each call takes minutes and
 # costs real money. Allow one per candidate per window.
 TOP_JOBS_COOLDOWN_SECONDS = int(os.getenv("JOBBYO_TOP_JOBS_COOLDOWN_SECONDS", "86400"))
+# While testing, redirect every first-matches email here instead of to the
+# candidate. Unset in production so real candidates receive their own.
+TOP_JOBS_TEST_RECIPIENT = os.getenv("JOBBYO_TOP_JOBS_TEST_RECIPIENT", "").strip()
 _top_jobs_last_run = {}   # normalized uid/email -> datetime of last accepted call
 
 BACKEND_BASE = os.getenv("JOBBYO_BACKEND_URL", "https://fastapi-service-03-160893319817.europe-southwest1.run.app")
@@ -309,14 +312,17 @@ async def run_user_top_jobs(target: UserTarget, limit: int = 3):
 
             resolved_uid = match.get("uid")
             profile = send_jobbyo.get_user_profile(resolved_uid) or {}
-            automation = send_jobbyo.get_user_automation(resolved_uid) or {}
+            # A candidate whose jobs were not stored has no plan, so the email
+            # closes on signing up rather than on their queue.
+            is_paid = bool(match.get("jobs_added"))
+            recipient = TOP_JOBS_TEST_RECIPIENT or match.get("email") or target.email
             emailed = bool(
                 await asyncio.to_thread(
-                    approve_jobs.send_email,
+                    approve_jobs.send_first_matches_email,
                     profile,
-                    automation,
                     jobs_added,
-                    match.get("email") or target.email,
+                    recipient,
+                    is_paid,
                 )
             )
         except Exception as exc:

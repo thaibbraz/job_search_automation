@@ -199,6 +199,119 @@ def promote_jobs(email, jobs_to_promote, new_status):
 # Email
 # ---------------------------------------------------------------------------
 
+def _job_reason(job):
+    """Reviewer's reason, with a grade-based fallback when none was stored."""
+    reason = (job.get("review_reason") or job.get("reason") or "").strip()
+    if reason:
+        return reason
+    grade = int(job.get("grade") or 0)
+    if grade >= 80:
+        return f"Strong match ({grade}/100) — selected based on your background and search preferences."
+    if grade >= 60:
+        return f"Good fit ({grade}/100) — aligns with your target roles and location."
+    return "Selected based on your search preferences and profile."
+
+
+def send_first_matches_email(user_profile, jobs, override_email=None, is_paid=True):
+    """Welcome email sent right after a candidate finishes their automation.
+
+    Distinct from the daily digest: this is the first thing they receive, so it
+    frames what the product just did rather than reporting a routine batch. For
+    a candidate without a plan the matches are shown but not saved, so the
+    closing copy points at signing up instead of at their queue.
+    """
+    email = override_email or user_profile.get("email") or ""
+    name = user_profile.get("displayName") or (user_profile.get("email") or "").split("@")[0]
+    first_name = name.split()[0] if name else "there"
+
+    cards = ""
+    for j in jobs:
+        title = j.get("title") or ""
+        company = j.get("company") or ""
+        url = j.get("job_url") or j.get("url") or ""
+        location = j.get("location") or ""
+        grade = int(j.get("grade") or 0)
+        reason = _job_reason(j)
+
+        heading = (
+            f'<a href="{url}" style="color:#3A56E2;text-decoration:none;font-weight:700;">{title}</a>'
+            if url else f'<strong style="color:#3A56E2;">{title}</strong>'
+        )
+        meta = " · ".join([p for p in (company, location) if p])
+
+        cards += f"""
+    <div style="border:1px solid #e5e7eb;border-radius:8px;padding:20px;margin:0 0 16px 0;">
+      <p style="margin:0 0 4px 0;font-size:16px;line-height:1.5;">{heading}</p>
+      <p style="margin:0 0 12px 0;font-size:13px;color:#6b7280;font-family:Arial,sans-serif;">{meta}</p>
+      <p style="margin:0;font-size:14px;color:#374151;line-height:1.7;">{reason}</p>
+      <p style="margin:12px 0 0 0;font-size:12px;color:#9ca3af;font-family:Arial,sans-serif;">Match score {grade}/100</p>
+    </div>"""
+
+    if is_paid:
+        closing = "These are saved to your queue — review and approve them whenever you're ready."
+        cta_text, cta_url = "Review &amp; Approve Jobs", "https://app.jobbyo.ai/auto-apply"
+    else:
+        closing = "This is a preview. Start your plan and Jobbyo will keep finding roles like these every day, and apply for you."
+        cta_text, cta_url = "Start Applying", "https://app.jobbyo.ai/pricing"
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family:Georgia,serif;background:#ffffff;margin:0;padding:0;color:#111827;">
+  <div style="max-width:580px;margin:0 auto;padding:40px 24px;">
+
+    <p style="margin:0 0 6px 0;font-size:12px;font-weight:700;color:#3A56E2;text-transform:uppercase;letter-spacing:0.08em;font-family:Arial,sans-serif;">Jobbyo</p>
+    <p style="margin:0 0 24px 0;font-size:15px;line-height:1.7;">Hi {first_name},</p>
+    <p style="margin:0 0 28px 0;font-size:15px;line-height:1.7;">Your profile is set up, and I've already been looking. Here {'is' if len(jobs) == 1 else 'are'} the {'role' if len(jobs) == 1 else f'{len(jobs)} roles'} that fit you best right now.</p>
+
+    {cards if cards else '<p style="font-size:15px;color:#6b7280;font-style:italic;">No strong matches yet — I&#39;ll keep looking and email you as soon as I find one.</p>'}
+
+    <p style="margin:28px 0 0 0;font-size:15px;line-height:1.7;">{closing}</p>
+    <p style="margin:20px 0 0 0;font-size:15px;line-height:1.7;">Best,<br>Jobbyo</p>
+
+    <hr style="border:none;border-top:1px solid #e5e7eb;margin:32px 0;">
+
+    <div style="text-align:center;margin-bottom:16px;">
+      <a href="{cta_url}" style="display:inline-block;background:#3A56E2;color:#ffffff;text-decoration:none;padding:12px 32px;border-radius:6px;font-size:14px;font-family:Arial,sans-serif;font-weight:600;">
+        {cta_text}
+      </a>
+    </div>
+    <p style="text-align:center;font-size:12px;color:#9ca3af;font-family:Arial,sans-serif;">
+      <a href="https://app.jobbyo.ai/settings" style="color:#9ca3af;">Manage preferences</a>
+    </p>
+
+  </div>
+</body>
+</html>"""
+
+    payload = {
+        "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+        "to": [{"email": email, "name": name}],
+        "subject": f"{first_name}, here {'is your first match' if len(jobs) == 1 else f'are your first {len(jobs)} matches'}",
+        "htmlContent": html_content,
+    }
+
+    if not BREVO_API_KEY:
+        print("  BREVO_API_KEY not set — cannot send first-matches email.")
+        return False
+
+    try:
+        res = requests.post(
+            f"{BREVO_API_URL}/smtp/email",
+            headers={"accept": "application/json", "api-key": BREVO_API_KEY, "content-type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        if res.status_code >= 400:
+            print(f"  Brevo error {res.status_code}: {res.text[:200]}")
+            return False
+        print(f"  First-matches email sent → {email}  ({len(jobs)} jobs)")
+        return True
+    except Exception as e:
+        print(f"  First-matches email failed for {email}: {e}")
+        return False
+
+
 def send_email(user_profile, automation, jobs, override_email=None):
     """Send the daily report email directly via Brevo."""
     email = override_email or user_profile.get("email") or ""
