@@ -46,6 +46,11 @@ PYTHON = sys.executable
 RUN_LOG_DIR = SCRIPT_DIR / "run_logs"
 SYNC_RUN_TIMEOUT_SECONDS = 600
 
+# /run/user/top-jobs runs the whole pipeline, so each call takes minutes and
+# costs real money. Allow one per candidate per window.
+TOP_JOBS_COOLDOWN_SECONDS = int(os.getenv("JOBBYO_TOP_JOBS_COOLDOWN_SECONDS", "86400"))
+_top_jobs_last_run = {}   # normalized uid/email -> datetime of last accepted call
+
 BACKEND_BASE = os.getenv("JOBBYO_BACKEND_URL", "https://fastapi-service-03-160893319817.europe-southwest1.run.app")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 # ---------------------------------------------------------------------------
@@ -218,6 +223,20 @@ async def run_user_top_jobs(target: UserTarget, limit: int = 3):
     and show a loading state for — this can take a few minutes."""
     if not target.uid and not target.email:
         raise HTTPException(status_code=422, detail="Provide uid or email.")
+
+    # One run per candidate per window: each call is a full pipeline run.
+    key = (target.uid or target.email or "").strip().lower()
+    last = _top_jobs_last_run.get(key)
+    now = datetime.now(timezone.utc)
+    if last is not None:
+        elapsed = (now - last).total_seconds()
+        if elapsed < TOP_JOBS_COOLDOWN_SECONDS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Already ran for {key} recently. Try again in {int(TOP_JOBS_COOLDOWN_SECONDS - elapsed)}s.",
+            )
+    _top_jobs_last_run[key] = now
+
     if target.uid:
         args, label = ["--uid", target.uid], f"run:user:{target.uid}"
     else:

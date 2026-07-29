@@ -174,13 +174,17 @@ APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "")
 APIFY_HIRING_CAFE_ACTOR_ID = "memo23~apify-hiring-cafe-scraper"
 HIRING_CAFE_MAX_ITEMS = 50           # raw results fetched per user from HC
 HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
-HIRING_CAFE_LOCAL_SCORE_MIN = 15     # same floor as Jobo/LinkedIn — AI review handles fit
+# Keyword-overlap floor applied BEFORE AI review. Set to 0 so every fetched job
+# reaches the reviewer: the score is bag-of-words overlap against the profile
+# text, so a thin persona scored good jobs near zero and deleted them unseen
+# (same user, same query: 26 kept with a search contract loaded, 1 without).
+HIRING_CAFE_LOCAL_SCORE_MIN = env_int("JOBBYO_LOCAL_SCORE_MIN", 0)
 ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
 
 JOBO_API_BASE = "https://connect.jobo.world"
 JOBO_API_KEY = os.getenv("JOBO_API_KEY", "")
 JOBO_ATS_MAX_ITEMS = 45           # raw results per call (was 30)
-JOBO_LOCAL_SCORE_MIN = 15         # lower than HC — Jobo URLs are ATS-direct; AI review handles fit
+JOBO_LOCAL_SCORE_MIN = env_int("JOBBYO_LOCAL_SCORE_MIN", 0)
 ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 
 # No-GPT mode: replace OpenAI search/review with more structured inventory from
@@ -313,6 +317,10 @@ OPENAI_MAX_BATCHES_PER_USER = env_int("JOBBYO_OPENAI_MAX_BATCHES_PER_USER", 1)
 _OPENAI_BATCHES_USED = {}
 
 DRY_RUN = os.getenv("JOBBYO_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
+# Set at runtime when a targeted run resolves to a non-paying candidate: the
+# jobs are found and returned, but nothing is written to their queue.
+SKIP_SAVE = False
 DRY_RUN_FILE = os.getenv("JOBBYO_DRY_RUN_FILE", "run_logs/dry_run_jobs.json")
 DRY_RUN_BUCKET = {}
 LEGACY_PENDING_STATUSES = {"pending_review", "pending", "waiting_approval"}
@@ -392,6 +400,18 @@ def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS):
         "jobs": jobs,
         "default_status": default_status,
     }
+
+    if SKIP_SAVE:
+        # Free preview: the caller still gets these jobs via the run log, but
+        # nothing is written to the candidate's queue.
+        print(f"\n[FREE PREVIEW] {len(jobs)} job(s) found for {email} — not saved.")
+        return {
+            "user_id": "free-preview",
+            "added_count": len(jobs),
+            "skipped_count": 0,
+            "added": jobs,
+            "skipped": [],
+        }
 
     if DRY_RUN:
         # Collect instead of posting, so a run can be reviewed before anything
@@ -7288,7 +7308,64 @@ def selected_email_matches(email):
 # RUN ROUNDS
 # ============================================================
 
+def resolve_requested_user():
+    """Resolve a --uid/--email target directly, without going through /users/paid.
+
+    A targeted run should work for anyone who has an automation, so a free
+    candidate can be shown a preview of what the product would find them.
+    Returns None when no single user was requested or the lookup fails.
+    """
+    global SKIP_SAVE
+
+    uid = SINGLE_USER_UID
+    email = SINGLE_USER_EMAIL or next(iter(SINGLE_USER_EMAILS), None)
+    if not uid and not email:
+        return None
+
+    if not uid and email:
+        # There is no GET automation-by-email route, so resolve the uid first.
+        looked_up = api_get(f"{BASE_URL}/users/email/{urllib.parse.quote(email)}/") or {}
+        uid = looked_up.get("uid") or looked_up.get("id") or looked_up.get("userId")
+
+    automation = get_user_automation(uid) if uid else None
+
+    if not automation or not uid:
+        print(f"SKIP: no automation found for {uid or email}")
+        return None
+
+    profile = get_user_profile(uid) or {}
+    user = {
+        "uid": uid,
+        "email": email or profile.get("email"),
+        "displayName": profile.get("displayName"),
+        "_automation_cache": automation,
+    }
+
+    # Paid status decides whether results are stored. Free candidates get the
+    # jobs returned to them but nothing written to their queue.
+    paid_match = next(
+        (u for u in (get_paid_users() or [])
+         if u.get("uid") == uid
+         or normalize_selected_email(u.get("email") or "") == normalize_selected_email(user["email"] or "")),
+        None,
+    )
+    if paid_match and is_paid_user(paid_match):
+        user.update({k: v for k, v in paid_match.items() if k not in user})
+        print(f"Targeted run: {user['email']} — paid, results will be saved.")
+    else:
+        SKIP_SAVE = True
+        print(f"Targeted run: {user['email']} — free, results will NOT be saved.")
+
+    return user
+
+
 def get_eligible_paid_users():
+    if selected_email_filter_active() or SINGLE_USER_UID:
+        direct = resolve_requested_user()
+        if direct is not None:
+            return [direct]
+        return []
+
     paid_users = get_paid_users()
 
     print(f"\nPaid users returned: {len(paid_users)}")
