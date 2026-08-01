@@ -172,7 +172,7 @@ PERMANENTLY_BLOCKED_COMPANIES = {
 # 7 OpenAI search batches, and returns direct ATS URLs (Ashby, Greenhouse, etc.)
 APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "")
 APIFY_HIRING_CAFE_ACTOR_ID = "memo23~apify-hiring-cafe-scraper"
-HIRING_CAFE_MAX_ITEMS = 50           # raw results fetched per user from HC
+HIRING_CAFE_MAX_ITEMS = env_int("JOBBYO_HC_MAX_ITEMS", 100)   # raw results fetched per user from HC
 HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
 # Keyword-overlap floor applied BEFORE AI review. Set to 0 so every fetched job
 # reaches the reviewer: the score is bag-of-words overlap against the profile
@@ -186,7 +186,7 @@ ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
 
 JOBO_API_BASE = "https://connect.jobo.world"
 JOBO_API_KEY = os.getenv("JOBO_API_KEY", "")
-JOBO_ATS_MAX_ITEMS = 45           # raw results per call (was 30)
+JOBO_ATS_MAX_ITEMS = env_int("JOBBYO_JOBO_MAX_ITEMS", 90)  # raw results per call
 JOBO_LOCAL_SCORE_MIN = env_int("JOBBYO_LOCAL_SCORE_MIN", 0)
 ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 
@@ -5831,8 +5831,9 @@ def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_
         extra_keywords = extract_automation_job_titles(automation, limit=NOGPT_HIRING_CAFE_KEYWORDS)
         keywords = list(dict.fromkeys([k for k in extra_keywords + keywords if k]))[:NOGPT_HIRING_CAFE_KEYWORDS]
     else:
-        # Normal mode: use up to 2 keywords so HC searches are more targeted
-        keywords = keywords[:2]
+        # Cover more of the candidate's target titles. maxItems is split
+        # across keywords, so this widens the search at the same raw cost.
+        keywords = keywords[:3]
     if not keywords:
         print("Hiring.cafe: no keyword extracted — skipping prefetch")
         return [], 0
