@@ -179,6 +179,9 @@ HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
 # text, so a thin persona scored good jobs near zero and deleted them unseen
 # (same user, same query: 26 kept with a search contract loaded, 1 without).
 HIRING_CAFE_LOCAL_SCORE_MIN = env_int("JOBBYO_LOCAL_SCORE_MIN", 0)
+# Location values the HC actor actually understands. Anything else makes it
+# return an empty dataset rather than an error, so it must be omitted.
+HIRING_CAFE_SUPPORTED_LOCATIONS = {"United States"}
 ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
 
 JOBO_API_BASE = "https://connect.jobo.world"
@@ -5841,7 +5844,12 @@ def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_
     for kw in keywords:
         try:
             actor_input = {"keyword": kw, "workplaceType": workplace_type, "maxItems": per_keyword_limit}
-            if location:
+            # The HC actor returns 0 results for any location it does not
+            # recognise — "Europe", "Spain", "United Kingdom" and
+            # "Nairobi, Kenya" all come back empty, while omitting the field
+            # returns results normally. Only send values known to work and let
+            # our own location policy filter the rest downstream.
+            if location in HIRING_CAFE_SUPPORTED_LOCATIONS:
                 actor_input["location"] = location
 
             resp = requests.post(
