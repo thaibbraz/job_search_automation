@@ -417,7 +417,11 @@ def _anthropic_create(prompt, schema, want_web_search):
     }
     if want_web_search:
         kwargs["tools"] = [{"type": "web_search_20260209", "name": "web_search"}]
-    output_config = {"effort": ANTHROPIC_EFFORT} if ANTHROPIC_EFFORT else {}
+    # effort is rejected on the Haiku tier — only send it where it is supported.
+    supports_effort = not ANTHROPIC_MODEL.startswith("claude-haiku")
+    output_config = (
+        {"effort": ANTHROPIC_EFFORT} if (ANTHROPIC_EFFORT and supports_effort) else {}
+    )
     if schema:
         output_config["format"] = {"type": "json_schema", "schema": schema}
     if output_config:
