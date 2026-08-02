@@ -379,6 +379,9 @@ LLM_PROVIDER = os.getenv("JOBBYO_LLM_PROVIDER", "openai").strip().lower()
 LLM_FALLBACK_PROVIDER = os.getenv("JOBBYO_LLM_FALLBACK_PROVIDER", "anthropic").strip().lower()
 ANTHROPIC_MODEL = os.getenv("JOBBYO_ANTHROPIC_MODEL", "claude-opus-5").strip()
 ANTHROPIC_MAX_TOKENS = env_int("JOBBYO_ANTHROPIC_MAX_TOKENS", 16000)
+# These prompts are schema-constrained extraction and grading, not open-ended
+# reasoning, so they do not need the default effort. Raise if grades look weak.
+ANTHROPIC_EFFORT = os.getenv("JOBBYO_ANTHROPIC_EFFORT", "medium").strip()
 
 anthropic_client = None
 if ANTHROPIC_API_KEY and not NO_GPT_MODE and anthropic is not None:
@@ -414,23 +417,35 @@ def _anthropic_create(prompt, schema, want_web_search):
     }
     if want_web_search:
         kwargs["tools"] = [{"type": "web_search_20260209", "name": "web_search"}]
+    output_config = {"effort": ANTHROPIC_EFFORT} if ANTHROPIC_EFFORT else {}
     if schema:
-        kwargs["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+        output_config["format"] = {"type": "json_schema", "schema": schema}
+    if output_config:
+        kwargs["output_config"] = output_config
+
+    def send(**call):
+        # Stream every request. These prompts grade a whole pool at once, and a
+        # non-streaming call at this max_tokens hits the HTTP idle timeout
+        # before the model finishes.
+        try:
+            with anthropic_client.messages.stream(**call) as stream:
+                return stream.get_final_message()
+        except TypeError:
+            # Older SDKs do not type output_config; forward it on the raw body.
+            body = call.pop("output_config", None)
+            with anthropic_client.messages.stream(
+                **call, extra_body={"output_config": body} if body else {}
+            ) as stream:
+                return stream.get_final_message()
 
     try:
-        response = anthropic_client.messages.create(**kwargs)
-    except TypeError:
-        # Older SDKs do not type output_config; forward it on the raw body.
-        body = kwargs.pop("output_config", None)
-        response = anthropic_client.messages.create(
-            **kwargs, extra_body={"output_config": body} if body else {}
-        )
+        response = send(**kwargs)
     except Exception as e:
         # Schema-constrained output is rejected alongside some server tools;
         # retry unconstrained and let the caller's JSON parser do the work.
         if schema and "output_config" in str(e):
             kwargs.pop("output_config", None)
-            response = anthropic_client.messages.create(**kwargs)
+            response = send(**kwargs)
         else:
             raise
 
@@ -441,7 +456,7 @@ def _anthropic_create(prompt, schema, want_web_search):
         kwargs["messages"] = kwargs["messages"][:1] + [
             {"role": "assistant", "content": response.content}
         ]
-        response = anthropic_client.messages.create(**kwargs)
+        response = send(**kwargs)
 
     if getattr(response, "stop_reason", None) == "refusal":
         raise RuntimeError("Claude declined this request (stop_reason=refusal).")
