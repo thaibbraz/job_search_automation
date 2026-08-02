@@ -19,6 +19,11 @@ except ImportError:
     OpenAI = None
 
 try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
@@ -358,6 +363,131 @@ if OPENAI_API_KEY and not NO_GPT_MODE and OpenAI is not None:
         timeout=120.0,
         max_retries=1,
     )
+
+# ============================================================
+# LLM PROVIDER ROUTING (OpenAI + Anthropic)
+# ============================================================
+# Every model call goes through responses_create() below, which speaks the
+# OpenAI Responses shape the call sites already use and executes it on either
+# provider. A provider outage or an exhausted balance falls through to the
+# other one instead of failing the run — the 2026-08-01 run lost all 38 users
+# because an OpenAI credit error was counted as 1070 rejected jobs.
+
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+# Which provider runs first, and which one catches it when that fails.
+LLM_PROVIDER = os.getenv("JOBBYO_LLM_PROVIDER", "openai").strip().lower()
+LLM_FALLBACK_PROVIDER = os.getenv("JOBBYO_LLM_FALLBACK_PROVIDER", "anthropic").strip().lower()
+ANTHROPIC_MODEL = os.getenv("JOBBYO_ANTHROPIC_MODEL", "claude-opus-5").strip()
+ANTHROPIC_MAX_TOKENS = env_int("JOBBYO_ANTHROPIC_MAX_TOKENS", 16000)
+
+anthropic_client = None
+if ANTHROPIC_API_KEY and not NO_GPT_MODE and anthropic is not None:
+    anthropic_client = anthropic.Anthropic(
+        api_key=ANTHROPIC_API_KEY,
+        timeout=180.0,
+        max_retries=1,
+    )
+
+
+class _LLMResponse:
+    """Stands in for the OpenAI Responses object the call sites already read."""
+
+    def __init__(self, output_text):
+        self.output_text = output_text
+
+
+def _anthropic_text(response):
+    return "".join(
+        b.text for b in (response.content or []) if getattr(b, "type", "") == "text"
+    )
+
+
+def _anthropic_create(prompt, schema, want_web_search):
+    """Run one OpenAI-shaped request on Claude."""
+    if anthropic_client is None:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set — Claude provider unavailable.")
+
+    kwargs = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": ANTHROPIC_MAX_TOKENS,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if want_web_search:
+        kwargs["tools"] = [{"type": "web_search_20260209", "name": "web_search"}]
+    if schema:
+        kwargs["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
+
+    try:
+        response = anthropic_client.messages.create(**kwargs)
+    except TypeError:
+        # Older SDKs do not type output_config; forward it on the raw body.
+        body = kwargs.pop("output_config", None)
+        response = anthropic_client.messages.create(
+            **kwargs, extra_body={"output_config": body} if body else {}
+        )
+    except Exception as e:
+        # Schema-constrained output is rejected alongside some server tools;
+        # retry unconstrained and let the caller's JSON parser do the work.
+        if schema and "output_config" in str(e):
+            kwargs.pop("output_config", None)
+            response = anthropic_client.messages.create(**kwargs)
+        else:
+            raise
+
+    # A server tool can pause the turn mid-search; resume until it completes.
+    guard = 0
+    while getattr(response, "stop_reason", None) == "pause_turn" and guard < 5:
+        guard += 1
+        kwargs["messages"] = kwargs["messages"][:1] + [
+            {"role": "assistant", "content": response.content}
+        ]
+        response = anthropic_client.messages.create(**kwargs)
+
+    if getattr(response, "stop_reason", None) == "refusal":
+        raise RuntimeError("Claude declined this request (stop_reason=refusal).")
+
+    return _LLMResponse(_anthropic_text(response))
+
+
+def _openai_create(model, prompt, text, tools):
+    if client is None:
+        raise RuntimeError("OPENAI_API_KEY is not set — OpenAI provider unavailable.")
+    kwargs = {"model": model, "input": prompt}
+    if text:
+        kwargs["text"] = text
+    if tools:
+        kwargs["tools"] = tools
+    return client.responses.create(**kwargs)
+
+
+def responses_create(model=None, input=None, text=None, tools=None):
+    """Drop-in for client.responses.create that runs on either provider.
+
+    Keeps the OpenAI call shape so the call sites are unchanged, and falls back
+    to the other provider when the first one errors (bad key, exhausted
+    balance, rate limit, outage).
+    """
+    schema = ((text or {}).get("format") or {}).get("schema")
+    want_web_search = any(
+        str((t or {}).get("type", "")).startswith("web_search") for t in (tools or [])
+    )
+
+    def run(provider):
+        if provider == "anthropic":
+            return _anthropic_create(input, schema, want_web_search)
+        return _openai_create(model, input, text, tools)
+
+    try:
+        return run(LLM_PROVIDER)
+    except Exception as primary_error:
+        fallback = LLM_FALLBACK_PROVIDER
+        if not fallback or fallback == LLM_PROVIDER:
+            raise
+        print(
+            f"  {LLM_PROVIDER} call failed ({str(primary_error)[:120]}) — "
+            f"retrying on {fallback}"
+        )
+        return run(fallback)
 
 
 # ============================================================
@@ -2164,7 +2294,7 @@ Make it practical for job matching:
 - scoring_rules: how to grade jobs from 1-100
 """
 
-    response = client.responses.create(
+    response = responses_create(
         model=SEARCH_MODEL,
         input=prompt,
         text={
@@ -2649,7 +2779,7 @@ Important:
 Return strict JSON only.
 """
 
-    response = client.responses.create(
+    response = responses_create(
         model=SEARCH_MODEL,
         input=prompt,
         text={
@@ -2922,7 +3052,7 @@ def openai_web_search_call(prompt):
     if NO_GPT_MODE or client is None:
         raise RuntimeError("OpenAI web search is disabled in --nogpt mode.")
     try:
-        return client.responses.create(
+        return responses_create(
             model=SEARCH_MODEL,
             tools=[
                 {
@@ -2944,7 +3074,7 @@ def openai_web_search_call(prompt):
         if "web_search" not in str(e):
             raise
 
-        return client.responses.create(
+        return responses_create(
             model=SEARCH_MODEL,
             tools=[
                 {
@@ -2996,7 +3126,7 @@ RAW TEXT:
 """
 
     try:
-        response = client.responses.create(
+        response = responses_create(
             model=SEARCH_MODEL,
             input=repair_prompt,
             text={
@@ -3055,7 +3185,7 @@ def openai_direct_resolution_call(prompt):
     if NO_GPT_MODE or client is None:
         raise RuntimeError("OpenAI direct resolution is disabled in --nogpt mode.")
     try:
-        return client.responses.create(
+        return responses_create(
             model=RESOLUTION_MODEL,
             tools=[{"type": "web_search", "search_context_size": RESOLUTION_SEARCH_CONTEXT_SIZE}],
             input=prompt,
@@ -3073,7 +3203,7 @@ def openai_direct_resolution_call(prompt):
         if "web_search" not in str(e):
             raise
 
-        return client.responses.create(
+        return responses_create(
             model=RESOLUTION_MODEL,
             tools=[{"type": "web_search_preview", "search_context_size": RESOLUTION_SEARCH_CONTEXT_SIZE}],
             input=prompt,
@@ -4216,7 +4346,7 @@ JOBS TO REVIEW:
 Return strict JSON only.
 """
 
-    response = client.responses.create(
+    response = responses_create(
         model=REVIEW_MODEL,
         input=prompt,
         text={
@@ -4790,7 +4920,7 @@ REJECTED DOMAINS:
 Return strict JSON only.
 """
 
-    response = client.responses.create(
+    response = responses_create(
         model=SEARCH_MODEL,
         input=prompt,
         text={
@@ -4942,7 +5072,7 @@ REJECTED DOMAINS:
 Return strict JSON only.
 """
 
-    response = client.responses.create(
+    response = responses_create(
         model=SEARCH_MODEL,
         input=prompt,
         text={
@@ -8111,6 +8241,8 @@ def main():
     print(f"NO_GPT_MODE={NO_GPT_MODE}")
     print(f"SEARCH_MODEL={SEARCH_MODEL}")
     print(f"REVIEW_MODEL={REVIEW_MODEL}")
+    print(f"LLM_PROVIDER={LLM_PROVIDER}  fallback={LLM_FALLBACK_PROVIDER}  "
+          f"anthropic_key={'set' if ANTHROPIC_API_KEY else 'MISSING'}  model={ANTHROPIC_MODEL}")
     print(f"MAX_USERS_TO_PROCESS={MAX_USERS_TO_PROCESS}")
     print(f"TRUST_USERS_PAID_ENDPOINT={TRUST_USERS_PAID_ENDPOINT}")
     print(f"SINGLE_USER_EMAIL={SINGLE_USER_EMAIL}")
