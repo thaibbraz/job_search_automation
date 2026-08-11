@@ -53,6 +53,7 @@ TOP_JOBS_COOLDOWN_SECONDS = int(os.getenv("JOBBYO_TOP_JOBS_COOLDOWN_SECONDS", "8
 # candidate. Unset in production so real candidates receive their own.
 TOP_JOBS_TEST_RECIPIENT = os.getenv("JOBBYO_TOP_JOBS_TEST_RECIPIENT", "").strip()
 _top_jobs_last_run = {}   # normalized uid/email -> datetime of last accepted call
+_subscribed_last_run = {} # normalized uid/email -> datetime of last accepted /run/user/subscribed call
 
 BACKEND_BASE = os.getenv("JOBBYO_BACKEND_URL", "https://fastapi-service-03-160893319817.europe-southwest1.run.app")
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
@@ -100,6 +101,14 @@ class TopJobsResponse(BaseModel):
     message:         str
     duration_seconds: float
     jobs:            list[TopJob]
+    emailed:         bool = False
+
+
+class SubscribedJobsResponse(BaseModel):
+    accepted:        bool
+    message:         str
+    duration_seconds: float
+    jobs_found:      int
     emailed:         bool = False
 
 class StatusResponse(BaseModel):
@@ -334,6 +343,124 @@ async def run_user_top_jobs(target: UserTarget, limit: int = 3):
         message=f"Found {len(jobs)} job(s) for {target.uid or target.email}.{suffix}",
         duration_seconds=duration_seconds,
         jobs=jobs,
+        emailed=emailed,
+    )
+
+
+@app.post("/run/user/subscribed", response_model=SubscribedJobsResponse)
+async def run_user_subscribed(target: UserTarget):
+    """Call this the moment a user subscribes (e.g. from the signup/billing
+    webhook). Runs the full pipeline for that one user, blocking until done
+    (same as /run/user/top-jobs — can take a few minutes), then emails them
+    their first batch with a reason per job. The email is only sent once at
+    least MIN_JOBS_TO_NOTIFY_SUBSCRIBED (3) jobs were found; below the daily
+    target it tells the candidate more are on the way instead of implying
+    the search is finished, and above/at target it doesn't."""
+    if not target.uid and not target.email:
+        raise HTTPException(status_code=422, detail="Provide uid or email.")
+
+    key = (target.uid or target.email or "").strip().lower()
+    last = _subscribed_last_run.get(key)
+    now = datetime.now(timezone.utc)
+    if last is not None:
+        elapsed = (now - last).total_seconds()
+        if elapsed < TOP_JOBS_COOLDOWN_SECONDS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Already ran for {key} recently. Try again in {int(TOP_JOBS_COOLDOWN_SECONDS - elapsed)}s.",
+            )
+    _subscribed_last_run[key] = now
+
+    if target.uid:
+        args, label = ["--uid", target.uid], f"run:subscribed:{target.uid}"
+    else:
+        args, label = ["--email", target.email], f"run:subscribed:{target.email}"
+
+    existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
+    started_at = asyncio.get_event_loop().time()
+
+    try:
+        code = await asyncio.wait_for(
+            _run_subprocess([PYTHON, "send_jobbyo.py", *args], label),
+            timeout=SYNC_RUN_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Run for {target.uid or target.email} did not finish within {SYNC_RUN_TIMEOUT_SECONDS}s.",
+        )
+
+    duration_seconds = round(asyncio.get_event_loop().time() - started_at, 1)
+
+    if code != 0:
+        raise HTTPException(status_code=500, detail=f"Run failed with exit code {code}. Check server logs for '{label}'.")
+
+    # A single-user run can go through up to 3 rounds (first/second/minimum-
+    # viable) if the first round falls short, and each round writes its own
+    # job_run_*.json snapshot — with each later snapshot being a cumulative
+    # superset of the ones before it (send_jobbyo.py's main() re-saves the
+    # full accumulated result list after every round it runs). So the newest
+    # new log file already has everything; merge every entry it has for this
+    # user (one per round they were part of), deduped by job_url.
+    new_logs = sorted(set(RUN_LOG_DIR.glob("job_run_*.json")) - existing_logs)
+    jobs_added = []
+    resolved_uid, resolved_email = None, None
+    if new_logs:
+        try:
+            with open(new_logs[-1], encoding="utf-8") as f:
+                results = json.load(f)
+        except Exception:
+            results = []
+        seen_urls = set()
+        for r in results:
+            if not ((target.uid and r.get("uid") == target.uid) or (target.email and r.get("email") == target.email)):
+                continue
+            resolved_uid = resolved_uid or r.get("uid")
+            resolved_email = resolved_email or r.get("email")
+            for j in (r.get("jobs_added") or []):
+                url = j.get("job_url")
+                if url and url in seen_urls:
+                    continue
+                if url:
+                    seen_urls.add(url)
+                jobs_added.append(j)
+
+    jobs_added.sort(key=lambda j: j.get("grade") or 0, reverse=True)
+
+    if not jobs_added:
+        return SubscribedJobsResponse(
+            accepted=True,
+            message=f"Run finished for {target.uid or target.email}, but no jobs were found this run.",
+            duration_seconds=duration_seconds,
+            jobs_found=0,
+            emailed=False,
+        )
+
+    emailed = False
+    try:
+        import send_jobbyo, approve_jobs
+
+        profile = send_jobbyo.get_user_profile(resolved_uid) or {}
+        recipient = TOP_JOBS_TEST_RECIPIENT or resolved_email or target.email
+        emailed = bool(
+            await asyncio.to_thread(
+                approve_jobs.send_subscribed_jobs_email,
+                profile,
+                jobs_added,
+                send_jobbyo.TARGET_JOBS_PER_USER,
+                recipient,
+            )
+        )
+    except Exception as exc:
+        print(f"[{label}] email send failed: {exc}")
+
+    below_minimum = len(jobs_added) < approve_jobs.MIN_JOBS_TO_NOTIFY_SUBSCRIBED
+    suffix = " Emailed." if emailed else (" Below minimum — not emailed." if below_minimum else " Email failed.")
+    return SubscribedJobsResponse(
+        accepted=True,
+        message=f"Found {len(jobs_added)} job(s) for {target.uid or target.email}.{suffix}",
+        duration_seconds=duration_seconds,
+        jobs_found=len(jobs_added),
         emailed=emailed,
     )
 
