@@ -1,0 +1,12 @@
+{
+	email hello@jobbyo.ai
+}
+
+# TLS is automatic (Let's Encrypt) — Caddy issues/renews the cert for this
+# domain as soon as it can reach it on 80/443, using the ACME HTTP-01
+# challenge. The domain must already resolve to this box's IP (see DNS A
+# record for search-api.jobbyo.ai) before this container starts, or the
+# challenge fails.
+search-api.jobbyo.ai {
+	reverse_proxy jobbyo-search:8000
+}

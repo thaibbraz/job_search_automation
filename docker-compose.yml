@@ -10,10 +10,11 @@ services:
     env_file:
       - .env
     ports:
-      # Public: the admin platform calls this directly from the browser.
-      # Every route but /health requires the X-Admin-Key header (see
-      # require_admin_key in api.py) since /run/* triggers real LLM spend.
-      - "8010:8000"
+      # No longer public — Caddy (below) is the only public entry point,
+      # terminating TLS and reverse-proxying here over the compose network.
+      # Bound to loopback only so scripts/run_full_cycle.sh (runs on the
+      # host via systemd, not in a container) can still reach it directly.
+      - "127.0.0.1:8010:8000"
     volumes:
       # Personas/search-contracts are LLM-generated per user and cost money
       # to rebuild, and run_logs drive cross-run learning (dead companies,
@@ -21,6 +22,24 @@ services:
       - jobbyo-search-personas:/app/personas
       - jobbyo-search-contracts:/app/search_contracts
       - jobbyo-search-run-logs:/app/run_logs
+    networks:
+      - jobbyo-search-network
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: jobbyo-search-caddy
+    restart: unless-stopped
+    depends_on:
+      - jobbyo-search
+    ports:
+      # Public HTTPS entry point — search-api.jobbyo.ai must resolve here
+      # before Caddy can complete the ACME challenge and issue its cert.
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data       # ACME account + certs — must survive redeploys
+      - caddy-config:/config
     networks:
       - jobbyo-search-network
 
@@ -34,4 +53,8 @@ volumes:
   jobbyo-search-contracts:
     driver: local
   jobbyo-search-run-logs:
+    driver: local
+  caddy-data:
+    driver: local
+  caddy-config:
     driver: local
