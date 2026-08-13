@@ -18,8 +18,8 @@ POST /approve/all             Alias for /email/all
 POST /approve/user            Alias for /email/user
 
 GET  /coverage/today          Per-user job counts today + coverage %  (query: ?send_slack=true)
-GET  /coverage/missing        Paid users below COVERAGE_TARGET_JOBS today
-POST /email/missing           Force-send the daily report to everyone below COVERAGE_TARGET_JOBS today
+GET  /coverage/missing        Paid users not yet emailed today (per approve_jobs.py's send log)
+POST /email/missing           Force-send the daily report to everyone not yet emailed today
 
 Usage
 -----
@@ -688,13 +688,30 @@ async def coverage_today(send_slack: bool = False):
     return report
 
 
+def _emailed_today_uids_sync() -> set:
+    """Reads approve_jobs.py's own dedup log (run_logs/emailed_<date>.json,
+    written by save_emailed_today()) — the ground truth of who actually got
+    an email today, as opposed to the job-count proxy in _compute_coverage_today.
+    """
+    path = Path("run_logs") / f"emailed_{datetime.now(timezone.utc).date().isoformat()}.json"
+    if not path.exists():
+        return set()
+    try:
+        return set(json.loads(path.read_text()).get("uids", []))
+    except Exception as exc:
+        print(f"[coverage/missing] Could not read {path}: {exc}")
+        return set()
+
+
 @app.get("/coverage/missing")
 async def coverage_missing():
-    """Paid users below COVERAGE_TARGET_JOBS today — the list the admin
-    platform's "not covered" table and bulk-send button read from.
+    """Paid users who have NOT been emailed today (per approve_jobs.py's own
+    send log) — the list the admin platform's "not covered" table and
+    bulk-send button read from.
     """
     report = await _compute_coverage_today()
-    missing_users = [u for u in report["users"] if u["total"] < COVERAGE_TARGET_JOBS]
+    emailed_uids = await asyncio.to_thread(_emailed_today_uids_sync)
+    missing_users = [u for u in report["users"] if u.get("uid") not in emailed_uids]
     return {
         "date": report["date"],
         "coverage_target_jobs": COVERAGE_TARGET_JOBS,
@@ -705,10 +722,10 @@ async def coverage_missing():
 
 @app.post("/email/missing", response_model=RunResponse, status_code=202)
 async def email_missing(background_tasks: BackgroundTasks):
-    """Force-send the daily report to every user currently below
-    COVERAGE_TARGET_JOBS today, bypassing MIN_JOBS_TO_EMAIL — the "send all
-    of them" admin-platform button. Skips anyone with zero emailable jobs
-    (nothing to send) or already emailed today (approve_jobs.py's own dedup).
+    """Force-send the daily report to every paid user not yet emailed today,
+    bypassing MIN_JOBS_TO_EMAIL — the "send all of them" admin-platform
+    button. approve_jobs.py itself still skips anyone with zero emailable
+    jobs (nothing to send).
     """
     if _state.full_run_active:
         raise HTTPException(
@@ -716,14 +733,15 @@ async def email_missing(background_tasks: BackgroundTasks):
             detail="A full run is in progress — wait for it to finish before sending emails.",
         )
     report = await _compute_coverage_today()
-    missing_emails = [u["email"] for u in report["users"] if u["total"] < COVERAGE_TARGET_JOBS and u["email"]]
+    emailed_uids = await asyncio.to_thread(_emailed_today_uids_sync)
+    missing_emails = [u["email"] for u in report["users"] if u.get("uid") not in emailed_uids and u["email"]]
     for email in missing_emails:
         background_tasks.add_task(
             _single_run, "approve_jobs.py", ["--email", email, "--force"], f"email:missing:{email}"
         )
     return RunResponse(
         accepted=True,
-        message=f"Force-send started for {len(missing_emails)} user(s) below {COVERAGE_TARGET_JOBS} jobs today.",
+        message=f"Force-send started for {len(missing_emails)} user(s) not yet emailed today.",
     )
 
 
