@@ -1,0 +1,18 @@
+[Unit]
+Description=Jobbyo job search — evening pass 2/2 (top-up + coverage report, no email)
+After=jobbyo-search.service docker.service
+Requires=jobbyo-search.service docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/script_job_search
+EnvironmentFile=/opt/script_job_search/.env
+Environment=SYSTEMD_UNIT_NAME=jobbyo-search-run-final.service
+ExecStart=/opt/script_job_search/scripts/run_full_cycle.sh --report
+Restart=on-failure
+RestartSec=300
+StartLimitIntervalSec=0
+StartLimitBurst=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=Jobbyo Job Search API Docker Compose Stack
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/script_job_search
+# Try docker compose first (newer), fallback to docker-compose
+ExecStart=/bin/bash -c 'if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then docker compose up -d; elif command -v docker-compose >/dev/null 2>&1; then docker-compose up -d; else echo "Neither docker compose nor docker-compose found"; exit 1; fi'
+ExecStop=/bin/bash -c 'if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then docker compose down; elif command -v docker-compose >/dev/null 2>&1; then docker-compose down; fi'
+TimeoutStartSec=0
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

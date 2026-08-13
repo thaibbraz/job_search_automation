@@ -1,0 +1,18 @@
+[Unit]
+Description=Jobbyo daily report — 10:00 Europe/Madrid (email only, no search)
+After=jobbyo-search.service docker.service
+Requires=jobbyo-search.service docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/script_job_search
+EnvironmentFile=/opt/script_job_search/.env
+Environment=SYSTEMD_UNIT_NAME=jobbyo-search-daily-report.service
+ExecStart=/opt/script_job_search/scripts/run_full_cycle.sh --email --skip-search
+Restart=on-failure
+RestartSec=300
+StartLimitIntervalSec=0
+StartLimitBurst=2
+
+[Install]
+WantedBy=multi-user.target

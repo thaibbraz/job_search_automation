@@ -1,0 +1,11 @@
+[Unit]
+Description=Jobbyo daily report, 10:00 Europe/Madrid
+Requires=jobbyo-search.service
+
+[Timer]
+OnCalendar=*-*-* 10:00:00 Europe/Madrid
+Persistent=true
+Unit=jobbyo-search-daily-report.service
+
+[Install]
+WantedBy=timers.target

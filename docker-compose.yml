@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  jobbyo-search:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jobbyo-search
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # Public: the admin platform calls this directly from the browser.
+      # Every route but /health requires the X-Admin-Key header (see
+      # require_admin_key in api.py) since /run/* triggers real LLM spend.
+      - "8010:8000"
+    volumes:
+      # Personas/search-contracts are LLM-generated per user and cost money
+      # to rebuild, and run_logs drive cross-run learning (dead companies,
+      # dedup) — all three must survive container rebuilds/redeploys.
+      - jobbyo-search-personas:/app/personas
+      - jobbyo-search-contracts:/app/search_contracts
+      - jobbyo-search-run-logs:/app/run_logs
+    networks:
+      - jobbyo-search-network
+
+networks:
+  jobbyo-search-network:
+    driver: bridge
+
+volumes:
+  jobbyo-search-personas:
+    driver: local
+  jobbyo-search-contracts:
+    driver: local
+  jobbyo-search-run-logs:
+    driver: local

@@ -17,6 +17,10 @@ POST /email/user              Trigger approve_jobs.py for one user  (body: {emai
 POST /approve/all             Alias for /email/all
 POST /approve/user            Alias for /email/user
 
+GET  /coverage/today          Per-user job counts today + coverage %  (query: ?send_slack=true)
+GET  /coverage/missing        Paid users below COVERAGE_TARGET_JOBS today
+POST /email/missing           Force-send the daily report to everyone below COVERAGE_TARGET_JOBS today
+
 Usage
 -----
     uvicorn api:app --host 0.0.0.0 --port 8000
@@ -37,6 +41,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -56,7 +61,9 @@ _top_jobs_last_run = {}   # normalized uid/email -> datetime of last accepted ca
 _subscribed_last_run = {} # normalized uid/email -> datetime of last accepted /run/user/subscribed call
 
 BACKEND_BASE = os.getenv("JOBBYO_BACKEND_URL", "https://fastapi-service-03-160893319817.europe-southwest1.run.app")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+# Run health / coverage % — as opposed to per-user emailed/missing detail,
+# which approve_jobs.py posts to SLACK_WEBHOOK_URL_USER_DETAILS instead.
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_DAILY_RUN", "")
 # ---------------------------------------------------------------------------
 # Run state — in-memory, resets on restart
 # ---------------------------------------------------------------------------
@@ -183,6 +190,20 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# This API is reachable from the internet (the admin platform calls it
+# directly from the browser) and /run/* triggers real LLM spend, so every
+# route but /health requires a shared secret. Fails closed if the key isn't
+# configured, rather than silently running open.
+ADMIN_API_KEY = os.getenv("JOBBYO_ADMIN_API_KEY", "")
+PUBLIC_PATHS = {"/health"}
+
+@app.middleware("http")
+async def require_admin_key(request, call_next):
+    if request.method != "OPTIONS" and request.url.path not in PUBLIC_PATHS:
+        if not ADMIN_API_KEY or request.headers.get("x-admin-key") != ADMIN_API_KEY:
+            return JSONResponse(status_code=401, content={"detail": "Missing or invalid X-Admin-Key header."})
+    return await call_next(request)
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -496,8 +517,13 @@ async def email_user(target: UserTarget, background_tasks: BackgroundTasks):
 # Coverage helpers
 # ---------------------------------------------------------------------------
 
-_TODAY_STATUSES = {"applied", "pending", "waiting_approval", "pending_review", "legacy"}
+_TODAY_STATUSES = {"applied", "approved", "pending", "waiting_approval", "pending_review", "legacy"}
 _APPLIED_STATUSES = {"applied", "approved"}
+
+# "Covered" = at least 80% of the daily per-user job target (JOBBYO_TARGET_JOBS,
+# default 10 in send_jobbyo.py). Goal: this fraction of users should be covered.
+COVERAGE_TARGET_JOBS = int(os.getenv("JOBBYO_COVERAGE_TARGET_JOBS", "8"))
+COVERAGE_GOAL_PCT = float(os.getenv("JOBBYO_COVERAGE_GOAL_PCT", "0.8"))
 
 _DATE_FORMATS = [
     "%Y-%m-%dT%H:%M:%S.%fZ",
@@ -556,12 +582,9 @@ def _uid_of(user: dict) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-@app.get("/coverage/today")
-async def coverage_today(send_slack: bool = False):
-    """Count jobs in active statuses added TODAY per paid user.
-
-    Statuses counted: applied, pending, waiting_approval, pending_review, legacy.
-    Query ?send_slack=true posts a summary to Slack.
+async def _compute_coverage_today() -> dict:
+    """Shared by /coverage/today, /coverage/missing and /email/missing so
+    they all agree on the same per-user job counts for today.
     """
     today_utc = datetime.now(timezone.utc).date()
     users = await asyncio.to_thread(_fetch_paid_users_sync)
@@ -577,7 +600,7 @@ async def coverage_today(send_slack: bool = False):
         try:
             automation = await asyncio.to_thread(_fetch_user_automation_sync, uid)
         except Exception as exc:
-            print(f"[coverage/today] Could not fetch automation for {uid}: {exc}")
+            print(f"[coverage] Could not fetch automation for {uid}: {exc}")
             continue
 
         jobs = automation.get("selectedJobs") or []
@@ -598,7 +621,7 @@ async def coverage_today(send_slack: bool = False):
             elif status == "waiting_approval":
                 waiting_c += 1
 
-        if total >= 10:
+        if total >= COVERAGE_TARGET_JOBS:
             covered += 1
         elif total >= 1:
             partial += 1
@@ -606,6 +629,7 @@ async def coverage_today(send_slack: bool = False):
             missing += 1
 
         result_users.append({
+            "uid": uid,
             "name": user.get("displayName") or user.get("name") or "",
             "email": user.get("email", ""),
             "total": total,
@@ -614,34 +638,93 @@ async def coverage_today(send_slack: bool = False):
             "waiting_approval": waiting_c,
         })
 
-    if send_slack:
-        ok_lines = [
-            f"  • {u['name']} ({u['email']}): {u['total']} jobs"
-            for u in result_users if u["total"] >= 10
-        ]
-        warn_lines = [
-            f"  • {u['name']} ({u['email']}): {u['total']} jobs"
-            for u in result_users if u["total"] < 10
-        ]
-        slack_text = (
-            f"*Coverage Report — {today_utc.isoformat()}*\n"
-            f"Total: {len(result_users)} | ✅ Covered (≥10): {covered} | "
-            f"⚠️ Partial (1-9): {partial} | ❌ Missing (0): {missing}\n"
-        )
-        if ok_lines:
-            slack_text += "\n✅ *At 10+ jobs:*\n" + "\n".join(ok_lines)
-        if warn_lines:
-            slack_text += "\n\n⚠️ *Below 10 jobs:*\n" + "\n".join(warn_lines)
-        await asyncio.to_thread(_send_slack_sync, slack_text)
+    total_users = len(result_users)
+    coverage_pct = round(covered / total_users, 4) if total_users else 0.0
+    meets_goal = coverage_pct >= COVERAGE_GOAL_PCT
 
     return {
         "date": today_utc.isoformat(),
-        "total_users": len(result_users),
+        "total_users": total_users,
+        "coverage_target_jobs": COVERAGE_TARGET_JOBS,
+        "coverage_pct": coverage_pct,
+        "coverage_goal_pct": COVERAGE_GOAL_PCT,
+        "meets_goal": meets_goal,
         "covered": covered,
         "partial": partial,
         "missing": missing,
         "users": result_users,
     }
+
+
+@app.get("/coverage/today")
+async def coverage_today(send_slack: bool = False):
+    """Count jobs in active statuses added TODAY per paid user.
+
+    Statuses counted: applied, approved, pending, waiting_approval, pending_review, legacy.
+    A user is "covered" once they hit COVERAGE_TARGET_JOBS (default 8, i.e. 80%
+    of the 10-job daily target). Goal: COVERAGE_GOAL_PCT (default 80%) of users
+    covered.
+    Query ?send_slack=true posts a summary to Slack.
+    """
+    report = await _compute_coverage_today()
+
+    if send_slack:
+        warn_lines = [
+            f"  • {u['name']} ({u['email']}): {u['total']} jobs"
+            for u in report["users"] if u["total"] < COVERAGE_TARGET_JOBS
+        ]
+        status_icon = "✅" if report["meets_goal"] else "⚠️"
+        slack_text = (
+            f"*Coverage Report — {report['date']}*\n"
+            f"{status_icon} {report['coverage_pct']:.0%} of users at {COVERAGE_TARGET_JOBS}+ jobs "
+            f"(goal: {COVERAGE_GOAL_PCT:.0%})\n"
+            f"Total: {report['total_users']} | ✅ Covered (≥{COVERAGE_TARGET_JOBS}): {report['covered']} | "
+            f"⚠️ Partial (1-{COVERAGE_TARGET_JOBS - 1}): {report['partial']} | ❌ Missing (0): {report['missing']}\n"
+        )
+        if warn_lines:
+            slack_text += f"\n⚠️ *Below {COVERAGE_TARGET_JOBS} jobs:*\n" + "\n".join(warn_lines)
+        await asyncio.to_thread(_send_slack_sync, slack_text)
+
+    return report
+
+
+@app.get("/coverage/missing")
+async def coverage_missing():
+    """Paid users below COVERAGE_TARGET_JOBS today — the list the admin
+    platform's "not covered" table and bulk-send button read from.
+    """
+    report = await _compute_coverage_today()
+    missing_users = [u for u in report["users"] if u["total"] < COVERAGE_TARGET_JOBS]
+    return {
+        "date": report["date"],
+        "coverage_target_jobs": COVERAGE_TARGET_JOBS,
+        "count": len(missing_users),
+        "users": missing_users,
+    }
+
+
+@app.post("/email/missing", response_model=RunResponse, status_code=202)
+async def email_missing(background_tasks: BackgroundTasks):
+    """Force-send the daily report to every user currently below
+    COVERAGE_TARGET_JOBS today, bypassing MIN_JOBS_TO_EMAIL — the "send all
+    of them" admin-platform button. Skips anyone with zero emailable jobs
+    (nothing to send) or already emailed today (approve_jobs.py's own dedup).
+    """
+    if _state.full_run_active:
+        raise HTTPException(
+            status_code=409,
+            detail="A full run is in progress — wait for it to finish before sending emails.",
+        )
+    report = await _compute_coverage_today()
+    missing_emails = [u["email"] for u in report["users"] if u["total"] < COVERAGE_TARGET_JOBS and u["email"]]
+    for email in missing_emails:
+        background_tasks.add_task(
+            _single_run, "approve_jobs.py", ["--email", email, "--force"], f"email:missing:{email}"
+        )
+    return RunResponse(
+        accepted=True,
+        message=f"Force-send started for {len(missing_emails)} user(s) below {COVERAGE_TARGET_JOBS} jobs today.",
+    )
 
 
 @app.get("/coverage/applied")

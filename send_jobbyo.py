@@ -300,12 +300,12 @@ MAX_STRATEGY_PIVOTS_PER_USER = 1
 REMOTE_TIMEOUT_SECONDS = 8
 REMOTE_WORKERS = 14
 
-# Fallback status. Actual posting status is plan-specific:
-# - starter/max users: waiting_approval
-# - premium users: pending
+# Fallback status. Actual posting status is automation-mode-specific:
+# - control/approve mode: waiting_approval (held for the user to review)
+# - auto mode: approved (submitted straight away)
 DEFAULT_STATUS = "waiting_approval"
 STARTER_MAX_STATUS = "waiting_approval"
-PREMIUM_STATUS = "pending"
+AUTO_STATUS = "approved"
 
 # Dry run: collect what would be posted into a JSON file instead of sending it
 # to real user queues. Everything upstream (sourcing, review, cost) runs for real.
@@ -346,6 +346,14 @@ PERSONA_DIR.mkdir(exist_ok=True)
 
 RUN_LOG_DIR = Path("./run_logs")
 RUN_LOG_DIR.mkdir(exist_ok=True)
+
+# Every raw company Jobo returns per user, before any filtering/scoring
+# discards most of them -- fed to jobbyo-job-crawler's company-discovery
+# backfill (utils/backfill_board_links.py, iter_jobo_discovery_log_urls) so
+# that pipeline reuses these already-paid-for calls instead of making its
+# own. One append-only file per day; see _log_jobo_discovery().
+JOBO_DISCOVERY_LOG_DIR = Path("./jobo_discovery_log")
+JOBO_DISCOVERY_LOG_DIR.mkdir(exist_ok=True)
 
 SEARCH_CONTRACT_DIR = Path("./search_contracts")
 SEARCH_CONTRACT_DIR.mkdir(exist_ok=True)
@@ -2017,16 +2025,25 @@ def get_user_plan(user, user_profile=None, automation=None):
     return "unknown"
 
 
-def status_for_user_plan(plan):
-    plan = str(plan or "").lower().strip()
+def get_automation_mode(automation):
+    """Mirrors jobbyo-admin-platform-2's getAutomationMode (PaidUsers.js):
+    no applyConfig on the record falls back to Approve Mode (backend default).
+    """
+    cfg = (automation or {}).get("applyConfig")
+    if not cfg:
+        return "approve"
+    if cfg.get("reviewBeforeSubmit") is not False:
+        return "control"
+    if cfg.get("requireApproval") is not False:
+        return "approve"
+    return "auto"
 
-    if plan == "premium":
-        return PREMIUM_STATUS
 
-    if plan in {"starter", "max"}:
-        return STARTER_MAX_STATUS
-
-    # Unknown paid users held for approval — safer than silently posting as premium.
+def status_for_automation_mode(automation):
+    mode = get_automation_mode(automation)
+    if mode == "auto":
+        return AUTO_STATUS
+    # control and approve modes both hold jobs for the user to review.
     return STARTER_MAX_STATUS
 
 
@@ -4590,10 +4607,11 @@ def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job
             and recommended_grade >= (MIN_VIABLE_CONFIDENCE if minimum_viable_mode else DISCOVERY_PENDING_MIN_GRADE)
             and (
                 minimum_viable_mode
-                # Non-starter users (premium/default) go to pending_review for human check anyway —
-                # trust the AI reviewer's discovery_pending classification directly.
+                # Auto-mode users (job_status=approved) go to pending_review for
+                # human check anyway — trust the AI reviewer's discovery_pending
+                # classification directly.
                 or job_status != STARTER_MAX_STATUS
-                # Starter users: apply the safety gate before posting to pending_review.
+                # Control/approve-mode users: apply the safety gate before posting to pending_review.
                 or safe_borderline_for_waiting_approval(
                     reason,
                     risk_flags,
@@ -6219,6 +6237,33 @@ def build_jobo_search_bodies(keywords, locations, workplace_type, salary_floor, 
     return bodies[:max_calls]
 
 
+def _log_jobo_discovery(raw_items):
+    """Append every raw Jobo item's company + listing URL to today's discovery
+    log, before any avoid/blocked/score filtering below discards most of
+    them. Best-effort only -- a logging failure must never break the actual
+    search this call is part of.
+    """
+    if not raw_items:
+        return
+    try:
+        path = JOBO_DISCOVERY_LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
+        with open(path, "a", encoding="utf-8") as f:
+            for raw in raw_items:
+                if not isinstance(raw, dict):
+                    continue
+                url = (raw.get("listing_url") or raw.get("apply_url") or "").strip()
+                company = ((raw.get("company") or {}).get("name") or "").strip()
+                if not url or not company:
+                    continue
+                f.write(json.dumps({
+                    "listing_url": url,
+                    "company": company,
+                    "source": raw.get("source", ""),
+                }, default=str) + "\n")
+    except Exception as e:
+        print(f"Jobo discovery log write failed (non-fatal): {e}")
+
+
 def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
     """Fetch and locally-score jobo.world ATS Jobs API candidates via direct API.
 
@@ -6271,6 +6316,7 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
 
     raw_items = raw_items_all
     print(f"Jobo ATS: {len(raw_items)} total raw results received")
+    _log_jobo_discovery(raw_items)  # log everything now, before avoid/blocked/score filtering below discards most of it
     avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
     blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
     seen_co_title = set()
@@ -6460,7 +6506,7 @@ def find_jobs_for_user(
 
     prefs = extract_job_preferences(automation)
     user_plan = get_user_plan(user=user, user_profile=user_profile, automation=automation)
-    job_status = status_for_user_plan(user_plan)
+    job_status = status_for_automation_mode(automation)
     existing_jobs = extract_existing_jobs(automation)
     rejected_jobs_from_automation = extract_rejected_jobs_from_automation(automation)
     plan_rejected_learning = (
@@ -7586,7 +7632,7 @@ def get_eligible_paid_users():
             print("NOTE: no job titles configured — proceeding anyway because --email mode is active")
 
         plan = get_user_plan(user=user, automation=automation)
-        job_status = status_for_user_plan(plan)
+        job_status = status_for_automation_mode(automation)
         existing_jobs = extract_existing_jobs(automation)
         pending_today = count_jobs_today(existing_jobs, job_status)
 
@@ -7666,7 +7712,7 @@ def run_round(
                 continue
 
             plan = get_user_plan(user=user, automation=automation)
-            job_status = status_for_user_plan(plan)
+            job_status = status_for_automation_mode(automation)
             existing_jobs = extract_existing_jobs(automation or {})
             pending_today = count_jobs_today(existing_jobs, job_status)
 
@@ -7734,7 +7780,7 @@ def get_users_below_pending_threshold(users, threshold):
             if automation is not None:
                 user["_automation_cache"] = automation
             plan = get_user_plan(user=user, automation=automation)
-            job_status = status_for_user_plan(plan)
+            job_status = status_for_automation_mode(automation)
             existing_jobs = extract_existing_jobs(automation or {})
             pending_today = count_jobs_today(existing_jobs, job_status)
 
@@ -8271,7 +8317,7 @@ def main():
     print(f"SINGLE_USER_UID={SINGLE_USER_UID}")
     print(f"TARGET_JOBS_PER_USER={TARGET_JOBS_PER_USER}")
     print(f"STARTER_MAX_STATUS={STARTER_MAX_STATUS}")
-    print(f"PREMIUM_STATUS={PREMIUM_STATUS}")
+    print(f"AUTO_STATUS={AUTO_STATUS}")
     print(f"MIN_JOBS_BEFORE_SECOND_ROUND={MIN_JOBS_BEFORE_SECOND_ROUND}")
     print(f"JOBS_PER_BATCH={JOBS_PER_BATCH}")
     print(f"FIRST_ROUND_BATCHES={FIRST_ROUND_BATCHES}")

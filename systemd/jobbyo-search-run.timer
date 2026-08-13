@@ -1,0 +1,12 @@
+[Unit]
+Description=Jobbyo job search — evening pass 1/2, 19:00 Europe/Madrid
+Requires=jobbyo-search.service
+
+[Timer]
+# Timezone-aware so this stays at 19:00 local through the CEST/CET switch.
+OnCalendar=*-*-* 19:00:00 Europe/Madrid
+Persistent=true
+Unit=jobbyo-search-run.service
+
+[Install]
+WantedBy=timers.target

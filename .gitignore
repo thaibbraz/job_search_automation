@@ -3,6 +3,7 @@ personas/
 run_logs/
 search_contracts/
 strategy_reports/
+jobo_discovery_log/
 
 # Secrets
 .env

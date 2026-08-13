@@ -1,0 +1,11 @@
+[Unit]
+Description=Jobbyo job search — evening pass 2/2, 22:00 Europe/Madrid
+Requires=jobbyo-search.service
+
+[Timer]
+OnCalendar=*-*-* 22:00:00 Europe/Madrid
+Persistent=true
+Unit=jobbyo-search-run-final.service
+
+[Install]
+WantedBy=timers.target

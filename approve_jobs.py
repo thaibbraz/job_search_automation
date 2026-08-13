@@ -15,6 +15,8 @@ On startup, deletes emailed_*.json logs older than yesterday to avoid accumulati
 Usage:
     python3 approve_jobs.py
     python3 approve_jobs.py --email user@example.com   # single user
+    python3 approve_jobs.py --force                    # bypass MIN_JOBS_TO_EMAIL for everyone
+    python3 approve_jobs.py --email user@example.com --force  # bypass for one user
 """
 
 import json
@@ -41,7 +43,7 @@ SENDER_EMAIL = "hello@jobbyo.ai"
 SENDER_NAME = "Jobbyo"
 
 MIN_JOBS_TO_EMAIL = 8
-PREMIUM_STATUS = "pending"
+AUTO_STATUS = "approved"
 MAX_STATUS = "waiting_approval"
 
 # The just-subscribed welcome email (send_subscribed_jobs_email) is gated on
@@ -49,11 +51,19 @@ MAX_STATUS = "waiting_approval"
 # sending right after signup, since the alternative is silence.
 MIN_JOBS_TO_NOTIFY_SUBSCRIBED = 3
 
-# Only jobs added TODAY count toward the threshold and email
-STATUSES_TO_COUNT = {"applied", "pending", "waiting_approval"}
-STATUSES_TO_EMAIL = {"pending", "waiting_approval"}
+# Only jobs added TODAY count toward the threshold and email.
+# "pending_review" is send_jobbyo.py's staging status for freshly-found jobs
+# (see promote_jobs() below) -- included here so a normal day's search
+# actually counts toward the threshold instead of silently never reaching it.
+# "approved" is what Auto Mode users' jobs get promoted straight to (see
+# target_status() below) -- counted toward coverage but not re-emailed for
+# review since nothing is waiting on the user for those.
+STATUSES_TO_COUNT = {"applied", "approved", "pending", "waiting_approval", "pending_review"}
+STATUSES_TO_EMAIL = {"pending", "waiting_approval", "pending_review"}
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+# Per-user emailed/missing detail — as opposed to run health/coverage %,
+# which api.py posts to SLACK_WEBHOOK_URL_DAILY_RUN instead.
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_USER_DETAILS", "")
 RUN_LOGS_DIR = Path("run_logs")
 
 # ---------------------------------------------------------------------------
@@ -157,30 +167,25 @@ def get_user_profile(uid):
 
 
 # ---------------------------------------------------------------------------
-# Plan detection (mirrors send_jobbyo.py logic)
+# Automation mode detection (mirrors jobbyo-admin-platform-2's
+# getAutomationMode in PaidUsers.js)
 # ---------------------------------------------------------------------------
 
-def get_user_plan(user, automation=None):
-    text = " ".join([
-        str(user.get("plan") or ""),
-        str(user.get("planName") or ""),
-        str(user.get("subscription") or ""),
-        str((automation or {}).get("plan") or ""),
-        str((automation or {}).get("planName") or ""),
-    ]).lower()
-    if "premium" in text:
-        return "premium"
-    if "starter" in text or "start" in text:
-        return "starter"
-    if "max" in text:
-        return "max"
-    return "max"   # safe default: hold for approval
+def get_automation_mode(automation):
+    cfg = (automation or {}).get("applyConfig")
+    if not cfg:
+        return "approve"   # no applyConfig on the record => backend default
+    if cfg.get("reviewBeforeSubmit") is not False:
+        return "control"
+    if cfg.get("requireApproval") is not False:
+        return "approve"
+    return "auto"
 
 
-def target_status(plan):
-    if plan == "premium":
-        return PREMIUM_STATUS
-    return MAX_STATUS   # max / starter / unknown
+def target_status(mode):
+    if mode == "auto":
+        return AUTO_STATUS
+    return MAX_STATUS   # control and approve both hold for the user to review
 
 
 # ---------------------------------------------------------------------------
@@ -523,16 +528,9 @@ def send_slack_summary(emailed_users, skipped_users, pending_users):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"📧 *approve_jobs* — {now}"]
 
-    if emailed_users:
-        lines.append(f"✅ *{len(emailed_users)} email(s) sent this run:*")
-        for u in emailed_users:
-            lines.append(f"  • {u['name']} ({u['email']}) — {u['jobs_promoted']} jobs → {u['new_status']}")
-    else:
-        lines.append("No new emails sent this run.")
-
+    lines.append(f"✅ {len(emailed_users)} email(s) sent this run." if emailed_users else "No new emails sent this run.")
     if skipped_users:
-        names = ", ".join(u["name"] for u in skipped_users)
-        lines.append(f"⏭️ *{len(skipped_users)} already emailed today* (skipped): {names}")
+        lines.append(f"⏭️ {len(skipped_users)} skipped (already sent today).")
 
     if pending_users:
         lines.append(f"⚠️ *{len(pending_users)} below threshold ({MIN_JOBS_TO_EMAIL} jobs):*")
@@ -546,7 +544,11 @@ def send_slack_summary(emailed_users, skipped_users, pending_users):
 # Process one user
 # ---------------------------------------------------------------------------
 
-def process_user(user):
+def process_user(user, force=False):
+    """force=True bypasses MIN_JOBS_TO_EMAIL — used for a manual/admin-triggered
+    send to a user who didn't naturally reach the threshold today, so they
+    still get whatever was found instead of nothing.
+    """
     uid = user.get("uid") or user.get("id") or ""
     email = user.get("email") or ""
     name = user.get("displayName") or email.split("@")[0]
@@ -557,8 +559,8 @@ def process_user(user):
     automation = get_automation(uid)
     user_profile = get_user_profile(uid) or user
 
-    plan = get_user_plan(user, automation)
-    new_status = target_status(plan)
+    mode = get_automation_mode(automation)
+    new_status = target_status(mode)
 
     selected_jobs = automation.get("selectedJobs") or []
     if not isinstance(selected_jobs, list):
@@ -575,9 +577,9 @@ def process_user(user):
     ]
 
     count = len(jobs_for_count)
-    print(f"  {name} ({email})  plan={plan}  today={count}  emailable={len(jobs_for_email)}")
+    print(f"  {name} ({email})  mode={mode}  today={count}  emailable={len(jobs_for_email)}  force={force}")
 
-    if count < MIN_JOBS_TO_EMAIL or not jobs_for_email:
+    if (count < MIN_JOBS_TO_EMAIL and not force) or not jobs_for_email:
         return {
             "name": name,
             "email": email,
@@ -585,6 +587,14 @@ def process_user(user):
             "pending_count": count,
             "emailed": False,
         }
+
+    # Jobs still staged as "pending_review" (send_jobbyo.py's status for
+    # freshly-found jobs) need promoting to the plan's real status before
+    # they're reported as sent -- promote_jobs() upserts by job_url, so this
+    # updates them in place rather than duplicating.
+    to_promote = [j for j in jobs_for_email if _status(j) != new_status]
+    if to_promote:
+        promote_jobs(email, to_promote, new_status)
 
     emailed = send_email(user_profile, automation, jobs_for_email)
 
@@ -605,14 +615,15 @@ def process_user(user):
 def main():
     single_email = None
     args = sys.argv[1:]
+    force = "--force" in args
     if args and args[0].startswith("--email"):
         if "=" in args[0]:
             single_email = args[0].split("=", 1)[1].strip()
-        elif len(args) > 1:
+        elif len(args) > 1 and not args[1].startswith("--"):
             single_email = args[1].strip()
 
     print("=== approve_jobs.py ===")
-    print(f"MIN_JOBS_TO_EMAIL={MIN_JOBS_TO_EMAIL}")
+    print(f"MIN_JOBS_TO_EMAIL={MIN_JOBS_TO_EMAIL}  force={force}")
     print()
 
     # Cleanup logs older than yesterday
@@ -646,7 +657,7 @@ def main():
             skipped_users.append({"name": name, "email": email})
             continue
 
-        result = process_user(user)
+        result = process_user(user, force=force)
         if result is None:
             continue
 

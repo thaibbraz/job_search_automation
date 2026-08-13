@@ -1,0 +1,21 @@
+[Unit]
+Description=Jobbyo job search — evening pass 1/2 (build up the queue)
+After=jobbyo-search.service docker.service
+Requires=jobbyo-search.service docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/script_job_search
+EnvironmentFile=/opt/script_job_search/.env
+Environment=SYSTEMD_UNIT_NAME=jobbyo-search-run.service
+ExecStart=/opt/script_job_search/scripts/run_full_cycle.sh
+# Retry on failure (up to 2 times, 5 min apart) — a transient backend hiccup
+# shouldn't skip a whole scheduled pass. The script itself already posts to
+# Slack on failure, independent of this retry.
+Restart=on-failure
+RestartSec=300
+StartLimitIntervalSec=0
+StartLimitBurst=2
+
+[Install]
+WantedBy=multi-user.target

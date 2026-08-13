@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile /Users/thiagobraz/Desktop/projects/script_job_search/send_jobbyo.py)",
+      "Bash(python3 send_jobbyo.py --email sharntaelintonlewin6@gmail.com)",
+      "Bash(echo \"PID: $!\")"
+    ]
+  }
+}
