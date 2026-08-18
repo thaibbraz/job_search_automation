@@ -586,7 +586,8 @@ async def _compute_coverage_today() -> dict:
     """Shared by /coverage/today, /coverage/missing and /email/missing so
     they all agree on the same per-user job counts for today.
     """
-    today_utc = datetime.now(timezone.utc).date()
+    now_utc = datetime.now(timezone.utc)
+    today_utc = now_utc.date()
     users = await asyncio.to_thread(_fetch_paid_users_sync)
 
     result_users: list[dict] = []
@@ -611,7 +612,7 @@ async def _compute_coverage_today() -> dict:
             if status not in _TODAY_STATUSES:
                 continue
             added = _parse_job_date(job.get("addedAt", ""))
-            if added is None or added.date() != today_utc:
+            if added is None or now_utc - added >= timedelta(hours=24):
                 continue
             total += 1
             if status == "applied":
@@ -751,7 +752,8 @@ async def coverage_applied(send_slack: bool = False):
 
     Query ?send_slack=true posts counts to Slack.
     """
-    today_utc = datetime.now(timezone.utc).date()
+    now_utc = datetime.now(timezone.utc)
+    today_utc = now_utc.date()
     users = await asyncio.to_thread(_fetch_paid_users_sync)
 
     result_users: list[dict] = []
@@ -773,7 +775,7 @@ async def coverage_applied(send_slack: bool = False):
             if job.get("status") not in _APPLIED_STATUSES:
                 continue
             added = _parse_job_date(job.get("addedAt", ""))
-            if added is not None and added.date() == today_utc:
+            if added is not None and now_utc - added < timedelta(hours=24):
                 applied_today += 1
 
         result_users.append({
@@ -811,7 +813,8 @@ async def coverage_complete(send_email: bool = False, warn_stale: bool = False):
       ?warn_stale=true  — POST /api/notifications/incomplete-profile for users
                           with stale waiting_approval jobs from yesterday.
     """
-    today_utc = datetime.now(timezone.utc).date()
+    now_utc = datetime.now(timezone.utc)
+    today_utc = now_utc.date()
     yesterday_utc = today_utc - timedelta(days=1)
 
     users = await asyncio.to_thread(_fetch_paid_users_sync)
@@ -846,7 +849,7 @@ async def coverage_complete(send_email: bool = False, warn_stale: bool = False):
             if added is None:
                 continue
             job_date = added.date()
-            if job_date == today_utc and status in _TODAY_STATUSES:
+            if now_utc - added < timedelta(hours=24) and status in _TODAY_STATUSES:
                 today_total += 1
             if job_date == yesterday_utc and status == "waiting_approval":
                 stale_count += 1

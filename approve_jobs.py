@@ -90,13 +90,20 @@ def cleanup_old_emailed_logs():
 # ---------------------------------------------------------------------------
 
 def _is_today(job):
-    """Return True if the job was added today (UTC)."""
+    """Return True if the job was added within the last 24h.
+
+    Calendar-date equality breaks here: the evening search passes (19:00/22:00
+    Europe/Madrid) stamp addedAt on one UTC calendar date, but the next-morning
+    email pass (10:00 Europe/Madrid) checks after UTC midnight has rolled over
+    to the next date -- so an exact date match silently misses last night's
+    jobs for whichever users got processed before the rollover.
+    """
     for field in ("addedAt", "createdAt", "added_at", "created_at"):
         val = job.get(field)
         if val:
             try:
                 dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-                return dt.date() == date.today()
+                return datetime.now(timezone.utc) - dt < timedelta(hours=24)
             except Exception:
                 pass
     return False
