@@ -117,6 +117,7 @@ class SubscribedJobsResponse(BaseModel):
     duration_seconds: float
     jobs_found:      int
     emailed:         bool = False
+    jobs:            list[TopJob] = []
 
 class StatusResponse(BaseModel):
     full_run_active:            bool
@@ -477,11 +478,23 @@ async def run_user_subscribed(target: UserTarget):
 
     below_minimum = len(jobs_added) < approve_jobs.MIN_JOBS_TO_NOTIFY_SUBSCRIBED
     suffix = " Emailed." if emailed else (" Below minimum — not emailed." if below_minimum else " Email failed.")
+    response_jobs = [
+        TopJob(
+            title=j.get("title"),
+            company=j.get("company"),
+            url=j.get("job_url"),
+            location=j.get("location"),
+            grade=j.get("grade"),
+            reason=approve_jobs._job_reason(j),
+        )
+        for j in jobs_added
+    ]
     return SubscribedJobsResponse(
         accepted=True,
         message=f"Found {len(jobs_added)} job(s) for {target.uid or target.email}.{suffix}",
         duration_seconds=duration_seconds,
         jobs_found=len(jobs_added),
+        jobs=response_jobs,
         emailed=emailed,
     )
 
