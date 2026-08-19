@@ -309,7 +309,7 @@ AUTO_STATUS = "approved"
 
 # Dry run: collect what would be posted into a JSON file instead of sending it
 # to real user queues. Everything upstream (sourcing, review, cost) runs for real.
-RUN_DATE_OFFSET_DAYS = env_int("JOBBYO_RUN_DATE_OFFSET_DAYS", 0)
+RUN_DATE_OFFSET_DAYS_OVERRIDE = os.getenv("JOBBYO_RUN_DATE_OFFSET_DAYS", "").strip() or None
 
 # OpenAI web search is a fallback for candidates the structured sources cannot
 # supply, not a default source. Measured over two full runs it produced 9.7% of
@@ -557,7 +557,25 @@ def api_get(url):
     return res.json()
 
 
+def _jobs_added_at_timestamp():
+    """Real time for on-demand single-user runs; next-day 08:00 UTC for
+    scheduled bulk runs (/run/all, no --uid/--email target). Scheduled jobs
+    are meant to be read by the next morning's cycle, and stamping them with
+    the actual add time (often the previous evening) is what caused the
+    24h-rollover bug where late jobs got silently missed once UTC midnight
+    passed before the next pass counted them."""
+    is_bulk_scheduled_run = not (SINGLE_USER_UID or SINGLE_USER_EMAIL or SINGLE_USER_EMAILS)
+    now = datetime.now(timezone.utc)
+    if is_bulk_scheduled_run:
+        return (now + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0).isoformat()
+    return now.isoformat()
+
+
 def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS):
+    added_at = _jobs_added_at_timestamp()
+    for j in jobs:
+        j["addedAt"] = added_at
+
     payload = {
         "jobs": jobs,
         "default_status": default_status,
@@ -2054,12 +2072,24 @@ def statuses_counted_for_today(job_status):
 
 
 def run_today():
-    """The date the run treats as 'today'.
+    """The date the run treats as 'today' for quota checks (count_jobs_today).
 
-    JOBBYO_RUN_DATE_OFFSET_DAYS=1 makes a run behave as if it were tomorrow, so
-    quota checks ignore jobs already delivered today. Defaults to 0.
+    A scheduled bulk run (no --uid/--email target) treats 'today' as
+    tomorrow, matching api_post_jobs's addedAt pre-dating -- otherwise a
+    same-evening top-up pass wouldn't see jobs the first pass already added
+    (they're dated tomorrow) and would re-search from scratch. An on-demand
+    single-user run keeps the real date. JOBBYO_RUN_DATE_OFFSET_DAYS, if
+    set, overrides this auto-detection either way.
     """
-    return (datetime.now(timezone.utc) + timedelta(days=RUN_DATE_OFFSET_DAYS)).date()
+    if RUN_DATE_OFFSET_DAYS_OVERRIDE is not None:
+        try:
+            offset = int(RUN_DATE_OFFSET_DAYS_OVERRIDE)
+        except Exception:
+            offset = 0
+    else:
+        is_bulk_scheduled_run = not (SINGLE_USER_UID or SINGLE_USER_EMAIL or SINGLE_USER_EMAILS)
+        offset = 1 if is_bulk_scheduled_run else 0
+    return (datetime.now(timezone.utc) + timedelta(days=offset)).date()
 
 
 def count_jobs_today(existing_jobs, job_status=None):

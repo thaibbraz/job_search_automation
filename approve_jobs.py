@@ -90,20 +90,23 @@ def cleanup_old_emailed_logs():
 # ---------------------------------------------------------------------------
 
 def _is_today(job):
-    """Return True if the job was added within the last 24h.
+    """Return True if the job's addedAt calendar date is today (UTC).
 
-    Calendar-date equality breaks here: the evening search passes (19:00/22:00
-    Europe/Madrid) stamp addedAt on one UTC calendar date, but the next-morning
-    email pass (10:00 Europe/Madrid) checks after UTC midnight has rolled over
-    to the next date -- so an exact date match silently misses last night's
-    jobs for whichever users got processed before the rollover.
+    Calendar-date equality is safe again because the evening search passes
+    (send_jobbyo.py's api_post_jobs) now pre-date scheduled-run jobs with
+    tomorrow's date at the moment they're added, instead of the real add
+    time -- so by the time this next-morning email pass runs, "today" is
+    already baked into addedAt. (A rolling 24h window doesn't work here: it
+    would still count yesterday's already-emailed batch as "recent" for
+    several hours into today, since scheduled jobs cluster at a fixed
+    08:00 UTC timestamp rather than spreading across the evening.)
     """
     for field in ("addedAt", "createdAt", "added_at", "created_at"):
         val = job.get(field)
         if val:
             try:
                 dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-                return datetime.now(timezone.utc) - dt < timedelta(hours=24)
+                return dt.date() == datetime.now(timezone.utc).date()
             except Exception:
                 pass
     return False
