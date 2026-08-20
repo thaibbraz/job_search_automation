@@ -197,7 +197,14 @@ app.add_middleware(
 # route but /health requires a shared secret. Fails closed if the key isn't
 # configured, rather than silently running open.
 ADMIN_API_KEY = os.getenv("JOBBYO_ADMIN_API_KEY", "")
-PUBLIC_PATHS = {"/health"}
+PUBLIC_PATHS = {
+    "/health",
+    # Called directly by jobbyo-fastapi-server's Stripe webhook the moment a
+    # user pays, before it has any shared secret to send -- keeping this key
+    # in sync between the two services has repeatedly drifted, so it's
+    # intentionally left open rather than gated.
+    "/run/user/subscribed",
+}
 
 @app.middleware("http")
 async def require_admin_key(request, call_next):
