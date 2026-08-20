@@ -1692,13 +1692,15 @@ def get_user_profile(uid):
 
 
 def has_active_automation(automation):
+    """isActive is legacy/dead on the automation doc -- most real automations
+    have it False and it isn't kept in sync with anything meaningful.
+    Eligibility here is just "a real, non-draft automation exists"; actual
+    paid status is verified separately via /users/paid (see
+    TRUST_USERS_PAID_ENDPOINT)."""
     if not automation:
         return False
 
-    if automation.get("isDraft") is True:
-        return False
-
-    return automation.get("isActive") is True
+    return automation.get("isDraft") is not True
 
 def should_bypass_automation_check(user, email):
     """True for trialing users and anyone in FORCE_USER_EMAILS."""
