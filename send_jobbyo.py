@@ -97,6 +97,13 @@ SINGLE_USER_EMAIL = os.getenv("JOBBYO_SINGLE_USER_EMAIL", "").strip() or None
 SINGLE_USER_EMAILS = set()
 SINGLE_USER_UID = os.getenv("JOBBYO_SINGLE_USER_UID", "").strip() or None
 
+# --assume-paid: skip the /users/paid lookup and save results unconditionally.
+# For callers (like the subscribe webhook) who already know the user just
+# paid — /users/paid can lag a freshly created subscription by several
+# seconds, which would otherwise misclassify a brand-new paying user as a
+# free preview and silently drop their results.
+ASSUME_PAID = False
+
 EXCLUDED_USER_EMAILS = {
     "zakin2time@gmail.com",
     "zachkolp.esl.japan@gmail.com",
@@ -7581,6 +7588,13 @@ def resolve_requested_user():
 
     # Paid status decides whether results are stored. Free candidates get the
     # jobs returned to them but nothing written to their queue.
+    if ASSUME_PAID:
+        # Caller already knows this user just paid (e.g. the subscribe
+        # webhook) — /users/paid can lag a brand-new subscription by several
+        # seconds, so don't let that race misclassify them as free.
+        print(f"Targeted run: {user['email']} — assumed paid, results will be saved.")
+        return user
+
     paid_match = next(
         (u for u in (get_paid_users() or [])
          if u.get("uid") == uid
@@ -8210,7 +8224,7 @@ def build_previous_run_results_by_uid(previous_run_data):
 # ============================================================
 
 def apply_cli_overrides():
-    global SINGLE_USER_EMAIL, SINGLE_USER_EMAILS, SINGLE_USER_UID, MAX_USERS_TO_PROCESS, NO_GPT_MODE
+    global SINGLE_USER_EMAIL, SINGLE_USER_EMAILS, SINGLE_USER_UID, MAX_USERS_TO_PROCESS, NO_GPT_MODE, ASSUME_PAID
 
     # Load env-based multi-email filter first. CLI values are added to this set.
     env_email_values = []
@@ -8298,6 +8312,11 @@ Environment alternatives:
             i += 1
             continue
 
+        if arg == "--assume-paid":
+            ASSUME_PAID = True
+            i += 1
+            continue
+
         if arg == "--max-users":
             if i + 1 >= len(args):
                 raise SystemExit("Missing value after --max-users")
@@ -8347,6 +8366,7 @@ def main():
     print(f"SINGLE_USER_EMAIL={SINGLE_USER_EMAIL}")
     print(f"SINGLE_USER_EMAILS={sorted(SINGLE_USER_EMAILS)}")
     print(f"SINGLE_USER_UID={SINGLE_USER_UID}")
+    print(f"ASSUME_PAID={ASSUME_PAID}")
     print(f"TARGET_JOBS_PER_USER={TARGET_JOBS_PER_USER}")
     print(f"STARTER_MAX_STATUS={STARTER_MAX_STATUS}")
     print(f"AUTO_STATUS={AUTO_STATUS}")
@@ -8638,6 +8658,15 @@ def main():
 
     print()
     print(f"Users: {len(results_by_uid)}  ·  Jobs added: {total_new}  ·  Rejected: {total_rejected}")
+
+    try:
+        import company_ingestion
+        all_jobs_this_run = [
+            j for merged in results_by_uid.values() for j in (merged.get("jobs_added") or [])
+        ]
+        company_ingestion.ingest_new_companies(all_jobs_this_run)
+    except Exception as e:
+        print(f"WARNING: company ingestion skipped: {e}")
 
 
 if __name__ == "__main__":

@@ -51,6 +51,19 @@ PYTHON = sys.executable
 RUN_LOG_DIR = SCRIPT_DIR / "run_logs"
 SYNC_RUN_TIMEOUT_SECONDS = 600
 
+# /run/user/subscribed's callers (Stripe webhook, automation-creation flow)
+# fire it as a detached background task with no read timeout of their own —
+# they're happy to wait however long the search takes. So give it a much
+# longer budget than the other synchronous endpoints, which a frontend is
+# waiting on for a loading state.
+SUBSCRIBED_RUN_TIMEOUT_SECONDS = 1800
+
+# Tasks kept alive here so they aren't garbage-collected mid-run: used when a
+# subscribed run outlives SUBSCRIBED_RUN_TIMEOUT_SECONDS — asyncio.shield
+# keeps the underlying subprocess going instead of abandoning it, but nothing
+# else holds a reference to that task once the request handler returns.
+_background_keepalive: set = set()
+
 # /run/user/top-jobs runs the whole pipeline, so each call takes minutes and
 # costs real money. Allow one per candidate per window.
 TOP_JOBS_COOLDOWN_SECONDS = int(os.getenv("JOBBYO_TOP_JOBS_COOLDOWN_SECONDS", "86400"))
@@ -376,53 +389,18 @@ async def run_user_top_jobs(target: UserTarget, limit: int = 3):
     )
 
 
-@app.post("/run/user/subscribed", response_model=SubscribedJobsResponse)
-async def run_user_subscribed(target: UserTarget):
-    """Call this the moment a user subscribes (e.g. from the signup/billing
-    webhook). Runs the full pipeline for that one user, blocking until done
-    (same as /run/user/top-jobs — can take a few minutes), then emails them
-    their first batch with a reason per job. The email is only sent once at
-    least MIN_JOBS_TO_NOTIFY_SUBSCRIBED (3) jobs were found; below the daily
-    target it tells the candidate more are on the way instead of implying
-    the search is finished, and above/at target it doesn't."""
-    if not target.uid and not target.email:
-        raise HTTPException(status_code=422, detail="Provide uid or email.")
-
-    key = (target.uid or target.email or "").strip().lower()
-    last = _subscribed_last_run.get(key)
-    now = datetime.now(timezone.utc)
-    if last is not None:
-        elapsed = (now - last).total_seconds()
-        if elapsed < TOP_JOBS_COOLDOWN_SECONDS:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Already ran for {key} recently. Try again in {int(TOP_JOBS_COOLDOWN_SECONDS - elapsed)}s.",
-            )
-    _subscribed_last_run[key] = now
-
-    if target.uid:
-        args, label = ["--uid", target.uid], f"run:subscribed:{target.uid}"
-    else:
-        args, label = ["--email", target.email], f"run:subscribed:{target.email}"
-
-    existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
-    started_at = asyncio.get_event_loop().time()
-
-    try:
-        code = await asyncio.wait_for(
-            _run_subprocess([PYTHON, "send_jobbyo.py", *args], label),
-            timeout=SYNC_RUN_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Run for {target.uid or target.email} did not finish within {SYNC_RUN_TIMEOUT_SECONDS}s.",
-        )
-
+async def _finish_subscribed_run(
+    target: "UserTarget", label: str, existing_logs: set, started_at: float, code: int
+) -> SubscribedJobsResponse:
+    """Read the completed run's jobs_added and email the user. Shared by the
+    normal (fast) path and the timeout-continuation path in
+    run_user_subscribed below — raises RuntimeError on a non-zero exit so
+    each caller can decide how to surface that (HTTP 500 vs. just logging it,
+    since a background continuation has no request to respond to)."""
     duration_seconds = round(asyncio.get_event_loop().time() - started_at, 1)
 
     if code != 0:
-        raise HTTPException(status_code=500, detail=f"Run failed with exit code {code}. Check server logs for '{label}'.")
+        raise RuntimeError(f"Run failed with exit code {code}. Check server logs for '{label}'.")
 
     # A single-user run can go through up to 3 rounds (first/second/minimum-
     # viable) if the first round falls short, and each round writes its own
@@ -504,6 +482,82 @@ async def run_user_subscribed(target: UserTarget):
         jobs=response_jobs,
         emailed=emailed,
     )
+
+
+@app.post("/run/user/subscribed", response_model=SubscribedJobsResponse)
+async def run_user_subscribed(target: UserTarget):
+    """Call this the moment a user subscribes (e.g. from the signup/billing
+    webhook). Runs the full pipeline for that one user, blocking until done
+    (same as /run/user/top-jobs — can take a few minutes), then emails them
+    their first batch with a reason per job. The email is only sent once at
+    least MIN_JOBS_TO_NOTIFY_SUBSCRIBED (3) jobs were found; below the daily
+    target it tells the candidate more are on the way instead of implying
+    the search is finished, and above/at target it doesn't.
+
+    Both callers (Stripe webhook, automation-creation flow) fire this as a
+    detached background task with no read timeout of their own, so a slow
+    run is never abandoned here either: if it outlives
+    SUBSCRIBED_RUN_TIMEOUT_SECONDS, asyncio.shield keeps the subprocess
+    running and this returns a "still processing" response instead of
+    failing the call outright — the user still gets their jobs + email once
+    it finishes, just without a synchronous response to report it."""
+    if not target.uid and not target.email:
+        raise HTTPException(status_code=422, detail="Provide uid or email.")
+
+    key = (target.uid or target.email or "").strip().lower()
+    last = _subscribed_last_run.get(key)
+    now = datetime.now(timezone.utc)
+    if last is not None:
+        elapsed = (now - last).total_seconds()
+        if elapsed < TOP_JOBS_COOLDOWN_SECONDS:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Already ran for {key} recently. Try again in {int(TOP_JOBS_COOLDOWN_SECONDS - elapsed)}s.",
+            )
+    _subscribed_last_run[key] = now
+
+    if target.uid:
+        args, label = ["--uid", target.uid, "--assume-paid"], f"run:subscribed:{target.uid}"
+    else:
+        args, label = ["--email", target.email, "--assume-paid"], f"run:subscribed:{target.email}"
+
+    existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
+    started_at = asyncio.get_event_loop().time()
+
+    task = asyncio.ensure_future(_run_subprocess([PYTHON, "send_jobbyo.py", *args], label))
+    _background_keepalive.add(task)
+    task.add_done_callback(_background_keepalive.discard)
+
+    try:
+        code = await asyncio.wait_for(asyncio.shield(task), timeout=SUBSCRIBED_RUN_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        async def _finish_in_background():
+            try:
+                bg_code = await task
+                await _finish_subscribed_run(target, label, existing_logs, started_at, bg_code)
+            except Exception as exc:
+                print(f"[{label}] background completion failed: {exc}")
+
+        bg_task = asyncio.ensure_future(_finish_in_background())
+        _background_keepalive.add(bg_task)
+        bg_task.add_done_callback(_background_keepalive.discard)
+
+        return SubscribedJobsResponse(
+            accepted=True,
+            message=(
+                f"Run for {target.uid or target.email} is still processing after "
+                f"{SUBSCRIBED_RUN_TIMEOUT_SECONDS}s — it will keep running and email "
+                "them once it finishes."
+            ),
+            duration_seconds=round(asyncio.get_event_loop().time() - started_at, 1),
+            jobs_found=0,
+            emailed=False,
+        )
+
+    try:
+        return await _finish_subscribed_run(target, label, existing_logs, started_at, code)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # --- Approve + email -------------------------------------------------------
