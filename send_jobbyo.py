@@ -7553,17 +7553,21 @@ def selected_email_matches(email):
 # RUN ROUNDS
 # ============================================================
 
-def resolve_requested_user():
-    """Resolve a --uid/--email target directly, without going through /users/paid.
+def resolve_requested_user(uid=None, email=None):
+    """Resolve a single --uid/--email target directly, without going through /users/paid.
 
     A targeted run should work for anyone who has an automation, so a free
     candidate can be shown a preview of what the product would find them.
-    Returns None when no single user was requested or the lookup fails.
-    """
-    global SKIP_SAVE
+    Returns None when no user was requested or the lookup fails.
 
-    uid = SINGLE_USER_UID
-    email = SINGLE_USER_EMAIL or next(iter(SINGLE_USER_EMAILS), None)
+    Free/paid status is recorded on the returned dict as "_skip_save" rather
+    than touching the global SKIP_SAVE directly — a multi-target run
+    (resolve_requested_users) resolves several users up front and processes
+    them one at a time later, so a single global flag can't hold each user's
+    answer at once. The per-user loop that actually posts jobs is
+    responsible for setting SKIP_SAVE from this field right before it runs
+    each user.
+    """
     if not uid and not email:
         return None
 
@@ -7584,6 +7588,7 @@ def resolve_requested_user():
         "email": email or profile.get("email"),
         "displayName": profile.get("displayName"),
         "_automation_cache": automation,
+        "_skip_save": False,
     }
 
     # Paid status decides whether results are stored. Free candidates get the
@@ -7603,20 +7608,47 @@ def resolve_requested_user():
     )
     if paid_match and is_paid_user(paid_match):
         user.update({k: v for k, v in paid_match.items() if k not in user})
+        user["_skip_save"] = False
         print(f"Targeted run: {user['email']} — paid, results will be saved.")
     else:
-        SKIP_SAVE = True
+        user["_skip_save"] = True
         print(f"Targeted run: {user['email']} — free, results will NOT be saved.")
 
     return user
 
 
+def resolve_requested_users():
+    """Resolve every --uid/--email target for this run.
+
+    SINGLE_USER_UID is a single target; SINGLE_USER_EMAILS/SINGLE_USER_EMAIL
+    can name any number of targets (see resolve_requested_user for how each
+    one is resolved and how free/paid is recorded per-user).
+    """
+    targets = []
+    if SINGLE_USER_UID:
+        targets.append({"uid": SINGLE_USER_UID, "email": None})
+
+    emails = set(SINGLE_USER_EMAILS)
+    if SINGLE_USER_EMAIL:
+        emails.add(SINGLE_USER_EMAIL)
+    for email in sorted(emails):
+        targets.append({"uid": None, "email": email})
+
+    resolved = []
+    seen_uids = set()
+    for target in targets:
+        user = resolve_requested_user(uid=target["uid"], email=target["email"])
+        if user is None or user["uid"] in seen_uids:
+            continue
+        seen_uids.add(user["uid"])
+        resolved.append(user)
+
+    return resolved
+
+
 def get_eligible_paid_users():
     if selected_email_filter_active() or SINGLE_USER_UID:
-        direct = resolve_requested_user()
-        if direct is not None:
-            return [direct]
-        return []
+        return resolve_requested_users()
 
     paid_users = get_paid_users()
 
@@ -7738,11 +7770,13 @@ def run_round(
     print("============================================================")
 
     round_results = []
+    global SKIP_SAVE
 
     for user in users:
         uid = user.get("uid")
         email = user.get("email")
         display_name = user.get("displayName")
+        SKIP_SAVE = user.get("_skip_save", False)
 
         print("\n\n############################################################")
         print(f"ROUND {round_number} USER: {display_name} — {email} — {uid}")
