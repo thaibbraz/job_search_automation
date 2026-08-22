@@ -8,6 +8,7 @@ jobo_discovery_log/
 # Secrets
 .env
 *.env
+creds/
 
 # Python
 __pycache__/

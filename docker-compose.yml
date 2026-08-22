@@ -22,6 +22,11 @@ services:
       - jobbyo-search-personas:/app/personas
       - jobbyo-search-contracts:/app/search_contracts
       - jobbyo-search-run-logs:/app/run_logs
+      # GCS service account key for company_ingestion.py (writes newly-found
+      # board links to the jobbyo-job-crawler bucket). Bind-mounted rather
+      # than baked into the image so the key never lands in a Docker layer;
+      # ./creds is gitignored — see GOOGLE_APPLICATION_CREDENTIALS in .env.
+      - ./creds:/app/creds:ro
     networks:
       - jobbyo-search-network
 
