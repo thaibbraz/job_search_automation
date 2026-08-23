@@ -14,8 +14,12 @@ set -euo pipefail
 
 SSH_HOST="${SSH_HOST:?Set SSH_HOST to the server IP/hostname}"
 SSH_USER="${SSH_USER:-root}"
-SSH_KEY_OPT=()
-[ -n "${SSH_KEY:-}" ] && SSH_KEY_OPT=(-i "$SSH_KEY")
+# A plain string, not an array: macOS's stock bash (3.2) throws "unbound
+# variable" under `set -u` when expanding an empty array's [@]/[*], even
+# guarded by -n checks elsewhere. Word-splitting a scalar sidesteps that —
+# fine here since SSH_KEY is a key path, not arbitrary user input.
+SSH_KEY_OPT=""
+[ -n "${SSH_KEY:-}" ] && SSH_KEY_OPT="-i $SSH_KEY"
 APP_DIR="${APP_DIR:-/opt/script_job_search}"
 SKIP_ENV="${SKIP_ENV:-0}"
 
@@ -23,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SSH_TARGET="${SSH_USER}@${SSH_HOST}"
 
 echo "==> Syncing repo to ${SSH_TARGET}:${APP_DIR}"
-ssh "${SSH_KEY_OPT[@]}" "$SSH_TARGET" "mkdir -p '$APP_DIR'"
+ssh $SSH_KEY_OPT "$SSH_TARGET" "mkdir -p '$APP_DIR'"
 rsync -az --delete \
   --exclude ".git/" \
   --exclude ".env" \
@@ -33,7 +37,7 @@ rsync -az --delete \
   --exclude "strategy_reports/" \
   --exclude "__pycache__/" \
   --exclude ".claude/" \
-  -e "ssh ${SSH_KEY_OPT[*]}" \
+  -e "ssh $SSH_KEY_OPT" \
   "$SCRIPT_DIR"/ "$SSH_TARGET:$APP_DIR/"
 
 if [ "$SKIP_ENV" != "1" ]; then
@@ -42,12 +46,12 @@ if [ "$SKIP_ENV" != "1" ]; then
     exit 1
   fi
   echo "==> Copying .env (chmod 600)"
-  scp "${SSH_KEY_OPT[@]}" "$SCRIPT_DIR/.env" "$SSH_TARGET:$APP_DIR/.env"
-  ssh "${SSH_KEY_OPT[@]}" "$SSH_TARGET" "chmod 600 '$APP_DIR/.env'"
+  scp $SSH_KEY_OPT "$SCRIPT_DIR/.env" "$SSH_TARGET:$APP_DIR/.env"
+  ssh $SSH_KEY_OPT "$SSH_TARGET" "chmod 600 '$APP_DIR/.env'"
 fi
 
 echo "==> Installing systemd units, building and starting containers"
-ssh "${SSH_KEY_OPT[@]}" "$SSH_TARGET" bash -s <<REMOTE
+ssh $SSH_KEY_OPT "$SSH_TARGET" bash -s <<REMOTE
 set -euo pipefail
 APP_DIR="$APP_DIR"
 
