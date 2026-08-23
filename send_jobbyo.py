@@ -580,7 +580,50 @@ def _jobs_added_at_timestamp():
     return now.isoformat()
 
 
-def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS):
+def _verify_jobs_persisted(uid, email, posted_jobs, default_status, max_attempts=2):
+    """Read the backend back after a write and confirm the jobs actually stuck.
+
+    The backend has been seen to reset a user's whole selectedJobs list to
+    empty shortly after a legitimate write, for reasons that live outside
+    this repo (a duplicate automation_data.selectedJobs the backend keeps
+    alongside the real one). We can't fix that at the source, so this is a
+    read-after-write check: if any job we just posted isn't showing up,
+    re-post the missing ones once, then log loudly if it still didn't take.
+    """
+    posted_urls = {normalize_url(j.get("job_url", "")) for j in posted_jobs if j.get("job_url")}
+    if not posted_urls:
+        return
+
+    missing_jobs = []
+    for attempt in range(1, max_attempts + 1):
+        time.sleep(2)
+        fresh = get_user_automation(uid) or {}
+        live_urls = {normalize_url(j.get("job_url", "")) for j in extract_selected_jobs(fresh)}
+        missing_urls = posted_urls - live_urls
+        if not missing_urls:
+            return
+
+        missing_jobs = [j for j in posted_jobs if normalize_url(j.get("job_url", "")) in missing_urls]
+        print(f"⚠️  VERIFY: {len(missing_jobs)}/{len(posted_urls)} job(s) missing from {email}'s "
+              f"queue right after posting (attempt {attempt}/{max_attempts}).")
+
+        if attempt < max_attempts:
+            print("   Re-posting the missing ones...")
+            try:
+                requests.post(
+                    post_jobs_url(email),
+                    json={"jobs": missing_jobs, "default_status": default_status},
+                    headers={"accept": "application/json", "Content-Type": "application/json"},
+                    timeout=90,
+                ).raise_for_status()
+            except Exception as e:
+                print(f"   Re-post attempt failed: {e}")
+
+    print(f"🔴 VERIFY FAILED: {email} still missing {len(missing_jobs)} job(s) after {max_attempts} "
+          f"attempts. Backend may have reset selectedJobs after the write — check manually.")
+
+
+def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS, uid=None):
     added_at = _jobs_added_at_timestamp()
     for j in jobs:
         j["addedAt"] = added_at
@@ -631,7 +674,12 @@ def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS):
     )
 
     res.raise_for_status()
-    return res.json()
+    result = res.json()
+
+    if uid:
+        _verify_jobs_persisted(uid, email, jobs, default_status)
+
+    return result
 
 
 # ============================================================
@@ -4800,7 +4848,7 @@ def regrade_ungraded_jobs(user_profile, automation, cv_text, persona, email, job
         return 0
 
     try:
-        api_post_jobs(email, updated, default_status=job_status)
+        api_post_jobs(email, updated, default_status=job_status, uid=user_profile.get("uid"))
         print(f"✓ Regrade: {len(updated)}/{len(ungraded)} jobs updated with AI grades + reasons")
         return len(updated)
     except Exception as e:
@@ -7320,7 +7368,7 @@ def find_jobs_for_user(
             )
 
             try:
-                post_result = api_post_jobs(email, approved_jobs, default_status=job_status)
+                post_result = api_post_jobs(email, approved_jobs, default_status=job_status, uid=user_profile.get("uid"))
                 print("\nPOST RESULT:")
                 print(json.dumps(post_result, indent=2))
 
