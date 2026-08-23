@@ -365,6 +365,11 @@ RUN_LOG_DIR.mkdir(exist_ok=True)
 # manual backfill script, which never actually ran on a schedule and had no
 # cleanup -- an unbounded log nobody read.
 _JOBO_DISCOVERY_ITEMS = []
+# Same idea, for Hiring.cafe -- without this, company_ingestion.py only ever
+# saw HC companies that actually got matched and delivered to a user, which
+# is a much narrower slice than what HC returned. Both lists feed the same
+# ingest_new_companies() call at the end of main().
+_HC_DISCOVERY_ITEMS = []
 
 SEARCH_CONTRACT_DIR = Path("./search_contracts")
 SEARCH_CONTRACT_DIR.mkdir(exist_ok=True)
@@ -6115,6 +6120,7 @@ def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_
 
     raw_items = raw_items_all
     print(f"Hiring.cafe: {len(raw_items)} total raw results received")
+    _log_hc_discovery(raw_items)  # log everything now, before avoid/blocked/score filtering below discards most of it
 
     # Parse → dedup by (company, title) → filter seen/blocked → score → sort.
     avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
@@ -6310,6 +6316,25 @@ def build_jobo_search_bodies(keywords, locations, workplace_type, salary_floor, 
         for body in bodies:
             body["salary_usd"] = {"min": salary_floor}
     return bodies[:max_calls]
+
+
+def _log_hc_discovery(raw_items):
+    """Record every raw Hiring.cafe item's apply_url, before any
+    avoid/blocked/score filtering below discards most of them -- same
+    reasoning as _log_jobo_discovery, mirrored for HC's raw item shape
+    (apply_url is top-level here, not nested under listing_url).
+    """
+    if not raw_items:
+        return
+    try:
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            url = (raw.get("apply_url") or "").strip()
+            if url:
+                _HC_DISCOVERY_ITEMS.append({"job_url": url})
+    except Exception as e:
+        print(f"HC discovery tracking failed (non-fatal): {e}")
 
 
 def _log_jobo_discovery(raw_items):
@@ -8754,10 +8779,11 @@ def main():
         all_jobs_this_run = [
             j for merged in results_by_uid.values() for j in (merged.get("jobs_added") or [])
         ]
-        # Matched jobs (all sources) plus every raw Jobo item this run saw,
-        # including ones filtering discarded -- the wider net the old
-        # jobo_discovery_log/backfill approach was meant to cover.
-        company_ingestion.ingest_new_companies(all_jobs_this_run + _JOBO_DISCOVERY_ITEMS)
+        # Matched jobs (all sources) plus every raw Jobo/HC item this run
+        # saw, including ones filtering discarded -- the wider net the old
+        # jobo_discovery_log/backfill approach was meant to cover, now
+        # applied to both prefetch sources instead of just Jobo.
+        company_ingestion.ingest_new_companies(all_jobs_this_run + _JOBO_DISCOVERY_ITEMS + _HC_DISCOVERY_ITEMS)
     except Exception as e:
         print(f"WARNING: company ingestion skipped: {e}")
 
