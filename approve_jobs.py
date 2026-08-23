@@ -55,11 +55,12 @@ MIN_JOBS_TO_NOTIFY_SUBSCRIBED = 3
 # "pending_review" is send_jobbyo.py's staging status for freshly-found jobs
 # (see promote_jobs() below) -- included here so a normal day's search
 # actually counts toward the threshold instead of silently never reaching it.
-# "approved" is what Auto Mode users' jobs get promoted straight to (see
-# target_status() below) -- counted toward coverage but not re-emailed for
-# review since nothing is waiting on the user for those.
+# "approved"/"applied" is what Auto Mode users' jobs get promoted straight to
+# (see target_status() below) -- Auto Mode users still get the daily email,
+# just as a "here's what I found/applied to for you" summary rather than a
+# review prompt, since silence isn't an acceptable substitute for an email.
 STATUSES_TO_COUNT = {"applied", "approved", "pending", "waiting_approval", "pending_review"}
-STATUSES_TO_EMAIL = {"pending", "waiting_approval", "pending_review"}
+STATUSES_TO_EMAIL = {"pending", "waiting_approval", "pending_review", "approved", "applied"}
 
 # Per-user emailed/missing detail — as opposed to run health/coverage %,
 # which api.py posts to SLACK_WEBHOOK_URL_DAILY_RUN instead.
@@ -598,11 +599,13 @@ def process_user(user, force=False):
             "emailed": False,
         }
 
-    # Jobs still staged as "pending_review" (send_jobbyo.py's status for
-    # freshly-found jobs) need promoting to the plan's real status before
-    # they're reported as sent -- promote_jobs() upserts by job_url, so this
-    # updates them in place rather than duplicating.
-    to_promote = [j for j in jobs_for_email if _status(j) != new_status]
+    # Only jobs still staged as "pending_review" (send_jobbyo.py's status for
+    # freshly-found jobs) need promoting to the plan's real status --
+    # promote_jobs() upserts by job_url with a flat default_status, so
+    # including anything already past that stage (e.g. an Auto Mode job the
+    # apply bot has since moved to "applied") would incorrectly demote it
+    # back down instead of leaving it alone.
+    to_promote = [j for j in jobs_for_email if _status(j) == "pending_review" and _status(j) != new_status]
     if to_promote:
         promote_jobs(email, to_promote, new_status)
 
