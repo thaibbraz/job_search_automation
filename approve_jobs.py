@@ -29,6 +29,8 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from date_utils import is_same_utc_date
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -102,14 +104,11 @@ def _is_today(job):
     several hours into today, since scheduled jobs cluster at a fixed
     08:00 UTC timestamp rather than spreading across the evening.)
     """
+    today = datetime.now(timezone.utc).date()
     for field in ("addedAt", "createdAt", "added_at", "created_at"):
         val = job.get(field)
-        if val:
-            try:
-                dt = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
-                return dt.date() == datetime.now(timezone.utc).date()
-            except Exception:
-                pass
+        if val and is_same_utc_date(val, today):
+            return True
     return False
 
 

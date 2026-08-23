@@ -13,6 +13,8 @@ from datetime import date, datetime, timezone, timedelta
 
 import requests
 
+from date_utils import parse_utc_timestamp
+
 try:
     from openai import OpenAI
 except ImportError:
@@ -2023,22 +2025,8 @@ def is_paid_user(user):
 
 
 def parse_added_at_date(value):
-    if not value:
-        return None
-
-    text = str(value).strip()
-
-    try:
-        if text.endswith("Z"):
-            text = text.replace("Z", "+00:00")
-        return datetime.fromisoformat(text).date()
-    except Exception:
-        pass
-
-    try:
-        return datetime.strptime(text[:10], "%Y-%m-%d").date()
-    except Exception:
-        return None
+    dt = parse_utc_timestamp(value)
+    return dt.date() if dt else None
 
 
 PLAN_HINT_KEYS = {

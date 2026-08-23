@@ -44,6 +44,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from date_utils import parse_utc_timestamp
+
 load_dotenv()
 
 SCRIPT_DIR = Path(__file__).parent
@@ -599,28 +601,9 @@ _APPLIED_STATUSES = {"applied", "approved"}
 COVERAGE_TARGET_JOBS = int(os.getenv("JOBBYO_COVERAGE_TARGET_JOBS", "8"))
 COVERAGE_GOAL_PCT = float(os.getenv("JOBBYO_COVERAGE_GOAL_PCT", "0.8"))
 
-_DATE_FORMATS = [
-    "%Y-%m-%dT%H:%M:%S.%fZ",
-    "%Y-%m-%dT%H:%M:%SZ",
-    "%Y-%m-%dT%H:%M:%S.%f",
-    "%Y-%m-%dT%H:%M:%S",
-    "%Y-%m-%d",
-    "%a, %d %b %Y %H:%M:%S GMT",
-    "%a, %d %b %Y %H:%M:%S %Z",
-]
-
-
 def _parse_job_date(date_str: str) -> Optional[datetime]:
     """Parse ISO 8601 or RFC 2822 date strings into UTC-aware datetime."""
-    if not date_str:
-        return None
-    for fmt in _DATE_FORMATS:
-        try:
-            dt = datetime.strptime(date_str, fmt)
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    return None
+    return parse_utc_timestamp(date_str)
 
 
 def _fetch_paid_users_sync() -> list[dict]:
