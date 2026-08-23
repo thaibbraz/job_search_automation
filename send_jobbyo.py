@@ -8215,6 +8215,32 @@ def save_run_log(all_results):
     print(f"\nSaved run log: {path}")
 
 
+RUN_LOG_RETENTION_DAYS = 7
+
+
+def cleanup_old_run_logs():
+    """Delete job_run_*.json / run_costs_*.json older than
+    RUN_LOG_RETENTION_DAYS. Only the single most recent job_run_*.json is
+    ever read back (see load_previous_run_log()), so these accumulate
+    forever otherwise -- 22GB/2300+ files and counting on the box this ran
+    on before this existed.
+    """
+    if not RUN_LOG_DIR.exists():
+        return
+    cutoff = datetime.now().timestamp() - RUN_LOG_RETENTION_DAYS * 86400
+    deleted = 0
+    for pattern in ("job_run_*.json", "run_costs_*.json"):
+        for f in RUN_LOG_DIR.glob(pattern):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    deleted += 1
+            except OSError:
+                pass
+    if deleted:
+        print(f"Deleted {deleted} run log(s) older than {RUN_LOG_RETENTION_DAYS} days.")
+
+
 def load_previous_run_log():
     """Find and load the most recent run log to seed cross-run learning."""
     if not RUN_LOG_DIR.exists():
@@ -8381,6 +8407,7 @@ Environment alternatives:
 
 def main():
     apply_cli_overrides()
+    cleanup_old_run_logs()
 
     print("Starting paid-user job automation script...")
     print(f"NO_GPT_MODE={NO_GPT_MODE}")
