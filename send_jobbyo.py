@@ -2318,8 +2318,7 @@ def build_local_persona(user_profile, automation, cv_text):
     return persona
 
 
-def get_or_create_persona(user_profile, automation, cv_text):
-    uid = user_profile["uid"]
+def get_or_create_persona(uid, user_profile, automation, cv_text):
     path = persona_path(uid)
 
     if path.exists():
@@ -2773,8 +2772,7 @@ def build_local_search_contract(user_profile, automation, cv_text, persona):
     }
 
 
-def get_or_create_search_contract(user_profile, automation, cv_text, persona):
-    uid = user_profile["uid"]
+def get_or_create_search_contract(uid, user_profile, automation, cv_text, persona):
     path = search_contract_path(uid)
 
     if path.exists():
@@ -6585,11 +6583,11 @@ def find_jobs_for_user(
 
     cv_text = cv_to_text(user_profile)
     _persona_existed = persona_path(uid).exists()
-    persona = get_or_create_persona(user_profile, automation, cv_text)
+    persona = get_or_create_persona(uid, user_profile, automation, cv_text)
     _persona_new = not _persona_existed
 
     _contract_existed = search_contract_path(uid).exists()
-    search_contract = get_or_create_search_contract(user_profile, automation, cv_text, persona)
+    search_contract = get_or_create_search_contract(uid, user_profile, automation, cv_text, persona)
     _contract_new = not _contract_existed
 
     existing_urls, existing_company_titles = existing_duplicate_sets(existing_jobs)
