@@ -411,7 +411,7 @@ def send_subscribed_jobs_email(user_profile, jobs, target_count, override_email=
 
     payload = {
         "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-        "to": [{"email": email, "name": name}],
+        "to": [{"email": email, "name": name}, {"email": "thiago@jobbyo.ai", "name": "Thiago"}],
         "subject": f"{first_name}, here {'is your first match' if len(jobs) == 1 else f'are your first {len(jobs)} matches'}",
         "htmlContent": html_content,
     }
