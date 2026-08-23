@@ -534,7 +534,10 @@ def post_slack(text):
         print(f"Slack post failed: {e}")
 
 
-def send_slack_summary(emailed_users, skipped_users, pending_users):
+HIGH_REJECTION_THRESHOLD = 5
+
+
+def send_slack_summary(emailed_users, skipped_users, pending_users, high_rejection_users=None):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"📧 *approve_jobs* — {now}"]
 
@@ -546,6 +549,11 @@ def send_slack_summary(emailed_users, skipped_users, pending_users):
         lines.append(f"⚠️ *{len(pending_users)} below threshold ({MIN_JOBS_TO_EMAIL} jobs):*")
         for u in pending_users:
             lines.append(f"  • {u['name']} ({u['email']}) — {u['pending_count']}/{MIN_JOBS_TO_EMAIL} jobs")
+
+    if high_rejection_users:
+        lines.append(f"🚫 *{len(high_rejection_users)} user(s) with more than {HIGH_REJECTION_THRESHOLD} jobs rejected today:*")
+        for u in high_rejection_users:
+            lines.append(f"  • {u['name']} ({u['email']}) — {u['rejected_today']} rejected")
 
     post_slack("\n".join(lines))
 
@@ -585,9 +593,14 @@ def process_user(user, force=False):
         j for j in today_jobs
         if _status(j) in STATUSES_TO_EMAIL
     ]
+    # Auto Mode jobs the ATS itself rejected after applying (see Jeff Outlaw
+    # case: 8/10 of his today jobs flipped to "rejected" post-apply). A high
+    # rejection rate is worth a human looking at, independent of whether this
+    # user got emailed today.
+    rejected_today = len([j for j in today_jobs if _status(j) == "rejected"])
 
     count = len(jobs_for_count)
-    print(f"  {name} ({email})  mode={mode}  today={count}  emailable={len(jobs_for_email)}  force={force}")
+    print(f"  {name} ({email})  mode={mode}  today={count}  emailable={len(jobs_for_email)}  rejected={rejected_today}  force={force}")
 
     if (count < MIN_JOBS_TO_EMAIL and not force) or not jobs_for_email:
         return {
@@ -595,6 +608,7 @@ def process_user(user, force=False):
             "email": email,
             "uid": uid,
             "pending_count": count,
+            "rejected_today": rejected_today,
             "emailed": False,
         }
 
@@ -616,6 +630,7 @@ def process_user(user, force=False):
         "uid": uid,
         "jobs_promoted": len(jobs_for_email),
         "new_status": new_status,
+        "rejected_today": rejected_today,
         "emailed": emailed,
     }
 
@@ -701,8 +716,17 @@ def main():
     for u in pending_users:
         print(f"  🔴 {u['name']} ({u['email']})  {u['pending_count']}/{MIN_JOBS_TO_EMAIL} jobs")
 
+    high_rejection_users = [
+        u for u in (emailed_users + pending_users)
+        if u.get("rejected_today", 0) > HIGH_REJECTION_THRESHOLD
+    ]
+    if high_rejection_users:
+        print(f"High rejection today (>{HIGH_REJECTION_THRESHOLD}):")
+        for u in high_rejection_users:
+            print(f"  🚫 {u['name']} ({u['email']})  {u['rejected_today']} rejected")
+
     if not single_email:
-        send_slack_summary(emailed_users, skipped_users, pending_users)
+        send_slack_summary(emailed_users, skipped_users, pending_users, high_rejection_users)
 
 
 if __name__ == "__main__":
