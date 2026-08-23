@@ -642,8 +642,14 @@ def main():
     # Cleanup logs older than yesterday
     cleanup_old_emailed_logs()
 
-    # Load UIDs already emailed today (dedup guard)
-    emailed_today_uids = load_emailed_today() if not single_email else set()
+    # Load UIDs already emailed today (dedup guard). Always load the real
+    # set, even for a single-user run -- a single-user run still needs to
+    # save into the *shared* file (save_emailed_today overwrites it wholesale),
+    # so starting from an empty set here would wipe out everyone else's
+    # record of already being emailed today. A single-user run bypasses the
+    # skip check below instead, so it can still deliberately re-send to one
+    # person regardless of their dedup state.
+    emailed_today_uids = load_emailed_today()
 
     paid_users = get_paid_users()
     if not paid_users:
@@ -665,7 +671,7 @@ def main():
         email = user.get("email") or ""
         name = user.get("displayName") or email.split("@")[0]
 
-        if uid and uid in emailed_today_uids:
+        if uid and uid in emailed_today_uids and not single_email:
             print(f"  {name} ({email}) — already emailed today, skipping")
             skipped_users.append({"name": name, "email": email})
             continue
