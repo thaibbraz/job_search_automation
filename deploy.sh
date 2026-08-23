@@ -65,7 +65,7 @@ fi
 COMPOSE="docker compose"
 docker compose version >/dev/null 2>&1 || COMPOSE="docker-compose"
 
-for unit in jobbyo-search.service jobbyo-search-run.service jobbyo-search-run.timer jobbyo-search-run-final.service jobbyo-search-run-final.timer jobbyo-search-daily-report.service jobbyo-search-daily-report.timer; do
+for unit in jobbyo-search.service jobbyo-search-run.service jobbyo-search-run.timer jobbyo-search-run-final.service jobbyo-search-run-final.timer jobbyo-search-daily-report.service jobbyo-search-daily-report.timer jobbyo-boardlinks-topup.service; do
   cp "\$APP_DIR/systemd/\$unit" "/etc/systemd/system/\$unit"
 done
 systemctl daemon-reload
@@ -84,6 +84,16 @@ systemctl start jobbyo-search.service || true
 sleep 5
 echo "Container status:"
 docker ps --filter "name=jobbyo-search" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+# boardsLinks backfill -- deploy-triggered only (no timer, no schedule): a
+# new ATS shows up here because a deploy just happened (a new crawler was
+# registered in jobbyo-job-crawler and that repo redeployed, publishing an
+# updated manifest), so checking on every deploy is the natural cadence,
+# not a calendar one. Blocking (not backgrounded) so its result is visible
+# in this deploy's own log instead of racing the rest of the script.
+echo ""
+echo "Running boardsLinks backfill..."
+systemctl start --wait jobbyo-boardlinks-topup.service || echo "boardsLinks backfill failed (non-fatal) -- check: journalctl -u jobbyo-boardlinks-topup.service"
 echo ""
 echo "Next scheduled runs:"
 systemctl list-timers 'jobbyo-search*.timer' --no-pager

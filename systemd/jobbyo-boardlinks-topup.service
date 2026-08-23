@@ -1,0 +1,15 @@
+[Unit]
+Description=Jobbyo boardsLinks backfill (deploy-triggered, no schedule)
+After=jobbyo-search.service docker.service
+Requires=jobbyo-search.service docker.service
+
+[Service]
+Type=oneshot
+# Triggered once per deploy.sh run, not on a timer -- see deploy.sh. Runs
+# inside the already-running jobbyo-search container, not via
+# run_full_cycle.sh -- this needs local filesystem access to run_logs/ (a
+# Docker volume only the container can see) and
+# GOOGLE_APPLICATION_CREDENTIALS, both already available there. See
+# backfill_boardlinks_from_history.py's module docstring for what this does
+# and why it lives in this repo instead of jobbyo-job-crawler.
+ExecStart=/usr/bin/docker exec jobbyo-search python3 backfill_boardlinks_from_history.py
