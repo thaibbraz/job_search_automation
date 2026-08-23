@@ -354,13 +354,15 @@ PERSONA_DIR.mkdir(exist_ok=True)
 RUN_LOG_DIR = Path("./run_logs")
 RUN_LOG_DIR.mkdir(exist_ok=True)
 
-# Every raw company Jobo returns per user, before any filtering/scoring
-# discards most of them -- fed to jobbyo-job-crawler's company-discovery
-# backfill (utils/backfill_board_links.py, iter_jobo_discovery_log_urls) so
-# that pipeline reuses these already-paid-for calls instead of making its
-# own. One append-only file per day; see _log_jobo_discovery().
-JOBO_DISCOVERY_LOG_DIR = Path("./jobo_discovery_log")
-JOBO_DISCOVERY_LOG_DIR.mkdir(exist_ok=True)
+# Every raw company Jobo returns per user this run, before any
+# filtering/scoring discards most of them -- kept in memory only (reset by
+# construction each run, since every run is its own subprocess) and handed
+# to company_ingestion.py at the end of main() so the board-link bucket gets
+# the full breadth of what Jobo considered, not just what got matched to a
+# user. Superseded the old file-based jobo_discovery_log/ + a separate
+# manual backfill script, which never actually ran on a schedule and had no
+# cleanup -- an unbounded log nobody read.
+_JOBO_DISCOVERY_ITEMS = []
 
 SEARCH_CONTRACT_DIR = Path("./search_contracts")
 SEARCH_CONTRACT_DIR.mkdir(exist_ok=True)
@@ -6275,30 +6277,23 @@ def build_jobo_search_bodies(keywords, locations, workplace_type, salary_floor, 
 
 
 def _log_jobo_discovery(raw_items):
-    """Append every raw Jobo item's company + listing URL to today's discovery
-    log, before any avoid/blocked/score filtering below discards most of
-    them. Best-effort only -- a logging failure must never break the actual
+    """Record every raw Jobo item's company + listing URL, before any
+    avoid/blocked/score filtering below discards most of them, so
+    company_ingestion.py can add any new ones to the board-link bucket at
+    the end of this run. Best-effort only -- must never break the actual
     search this call is part of.
     """
     if not raw_items:
         return
     try:
-        path = JOBO_DISCOVERY_LOG_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
-        with open(path, "a", encoding="utf-8") as f:
-            for raw in raw_items:
-                if not isinstance(raw, dict):
-                    continue
-                url = (raw.get("listing_url") or raw.get("apply_url") or "").strip()
-                company = ((raw.get("company") or {}).get("name") or "").strip()
-                if not url or not company:
-                    continue
-                f.write(json.dumps({
-                    "listing_url": url,
-                    "company": company,
-                    "source": raw.get("source", ""),
-                }, default=str) + "\n")
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            url = (raw.get("listing_url") or raw.get("apply_url") or "").strip()
+            if url:
+                _JOBO_DISCOVERY_ITEMS.append({"job_url": url})
     except Exception as e:
-        print(f"Jobo discovery log write failed (non-fatal): {e}")
+        print(f"Jobo discovery tracking failed (non-fatal): {e}")
 
 
 def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
@@ -8696,7 +8691,10 @@ def main():
         all_jobs_this_run = [
             j for merged in results_by_uid.values() for j in (merged.get("jobs_added") or [])
         ]
-        company_ingestion.ingest_new_companies(all_jobs_this_run)
+        # Matched jobs (all sources) plus every raw Jobo item this run saw,
+        # including ones filtering discarded -- the wider net the old
+        # jobo_discovery_log/backfill approach was meant to cover.
+        company_ingestion.ingest_new_companies(all_jobs_this_run + _JOBO_DISCOVERY_ITEMS)
     except Exception as e:
         print(f"WARNING: company ingestion skipped: {e}")
 
