@@ -2020,7 +2020,15 @@ def is_paid_user(user):
 
     subscription = user.get("subscription") or {}
 
-    if subscription.get("status") != "active":
+    # Matches /users/paid's own definition (jobbyo-fastapi-server
+    # app/users/router.py) -- that endpoint already counts "trialing" as
+    # paid, but this local re-check required "active" specifically, so a
+    # brand-new free-trial user silently got skipped here (SKIP: not
+    # active paid user) for their entire 3-day trial, only starting to
+    # actually get searched once Stripe flips status to "active" (trial
+    # ends + first successful charge). This was the reported "trial users
+    # don't count as paid / huge delay" bug.
+    if subscription.get("status") not in ("active", "trialing"):
         return False
 
     if not user.get("stripeId"):

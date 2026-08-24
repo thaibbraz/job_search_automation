@@ -473,11 +473,15 @@ async def _finish_subscribed_run(
     except Exception as exc:
         print(f"[{label}] email send failed: {exc}")
 
+    # send_subscribed_jobs_email now always sends (a thin/empty batch just
+    # gets a "still searching" variant instead of job cards -- see that
+    # function's docstring), so emailed=False here means an actual send
+    # failure (Brevo error, missing key), not a thin-batch skip.
     below_minimum = len(jobs_added) < approve_jobs.MIN_JOBS_TO_NOTIFY_SUBSCRIBED
-    suffix = " Emailed." if emailed else (" Below minimum — not emailed." if below_minimum else " Email failed.")
+    suffix = " Emailed (no matches yet)." if emailed and below_minimum else (" Emailed." if emailed else " Email failed.")
 
     recipient_for_slack = TOP_JOBS_TEST_RECIPIENT or resolved_email or target.email
-    status_icon = ":white_check_mark:" if emailed else (":hourglass:" if below_minimum else ":x:")
+    status_icon = ":white_check_mark:" if emailed else ":x:"
     await asyncio.to_thread(
         _send_slack_sync,
         f"Laras: {status_icon} subscribed search for {recipient_for_slack} — {len(jobs_added)} job(s) found.{suffix}",

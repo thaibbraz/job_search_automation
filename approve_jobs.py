@@ -48,9 +48,10 @@ MIN_JOBS_TO_EMAIL = 8
 AUTO_STATUS = "approved"
 MAX_STATUS = "waiting_approval"
 
-# The just-subscribed welcome email (send_subscribed_jobs_email) is gated on
-# a lower bar than the daily digest above — a thin first batch is still worth
-# sending right after signup, since the alternative is silence.
+# Threshold for showing job cards in the just-subscribed welcome email
+# (send_subscribed_jobs_email) -- below this it still sends (never silence
+# right after signup), just without cards, saying the search is still
+# running instead.
 MIN_JOBS_TO_NOTIFY_SUBSCRIBED = 3
 
 # Only jobs added TODAY count toward the threshold and email.
@@ -341,35 +342,37 @@ def send_first_matches_email(user_profile, jobs, override_email=None, is_paid=Tr
 def send_subscribed_jobs_email(user_profile, jobs, target_count, override_email=None):
     """Sent right after a candidate subscribes, once their first search finishes.
 
-    Gated on MIN_JOBS_TO_NOTIFY_SUBSCRIBED — a batch thinner than that isn't
-    worth interrupting the candidate for; the caller should just let the
-    regular pipeline pick them up later instead. When the batch falls short
-    of target_count the closing says more are still coming, so a candidate
-    with 3 jobs isn't left thinking the search is already done.
+    Always sends now, even below MIN_JOBS_TO_NOTIFY_SUBSCRIBED -- a candidate
+    who just signed up and hears nothing looks like a broken product, not a
+    thin batch. Below that threshold, the email just drops the job cards and
+    says the search is actively running instead, rather than skipping the
+    welcome moment entirely. When the batch falls short of target_count (but
+    still meets the minimum) the closing says more are still coming, so a
+    candidate with 3 jobs isn't left thinking the search is already done.
     """
-    if len(jobs) < MIN_JOBS_TO_NOTIFY_SUBSCRIBED:
-        return False
-
     email = override_email or user_profile.get("email") or ""
     name = user_profile.get("displayName") or (user_profile.get("email") or "").split("@")[0]
     first_name = name.split()[0] if name else "there"
 
-    cards = ""
-    for j in jobs:
-        title = j.get("title") or ""
-        company = j.get("company") or ""
-        url = j.get("job_url") or j.get("url") or ""
-        location = j.get("location") or ""
-        grade = int(j.get("grade") or 0)
-        reason = _job_reason(j)
+    has_matches = len(jobs) >= MIN_JOBS_TO_NOTIFY_SUBSCRIBED
 
-        heading = (
-            f'<a href="{url}" style="color:#3A56E2;text-decoration:none;font-weight:700;">{title}</a>'
-            if url else f'<strong style="color:#3A56E2;">{title}</strong>'
-        )
-        meta = " · ".join([p for p in (company, location) if p])
+    if has_matches:
+        cards = ""
+        for j in jobs:
+            title = j.get("title") or ""
+            company = j.get("company") or ""
+            url = j.get("job_url") or j.get("url") or ""
+            location = j.get("location") or ""
+            grade = int(j.get("grade") or 0)
+            reason = _job_reason(j)
 
-        cards += f"""
+            heading = (
+                f'<a href="{url}" style="color:#3A56E2;text-decoration:none;font-weight:700;">{title}</a>'
+                if url else f'<strong style="color:#3A56E2;">{title}</strong>'
+            )
+            meta = " · ".join([p for p in (company, location) if p])
+
+            cards += f"""
     <div style="border:1px solid #e5e7eb;border-radius:8px;padding:20px;margin:0 0 16px 0;">
       <p style="margin:0 0 4px 0;font-size:16px;line-height:1.5;">{heading}</p>
       <p style="margin:0 0 12px 0;font-size:13px;color:#6b7280;font-family:Arial,sans-serif;">{meta}</p>
@@ -377,13 +380,26 @@ def send_subscribed_jobs_email(user_profile, jobs, target_count, override_email=
       <p style="margin:12px 0 0 0;font-size:12px;color:#9ca3af;font-family:Arial,sans-serif;">Match score {grade}/100</p>
     </div>"""
 
-    if len(jobs) >= target_count:
-        closing = "These are saved to your queue — review and approve them whenever you're ready."
-    else:
-        closing = (
-            f"That's the first {len(jobs)} I could find right now — I'm still searching and will "
-            "keep adding roles to your queue today."
+        intro = (
+            f"Welcome! I've already been looking. Here {'is' if len(jobs) == 1 else 'are'} the "
+            f"{'role' if len(jobs) == 1 else f'{len(jobs)} roles'} that fit you best right now, and why."
         )
+        if len(jobs) >= target_count:
+            closing = "These are saved to your queue — review and approve them whenever you're ready."
+        else:
+            closing = (
+                f"That's the first {len(jobs)} I could find right now — I'm still searching and will "
+                "keep adding roles to your queue today."
+            )
+        subject = f"{first_name}, here {'is your first match' if len(jobs) == 1 else f'are your first {len(jobs)} matches'}"
+    else:
+        cards = ""
+        intro = (
+            "Welcome! I've already started searching based on what you told me — nothing that's a "
+            "strong enough fit to send over just yet, but I'm actively on it."
+        )
+        closing = "I'll email you the moment I've got a solid batch ready to review."
+        subject = f"{first_name}, welcome to Jobbyo — I'm on the hunt for your first matches"
 
     html_content = f"""<!DOCTYPE html>
 <html>
@@ -393,7 +409,7 @@ def send_subscribed_jobs_email(user_profile, jobs, target_count, override_email=
 
     <p style="margin:0 0 6px 0;font-size:12px;font-weight:700;color:#3A56E2;text-transform:uppercase;letter-spacing:0.08em;font-family:Arial,sans-serif;">Jobbyo</p>
     <p style="margin:0 0 24px 0;font-size:15px;line-height:1.7;">Hi {first_name},</p>
-    <p style="margin:0 0 28px 0;font-size:15px;line-height:1.7;">Welcome! I've already been looking. Here {'is' if len(jobs) == 1 else 'are'} the {'role' if len(jobs) == 1 else f'{len(jobs)} roles'} that fit you best right now, and why.</p>
+    <p style="margin:0 0 28px 0;font-size:15px;line-height:1.7;">{intro}</p>
 
     {cards}
 
@@ -418,7 +434,7 @@ def send_subscribed_jobs_email(user_profile, jobs, target_count, override_email=
     payload = {
         "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
         "to": [{"email": email, "name": name}, {"email": "thiago@jobbyo.ai", "name": "Thiago"}],
-        "subject": f"{first_name}, here {'is your first match' if len(jobs) == 1 else f'are your first {len(jobs)} matches'}",
+        "subject": subject,
         "htmlContent": html_content,
     }
 

@@ -271,15 +271,6 @@ def _esc(text):
     return _html.escape(str(text or ""))
 
 
-def _grade_badge_class(grade):
-    grade = int(grade or 0)
-    if grade >= 80:
-        return "badge-strong", f"{grade} MATCH"
-    if grade >= 60:
-        return "badge-good", f"{grade} MATCH"
-    return "badge-fair", f"{grade} MATCH"
-
-
 PDF_CSS = """
 @page { size: A4; margin: 0; }
 * { box-sizing: border-box; }
@@ -430,26 +421,6 @@ def generate_strategy_pdf(context):
     if persona.get("strengths"):
         items = "".join(f"<li>{_esc(s)}</li>" for s in persona["strengths"])
         sections.append(f'<h2>Your real strengths</h2><ul class="plain">{items}</ul>')
-
-    real_jobs = [j for j in (context.get("automation_jobs") or []) if _looks_like_real_job(j)]
-    real_jobs.sort(key=lambda j: j.get("grade") or 0, reverse=True)
-    top_matches = real_jobs[:3]
-    if top_matches:
-        cards = ""
-        for j in top_matches:
-            badge_class, badge_text = _grade_badge_class(j.get("grade"))
-            reason = approve_jobs._job_reason(j)
-            cards += f"""<div class="match-card">
-  <div class="row">
-    <div>
-      <div class="title">{_esc(j.get('title'))}</div>
-      <div class="company">{_esc(j.get('company'))}</div>
-    </div>
-    <span class="badge {badge_class}">{_esc(badge_text)}</span>
-  </div>
-  <div class="reason">{_esc(reason)}</div>
-</div>"""
-        sections.append(f'<h2>Your top matches right now</h2>{cards}')
 
     if persona.get("target_titles"):
         chips = "".join(f'<span class="chip chip-target">{_esc(t)}</span>' for t in persona["target_titles"])
