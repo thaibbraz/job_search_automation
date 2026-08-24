@@ -437,6 +437,10 @@ async def _finish_subscribed_run(
     jobs_added.sort(key=lambda j: j.get("grade") or 0, reverse=True)
 
     if not jobs_added:
+        await asyncio.to_thread(
+            _send_slack_sync,
+            f":wave: Subscribed search — {target.uid or target.email}: 0 jobs found, not emailed.",
+        )
         return SubscribedJobsResponse(
             accepted=True,
             message=f"Run finished for {target.uid or target.email}, but no jobs were found this run.",
@@ -465,6 +469,14 @@ async def _finish_subscribed_run(
 
     below_minimum = len(jobs_added) < approve_jobs.MIN_JOBS_TO_NOTIFY_SUBSCRIBED
     suffix = " Emailed." if emailed else (" Below minimum — not emailed." if below_minimum else " Email failed.")
+
+    recipient_for_slack = TOP_JOBS_TEST_RECIPIENT or resolved_email or target.email
+    status_icon = ":white_check_mark:" if emailed else (":hourglass:" if below_minimum else ":x:")
+    await asyncio.to_thread(
+        _send_slack_sync,
+        f"{status_icon} Subscribed search — {recipient_for_slack}: {len(jobs_added)} job(s) found.{suffix}",
+    )
+
     response_jobs = [
         TopJob(
             title=j.get("title"),
