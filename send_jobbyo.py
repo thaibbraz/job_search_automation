@@ -85,7 +85,7 @@ MAX_USERS_TO_PROCESS = None
 
 # /users/paid is the source of truth for paid status.
 # Keep True unless you want the script to re-check subscription.status and stripeId locally.
-TRUST_USERS_PAID_ENDPOINT = True
+TRUST_USERS_PAID_ENDPOINT = False
 
 # Optional targeted-user mode.
 # You can run one or many users either by CLI or env:
@@ -2301,6 +2301,14 @@ PERSONA_SCHEMA = {
         "salary_rules": {"type": "string"},
         "search_keywords": {"type": "array", "items": {"type": "string"}},
         "scoring_rules": {"type": "string"},
+        # Genuine career-coach analysis, not job-matching config -- these
+        # drive the strategy PDF / outreach copy, not the search filters.
+        "strengths": {"type": "array", "items": {"type": "string"}},
+        "blind_spots": {"type": "array", "items": {"type": "string"}},
+        "market_reality_check": {"type": "string"},
+        "coach_recommendation": {"type": "string"},
+        "positioning_pitch": {"type": "string"},
+        "alternative_paths": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "career_hybrid",
@@ -2314,6 +2322,12 @@ PERSONA_SCHEMA = {
         "salary_rules",
         "search_keywords",
         "scoring_rules",
+        "strengths",
+        "blind_spots",
+        "market_reality_check",
+        "coach_recommendation",
+        "positioning_pitch",
+        "alternative_paths",
     ],
     "additionalProperties": False,
 }
@@ -2357,6 +2371,15 @@ def build_local_persona(user_profile, automation, cv_text):
         "salary_rules": json.dumps(prefs.get("salaryRange") or prefs.get("minimumAcceptableSalary") or {}, default=str),
         "search_keywords": list(dict.fromkeys(titles + skills[:20]))[:60],
         "scoring_rules": "Local scoring: prioritize title/function overlap, direct ATS URLs, compatible location, and non-duplicate companies.",
+        # No-GPT mode has no model to form an actual opinion with -- left
+        # empty rather than faked, so downstream consumers (outreach.py) can
+        # tell "no coaching analysis available" from "here's the analysis."
+        "strengths": [],
+        "blind_spots": [],
+        "market_reality_check": "",
+        "coach_recommendation": "",
+        "positioning_pitch": "",
+        "alternative_paths": [],
     }
     return persona
 
@@ -2380,9 +2403,11 @@ def get_or_create_persona(uid, user_profile, automation, cv_text):
     prefs = extract_job_preferences(automation)
 
     prompt = f"""
-Create a job search persona for this user.
-
-Use the resume/CV and automation config.
+You are an experienced career coach reviewing this candidate's resume and
+stated job search preferences. You have seen thousands of resumes and know
+what actually gets someone hired versus what just sounds good on paper. Form
+a real, specific opinion about THIS person -- not generic career advice that
+could apply to anyone.
 
 USER:
 {json.dumps({
@@ -2397,9 +2422,10 @@ AUTOMATION CONFIG:
 CV:
 {cv_text}
 
-Return a strict JSON persona.
+Return a strict JSON persona with two kinds of fields.
 
-Make it practical for job matching:
+Job-matching config (used directly by the search pipeline to filter and
+score jobs -- keep these practical and mechanical):
 - career_hybrid: the unique professional mix
 - transformation_story: what happens when this person joins a company
 - target_titles: exact target titles
@@ -2411,6 +2437,29 @@ Make it practical for job matching:
 - salary_rules: salary rules
 - search_keywords: useful job search keywords
 - scoring_rules: how to grade jobs from 1-100
+
+Actual coaching analysis (this is the part that matters most -- write it
+like you're briefing a colleague on this specific candidate, not filling out
+a form):
+- strengths: 3-5 specific, evidence-based strengths -- reference what's
+  actually in the CV (a project, a result, a progression), not generic
+  traits like "hard worker" or "team player."
+- blind_spots: 2-4 honest gaps or risks in how they're approaching their
+  search or how they'll read to employers. Be direct. If their salary floor
+  looks unrealistic for their experience level, say so. If their target
+  titles don't match their actual background, say so. This is useless if
+  it's just flattery.
+- market_reality_check: one honest paragraph on how competitive their
+  actual target is right now, given their real experience level, location
+  constraints, and salary floor -- not encouragement for its own sake.
+- coach_recommendation: the single highest-leverage piece of advice you'd
+  give this person right now if you only got one sentence. Specific to
+  them, not generic ("update your resume").
+- positioning_pitch: a sharper one-to-two sentence way for them to describe
+  themselves than however they currently frame it in their CV/summary.
+- alternative_paths: 1-3 adjacent roles or directions worth considering
+  that they likely haven't thought of themselves, each with a short reason
+  grounded in something specific from their actual background.
 """
 
     response = responses_create(
