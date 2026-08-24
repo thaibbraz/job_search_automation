@@ -61,9 +61,9 @@ post_slack() {
     return 0
   fi
   local escaped
-  escaped=$(printf '%s' "$text" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+  escaped=$(printf 'Laras: %s' "$text" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
   curl -sf -X POST "$SLACK_WEBHOOK_URL" -H "Content-Type: application/json" \
-    -d "{\"text\":\"$escaped\"}" >/dev/null || log "Slack post itself failed"
+    -d "{\"text\":\"$escaped\",\"username\":\"Laras\",\"icon_emoji\":\":bar_chart:\"}" >/dev/null || log "Slack post itself failed"
 }
 
 # Prints the finished run's result ("success"/"error"/"unknown") once

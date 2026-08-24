@@ -526,10 +526,18 @@ def send_email(user_profile, automation, jobs, override_email=None):
 # ---------------------------------------------------------------------------
 
 def post_slack(text):
+    """Posted as "Laras" (our Ops & Reporting Analyst persona) -- same
+    username/icon override every automated Slack post from this project
+    uses, so it reads as one consistent reporting voice.
+    """
     if not SLACK_WEBHOOK_URL:
         return
     try:
-        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+        requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
+            timeout=10,
+        )
     except Exception as e:
         print(f"Slack post failed: {e}")
 
@@ -539,7 +547,7 @@ HIGH_REJECTION_THRESHOLD = 5
 
 def send_slack_summary(emailed_users, skipped_users, pending_users, high_rejection_users=None):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"📧 *approve_jobs* — {now}"]
+    lines = [f"Laras here with the email send recap ({now}):"]
 
     lines.append(f"✅ {len(emailed_users)} email(s) sent this run." if emailed_users else "No new emails sent this run.")
     if skipped_users:

@@ -439,7 +439,7 @@ async def _finish_subscribed_run(
     if not jobs_added:
         await asyncio.to_thread(
             _send_slack_sync,
-            f":wave: Subscribed search — {target.uid or target.email}: 0 jobs found, not emailed.",
+            f"Laras: subscribed search for {target.uid or target.email} — 0 jobs found, not emailed.",
         )
         return SubscribedJobsResponse(
             accepted=True,
@@ -474,7 +474,7 @@ async def _finish_subscribed_run(
     status_icon = ":white_check_mark:" if emailed else (":hourglass:" if below_minimum else ":x:")
     await asyncio.to_thread(
         _send_slack_sync,
-        f"{status_icon} Subscribed search — {recipient_for_slack}: {len(jobs_added)} job(s) found.{suffix}",
+        f"Laras: {status_icon} subscribed search for {recipient_for_slack} — {len(jobs_added)} job(s) found.{suffix}",
     )
 
     response_jobs = [
@@ -632,10 +632,18 @@ def _fetch_user_automation_sync(uid: str) -> dict:
 
 
 def _send_slack_sync(text: str) -> bool:
+    """Posted as "Laras" (our Ops & Reporting Analyst persona) -- same
+    username/icon override every automated Slack post from this project
+    uses, so it reads as one consistent reporting voice.
+    """
     if not SLACK_WEBHOOK_URL:
         print("[slack] SLACK_WEBHOOK_URL not set — skipping notification.")
         return False
-    resp = requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+    resp = requests.post(
+        SLACK_WEBHOOK_URL,
+        json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
+        timeout=10,
+    )
     ok = resp.status_code == 200
     if not ok:
         print(f"[slack] Webhook returned {resp.status_code}: {resp.text[:200]}")
@@ -745,7 +753,7 @@ async def coverage_today(send_slack: bool = False):
         ]
         status_icon = "✅" if report["meets_goal"] else "⚠️"
         slack_text = (
-            f"*Coverage Report — {report['date']}*\n"
+            f"Laras here with today's coverage report ({report['date']}):\n"
             f"{status_icon} {report['coverage_pct']:.0%} of users at {COVERAGE_TARGET_JOBS}+ jobs "
             f"(goal: {COVERAGE_GOAL_PCT:.0%})\n"
             f"Total: {report['total_users']} | ✅ Covered (≥{COVERAGE_TARGET_JOBS}): {report['covered']} | "
@@ -856,7 +864,7 @@ async def coverage_applied(send_slack: bool = False):
     if send_slack:
         has_applied = [u for u in result_users if u["applied_today"] > 0]
         no_applied = [u for u in result_users if u["applied_today"] == 0]
-        slack_text = f"*Applied Jobs Report — {today_utc.isoformat()}*\n"
+        slack_text = f"Laras here with today's applied-jobs report ({today_utc.isoformat()}):\n"
         if has_applied:
             lines = [f"  • {u['name']} ({u['email']}): {u['applied_today']}" for u in has_applied]
             slack_text += "\n✅ *Users with applied jobs today:*\n" + "\n".join(lines)

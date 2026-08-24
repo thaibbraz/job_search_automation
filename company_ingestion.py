@@ -188,9 +188,13 @@ def _post_slack_summary(added_by_ats):
         return
     total = sum(added_by_ats.values())
     lines = "\n".join(f"  • {ats}: {count}" for ats, count in sorted(added_by_ats.items()))
-    text = f"\U0001F4C5 Company ingestion — {total} new board link(s) added to the crawler bucket:\n{lines}"
+    text = f"Laras here — picked up {total} new board link(s) for the crawler bucket while going through today's jobs:\n{lines}"
     try:
-        requests.post(SLACK_WEBHOOK_URL, json={"text": text}, timeout=10)
+        requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
+            timeout=10,
+        )
     except Exception as e:
         print(f"  company_ingestion: Slack notification failed: {e}")
 
