@@ -67,6 +67,12 @@ STATUSES_TO_EMAIL = {"pending", "waiting_approval", "pending_review", "approved"
 # Per-user emailed/missing detail — as opposed to run health/coverage %,
 # which api.py posts to SLACK_WEBHOOK_URL_DAILY_RUN instead.
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_USER_DETAILS", "")
+# Posted to both #operations (its home channel) and #job-library, per
+# request. Deduped so a misconfiguration pointing both at the same webhook
+# doesn't double-post.
+SLACK_WEBHOOK_URLS = list(dict.fromkeys(
+    url for url in (SLACK_WEBHOOK_URL, os.getenv("SLACK_WEBHOOK_URL_NEW_ATS", "")) if url
+))
 RUN_LOGS_DIR = Path("run_logs")
 
 # ---------------------------------------------------------------------------
@@ -528,18 +534,20 @@ def send_email(user_profile, automation, jobs, override_email=None):
 def post_slack(text):
     """Posted as "Laras" (our Ops & Reporting Analyst persona) -- same
     username/icon override every automated Slack post from this project
-    uses, so it reads as one consistent reporting voice.
+    uses, so it reads as one consistent reporting voice. Posts to both
+    #operations and #job-library (SLACK_WEBHOOK_URLS), per request.
     """
-    if not SLACK_WEBHOOK_URL:
+    if not SLACK_WEBHOOK_URLS:
         return
-    try:
-        requests.post(
-            SLACK_WEBHOOK_URL,
-            json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"Slack post failed: {e}")
+    for url in SLACK_WEBHOOK_URLS:
+        try:
+            requests.post(
+                url,
+                json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"Slack post failed for one webhook (non-fatal): {e}")
 
 
 HIGH_REJECTION_THRESHOLD = 5

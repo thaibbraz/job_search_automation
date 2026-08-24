@@ -79,6 +79,12 @@ BACKEND_BASE = os.getenv("JOBBYO_BACKEND_URL", "https://fastapi-service-03-16089
 # Run health / coverage % — as opposed to per-user emailed/missing detail,
 # which approve_jobs.py posts to SLACK_WEBHOOK_URL_USER_DETAILS instead.
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_DAILY_RUN", "")
+# Posted to both #operations (its home channel) and #job-library, per
+# request. Deduped so a misconfiguration pointing both at the same webhook
+# doesn't double-post.
+SLACK_WEBHOOK_URLS = list(dict.fromkeys(
+    url for url in (SLACK_WEBHOOK_URL, os.getenv("SLACK_WEBHOOK_URL_NEW_ATS", "")) if url
+))
 # ---------------------------------------------------------------------------
 # Run state — in-memory, resets on restart
 # ---------------------------------------------------------------------------
@@ -439,7 +445,7 @@ async def _finish_subscribed_run(
     if not jobs_added:
         await asyncio.to_thread(
             _send_slack_sync,
-            f"Laras: subscribed search for {target.uid or target.email} — 0 jobs found, not emailed.",
+            f"Laras: subscribed search for {resolved_email or target.email or target.uid} — 0 jobs found, not emailed.",
         )
         return SubscribedJobsResponse(
             accepted=True,
@@ -634,19 +640,22 @@ def _fetch_user_automation_sync(uid: str) -> dict:
 def _send_slack_sync(text: str) -> bool:
     """Posted as "Laras" (our Ops & Reporting Analyst persona) -- same
     username/icon override every automated Slack post from this project
-    uses, so it reads as one consistent reporting voice.
+    uses, so it reads as one consistent reporting voice. Posts to both
+    #operations and #job-library (SLACK_WEBHOOK_URLS), per request.
     """
-    if not SLACK_WEBHOOK_URL:
-        print("[slack] SLACK_WEBHOOK_URL not set — skipping notification.")
+    if not SLACK_WEBHOOK_URLS:
+        print("[slack] No Slack webhooks configured — skipping notification.")
         return False
-    resp = requests.post(
-        SLACK_WEBHOOK_URL,
-        json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
-        timeout=10,
-    )
-    ok = resp.status_code == 200
-    if not ok:
-        print(f"[slack] Webhook returned {resp.status_code}: {resp.text[:200]}")
+    ok = True
+    for url in SLACK_WEBHOOK_URLS:
+        resp = requests.post(
+            url,
+            json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            print(f"[slack] Webhook returned {resp.status_code}: {resp.text[:200]}")
+            ok = False
     return ok
 
 
