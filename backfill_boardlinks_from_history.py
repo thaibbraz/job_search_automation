@@ -34,8 +34,14 @@ import company_ingestion
 
 ROOT = Path(__file__).parent
 
-REGISTERED_ATS_MANIFEST_PATH = f"{company_ingestion.PREFIX_TO_BOARDLINKS}/_registered_ats.json"
-ONBOARDING_STATUS_PATH = f"{company_ingestion.PREFIX_TO_BOARDLINKS}/_onboarding_status.md"
+# Deliberately NOT under boardsLinks/ -- jobbyo-job-crawler's
+# list_dirs_from_s3(boardsLinks/) treats every top-level object there as an
+# ATS folder name (that's how it builds its per-run worklist), so a file
+# living inside that prefix gets queued up and "processed" as if it were an
+# ATS itself. Must match jobbyo-job-crawler's main_vm.py
+# REGISTERED_ATS_MANIFEST_PATH exactly, since that repo writes this file.
+REGISTERED_ATS_MANIFEST_PATH = "meta/registered_ats.json"
+ONBOARDING_STATUS_PATH = "meta/onboarding_status.md"
 _STATUS_ROW_RE = re.compile(r"^\|\s*([a-zA-Z_0-9]+)\s*\|\s*(✅|⬜)\s*\|\s*$")
 
 
