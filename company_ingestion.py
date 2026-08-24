@@ -21,10 +21,13 @@ import requests
 BUCKET_NAME = os.getenv("JOBBYO_DATA_BUCKET", "jobbyo-jobs-dev")
 PREFIX_TO_BOARDLINKS = "boardsLinks"
 
-# Same channel api.py/run_full_cycle.sh use for run health/coverage — this is
-# an ops metric, not per-user detail, so it belongs there rather than on
-# SLACK_WEBHOOK_URL_USER_DETAILS.
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_DAILY_RUN", "")
+# Same channel jobbyo-job-crawler posts its new-ATS first-scan notifications
+# to (see that repo's main_vm.py post_to_slack / SLACK_WEBHOOK_URL_NEW_ATS)
+# -- board-link ingestion is the same "new company/ATS coverage" story from
+# this project's side, so it belongs in that channel rather than
+# SLACK_WEBHOOK_URL_DAILY_RUN (run health/coverage) or
+# SLACK_WEBHOOK_URL_USER_DETAILS (per-user detail).
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_NEW_ATS", "")
 
 # (ats_name, url regex, board-URL template) — ats_name matches
 # jobbyo-job-crawler's src/URLs.py ATS_TO_URL keys so the crawler recognizes
