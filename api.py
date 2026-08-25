@@ -351,7 +351,7 @@ async def _finish_subscribed_run(
         tags = " ".join(t for t in (SLACK_MENTION_GALIH, SLACK_MENTION_NADIA) if t)
         await asyncio.to_thread(
             _send_ops_only_slack_sync,
-            f"Laras: the automated search came up completely empty for {who} (full pipeline "
+            f"The automated search came up completely empty for {who} (full pipeline "
             f"already ran, this isn't a first-pass miss). Likely reason: {reason}. "
             f"{tags} can you take a manual look and find them something?".strip(),
         )
@@ -393,9 +393,9 @@ async def _finish_subscribed_run(
     who = profile.get("displayName") or recipient_for_slack
     if emailed:
         job_word = "job" if len(jobs_added) == 1 else "jobs"
-        slack_text = f"Laras: found {len(jobs_added)} {job_word} for {who} and just sent them a message with the details."
+        slack_text = f"Found {len(jobs_added)} {job_word} for {who} and just sent them a message with the details."
     else:
-        slack_text = f"Laras: found {len(jobs_added)} job(s) for {who}, but the email failed to send — worth a look."
+        slack_text = f"Found {len(jobs_added)} job(s) for {who}, but the email failed to send — worth a look."
     await asyncio.to_thread(_send_ops_only_slack_sync, slack_text)
 
     response_jobs = [

@@ -2018,6 +2018,17 @@ def is_paid_user(user):
     if TRUST_USERS_PAID_ENDPOINT:
         return True
 
+    # A --uid/--assume-paid targeted run (build_targeted_user, ASSUME_PAID
+    # branch) builds a bare user dict with no subscription/stripeId at all
+    # -- the caller (Stripe webhook, automation-creation) already knows this
+    # person is paid, that's the whole point of --assume-paid. Without this
+    # check, every such run silently failed the subscription/stripeId check
+    # below and skipped the user entirely (SKIP: not active paid user),
+    # which is why /run/user/subscribed calls kept coming back with 0 jobs
+    # regardless of the person's real subscription status.
+    if user.get("_assume_paid"):
+        return True
+
     subscription = user.get("subscription") or {}
 
     # Matches /users/paid's own definition (jobbyo-fastapi-server
@@ -7707,7 +7718,11 @@ def resolve_requested_user(uid=None, email=None):
     if ASSUME_PAID:
         # Caller already knows this user just paid (e.g. the subscribe
         # webhook) — /users/paid can lag a brand-new subscription by several
-        # seconds, so don't let that race misclassify them as free.
+        # seconds, so don't let that race misclassify them as free. Marked
+        # explicitly (not faked subscription/stripeId fields) so is_paid_user
+        # further down the pipeline actually honors this instead of still
+        # requiring fields this bare dict was never going to have.
+        user["_assume_paid"] = True
         print(f"Targeted run: {user['email']} — assumed paid, results will be saved.")
         return user
 
