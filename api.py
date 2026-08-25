@@ -96,6 +96,14 @@ SLACK_WEBHOOK_URLS = list(dict.fromkeys(
 # retention specialist") from Laras -- hot-lead / retention-outreach events
 # specifically, not general ops reporting.
 SLACK_WEBHOOK_URL_RETENTION = os.getenv("SLACK_WEBHOOK_URL_RETENTION", "")
+# Slack member IDs (the "Copy member ID" value from a person's Slack
+# profile, not their @handle) for the zero-match escalation below. Rendered
+# as a real <@ID> mention (pings them) when set; falls back to a plain,
+# non-pinging "@name" if the env var isn't configured yet.
+SLACK_USER_ID_GALIH = os.getenv("SLACK_USER_ID_GALIH", "").strip()
+SLACK_USER_ID_NADIA = os.getenv("SLACK_USER_ID_NADIA", "").strip()
+SLACK_MENTION_GALIH = f"<@{SLACK_USER_ID_GALIH}>" if SLACK_USER_ID_GALIH else "@galih"
+SLACK_MENTION_NADIA = f"<@{SLACK_USER_ID_NADIA}>" if SLACK_USER_ID_NADIA else "@nadia"
 # ---------------------------------------------------------------------------
 # Run state — in-memory, resets on restart
 # ---------------------------------------------------------------------------
@@ -329,16 +337,23 @@ async def _finish_subscribed_run(
 
     if not jobs_added:
         who = None
+        reason = "no obvious reason from their stated preferences, worth a manual look"
         if resolved_uid:
             try:
                 import send_jobbyo
                 who = (send_jobbyo.get_user_profile(resolved_uid) or {}).get("displayName")
+                automation = send_jobbyo.get_user_automation(resolved_uid) or {}
+                prefs = (automation.get("settings") or {}).get("jobPreferences") or {}
+                reason = _guess_zero_match_reason(prefs)
             except Exception:
-                who = None
+                pass
         who = who or resolved_email or target.email or target.uid
+        tags = " ".join(t for t in (SLACK_MENTION_GALIH, SLACK_MENTION_NADIA) if t)
         await asyncio.to_thread(
             _send_ops_only_slack_sync,
-            f"Laras: just ran {who}'s search and came up empty this round. Not emailing them yet, I'll catch it on the next pass.",
+            f"Laras: the automated search came up completely empty for {who} (full pipeline "
+            f"already ran, this isn't a first-pass miss). Likely reason: {reason}. "
+            f"{tags} can you take a manual look and find them something?".strip(),
         )
         return SubscribedJobsResponse(
             accepted=True,
@@ -533,16 +548,71 @@ async def add_hot_lead(candidate: HotLeadCandidate):
 
     fire_label = {1: "🔥", 2: "🔥🔥", 3: "🔥🔥🔥"}.get(lead.tier, "🔥")
     tier_name = {1: "good", 2: "super good", 3: "super-duper good"}.get(lead.tier, "good")
+    where = lead.location_text or lead.region
     await asyncio.to_thread(
         _send_retention_slack_sync,
         f"{fire_label} Just spotted a {tier_name} lead — {lead.name or lead.email or lead.uid} "
-        f"(${lead.salary_usd:,}, {lead.region}). They've set up their search but haven't started "
+        f"(${lead.salary_usd:,}, {where}). They've set up their search but haven't started "
         "their trial yet. I'll give them 24h, then reach out if they still haven't signed up.",
     )
 
     return HotLeadResponse(
         accepted=True, qualified=True,
         message=f"{candidate.uid} recorded as tier-{lead.tier} hot lead.",
+    )
+
+
+class NudgeResponse(BaseModel):
+    accepted: bool
+    sent: bool
+    message: str
+
+
+@app.post("/leads/hot/{uid}/nudge", response_model=NudgeResponse)
+async def send_hot_lead_nudge(uid: str):
+    """Send the prospect nudge email to a recorded hot lead. Meant to be
+    called by the daily outreach job (not built yet) -- exposed as an
+    endpoint too so it can be triggered/tested manually in the meantime.
+    Once it sends: removes the lead from hot_leads/ (a lead only sits there
+    while its first touch is still pending -- ongoing cadence tracking
+    lives in outreach_log/, which this also writes to) and posts a
+    retention Slack summary with who they are, their salary/location, and
+    a snippet of what the email said."""
+    import lead_scoring, outreach_log, outreach
+
+    lead = await asyncio.to_thread(lead_scoring.load_lead, uid)
+    if lead is None:
+        raise HTTPException(status_code=404, detail=f"No recorded hot lead for {uid}.")
+
+    context = await asyncio.to_thread(outreach.build_prospect_context, uid)
+    body_text = await asyncio.to_thread(outreach.generate_prospect_message, context)
+    try:
+        pdf_bytes = await asyncio.to_thread(outreach.generate_strategy_pdf, context)
+    except Exception as e:
+        print(f"[hot_lead_nudge] PDF generation failed (non-fatal, sends without it): {e}")
+        pdf_bytes = None
+
+    sent = await asyncio.to_thread(
+        outreach.send_prospect_outreach_email, context, body_text, pdf_bytes,
+    )
+
+    if sent:
+        await asyncio.to_thread(lead_scoring.remove_lead, uid)
+        summary = (body_text.strip().split("\n\n")[0] if body_text else "")[:180]
+        await asyncio.to_thread(
+            outreach_log.record_touch, uid, "hot_lead_nudge", lead.get("tier"), summary,
+        )
+        where = lead.get("location_text") or lead.get("region")
+        await asyncio.to_thread(
+            _send_retention_slack_sync,
+            f"📨 Sent a nudge to {lead.get('name') or lead.get('email') or uid} "
+            f"(${lead.get('salary_usd', 0):,}, {where}). What I said: "
+            f"“{summary}…”",
+        )
+
+    return NudgeResponse(
+        accepted=True, sent=sent,
+        message=f"Nudge {'sent' if sent else 'failed'} for {uid}.",
     )
 
 
@@ -663,6 +733,35 @@ def _send_retention_slack_sync(text: str) -> bool:
 
 def _uid_of(user: dict) -> Optional[str]:
     return user.get("uid") or user.get("id") or user.get("_id")
+
+
+def _guess_zero_match_reason(prefs: dict) -> str:
+    """Heuristic, not an LLM call -- this only feeds an internal Slack
+    escalation for a human to look into, so a rough plain-language guess is
+    enough; not worth a model call for every zero-match run."""
+    prefs = prefs or {}
+    reasons = []
+
+    salary = prefs.get("minimumAcceptableSalary") or prefs.get("currentSalary")
+    try:
+        if salary is not None and int(str(salary).replace(",", "")) >= 250_000:
+            reasons.append("salary floor looks very high for the target title")
+    except (TypeError, ValueError):
+        pass
+
+    titles = prefs.get("jobTitles") or []
+    if len(titles) == 1:
+        reasons.append(f'only one job title ("{titles[0]}"), narrows the pool a lot')
+    elif not titles:
+        reasons.append("no job title set at all")
+
+    location = prefs.get("location") or {}
+    places = location.get("places") or []
+    remote_ok = "remote" in (location.get("type") or [])
+    if len(places) <= 1 and not remote_ok:
+        reasons.append("single location with no remote option")
+
+    return "; ".join(reasons) or "no obvious reason from their stated preferences, worth a manual look"
 
 
 # ---------------------------------------------------------------------------

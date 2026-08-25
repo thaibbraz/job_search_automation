@@ -27,6 +27,10 @@ BREVO_API_KEY = approve_jobs.BREVO_API_KEY
 BREVO_API_URL = approve_jobs.BREVO_API_URL
 
 TEAM_CC_EMAIL = "thiago@jobbyo.ai"
+# Prospect nudges (send_prospect_outreach_email) CC both, but a reply goes
+# straight to Adnan -- he owns retention conversations, not Thiago.
+RETENTION_CC_EMAILS = ["thiago@jobbyo.ai", "adnan@jobbyo.ai"]
+RETENTION_REPLY_TO_EMAIL = "adnan@jobbyo.ai"
 
 # Junk/placeholder entries seen in test data (a URL instead of a real job
 # title) -- filtered out so they never leak into a real message.
@@ -710,7 +714,8 @@ def send_outreach_email(context, body_text, pdf_bytes=None, override_email=None,
 
     payload = {
         "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-        "to": [{"email": email, "name": first_name}, {"email": TEAM_CC_EMAIL, "name": "Thiago"}],
+        "to": [{"email": email, "name": first_name}],
+        "cc": [{"email": TEAM_CC_EMAIL, "name": "Thiago"}],
         "subject": subject or f"quick update, {first_name}",
         "htmlContent": html_content,
     }
@@ -805,7 +810,11 @@ def send_prospect_outreach_email(context, body_text, pdf_bytes=None, override_em
 
     payload = {
         "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-        "to": [{"email": email, "name": first_name}, {"email": TEAM_CC_EMAIL, "name": "Thiago"}],
+        "to": [{"email": email, "name": first_name}],
+        "cc": [{"email": addr, "name": addr.split("@")[0].title()} for addr in RETENTION_CC_EMAILS],
+        # A reply goes to Adnan, not the sender address or Thiago -- he owns
+        # retention conversations.
+        "replyTo": {"email": RETENTION_REPLY_TO_EMAIL, "name": "Adnan"},
         "subject": subject or f"{first_name}, a few things I found",
         "htmlContent": html_content,
     }

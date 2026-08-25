@@ -23,7 +23,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
-COPY api.py send_jobbyo.py approve_jobs.py company_ingestion.py date_utils.py backfill_boardlinks_from_history.py outreach.py ./
+COPY api.py send_jobbyo.py approve_jobs.py company_ingestion.py date_utils.py backfill_boardlinks_from_history.py outreach.py lead_scoring.py outreach_log.py ./
 
 # Create a non-root user and the data dirs the pipeline writes to
 RUN useradd --create-home --shell /bin/bash app \

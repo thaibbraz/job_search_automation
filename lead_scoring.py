@@ -76,6 +76,7 @@ class ScoredLead:
     tier: int
     salary_usd: int
     region: str  # "US" | "EU"
+    location_text: Optional[str] = None  # the raw stated location, for display (e.g. "London")
 
 
 def normalize_salary_usd(amount, currency: Optional[str]) -> Optional[int]:
@@ -149,6 +150,7 @@ def qualifies(
         tier=fire_tier(salary_usd),
         salary_usd=salary_usd,
         region=region,
+        location_text=", ".join(str(p) for p in (locations or []) if p) or None,
     )
 
 
@@ -167,6 +169,25 @@ def record_lead(lead: ScoredLead) -> None:
     HOT_LEADS_DIR.mkdir(parents=True, exist_ok=True)
     data = asdict(lead)
     data["added_at"] = datetime.now(timezone.utc).isoformat()
-    data["touches"] = []
     with open(_lead_path(lead.uid), "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def load_lead(uid: str) -> Optional[dict]:
+    path = _lead_path(uid)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def remove_lead(uid: str) -> None:
+    """Called once the first nudge email actually goes out -- a lead is
+    only "pending first touch" while it sits in hot_leads/. Ongoing touch
+    history (for the 3-day/7-day follow-up cadence) lives separately in
+    outreach_log.py, so removing this doesn't lose that."""
+    path = _lead_path(uid)
+    if path.exists():
+        path.unlink()

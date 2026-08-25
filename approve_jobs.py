@@ -433,7 +433,8 @@ def send_subscribed_jobs_email(user_profile, jobs, target_count, override_email=
 
     payload = {
         "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-        "to": [{"email": email, "name": name}, {"email": "thiago@jobbyo.ai", "name": "Thiago"}],
+        "to": [{"email": email, "name": name}],
+        "cc": [{"email": "thiago@jobbyo.ai", "name": "Thiago"}],
         "subject": subject,
         "htmlContent": html_content,
     }
