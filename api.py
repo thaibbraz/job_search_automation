@@ -8,8 +8,9 @@ GET  /run/status              Current run state + last run info
 
 POST /run/all                 Trigger send_jobbyo.py for all users
 POST /run/user                Trigger send_jobbyo.py for one user  (body: {uid?, email?})
-POST /run/user/top-jobs        Run for one user and block until done, returning top N jobs found
-                               (body: {uid?, email?}, query: ?limit=3)
+POST /run/user/subscribed     Run for one user, block until done, email their first matches
+                               (body: {uid?, email?}) — called from the Stripe successful-
+                               checkout webhook, once payment is confirmed.
 
 POST /email/all               Trigger approve_jobs.py for all users (promote + email)
 POST /email/user              Trigger approve_jobs.py for one user  (body: {email})
@@ -20,6 +21,11 @@ POST /approve/user            Alias for /email/user
 GET  /coverage/today          Per-user job counts today + coverage %  (query: ?send_slack=true)
 GET  /coverage/missing        Paid users not yet emailed today (per approve_jobs.py's send log)
 POST /email/missing           Force-send the daily report to everyone not yet emailed today
+
+POST /leads/hot                Score a just-created automation's salary/location; if it clears
+                               the hot-lead bar (see lead_scoring.py), record it and Slack-post.
+                               Called from jobbyo-fastapi-server's create_automation_job for
+                               anyone not already paid/trialing — no-ops otherwise.
 
 Usage
 -----
@@ -53,11 +59,11 @@ PYTHON = sys.executable
 RUN_LOG_DIR = SCRIPT_DIR / "run_logs"
 SYNC_RUN_TIMEOUT_SECONDS = 600
 
-# /run/user/subscribed's callers (Stripe webhook, automation-creation flow)
-# fire it as a detached background task with no read timeout of their own —
-# they're happy to wait however long the search takes. So give it a much
-# longer budget than the other synchronous endpoints, which a frontend is
-# waiting on for a loading state.
+# /run/user/subscribed's caller (jobbyo-fastapi-server's Stripe successful-
+# checkout webhook) fires it as a detached background task with no read
+# timeout of its own — it's happy to wait however long the search takes. So
+# give it a much longer budget than the other synchronous endpoints, which a
+# frontend is waiting on for a loading state.
 SUBSCRIBED_RUN_TIMEOUT_SECONDS = 1800
 
 # Tasks kept alive here so they aren't garbage-collected mid-run: used when a
@@ -66,13 +72,14 @@ SUBSCRIBED_RUN_TIMEOUT_SECONDS = 1800
 # else holds a reference to that task once the request handler returns.
 _background_keepalive: set = set()
 
-# /run/user/top-jobs runs the whole pipeline, so each call takes minutes and
-# costs real money. Allow one per candidate per window.
-TOP_JOBS_COOLDOWN_SECONDS = int(os.getenv("JOBBYO_TOP_JOBS_COOLDOWN_SECONDS", "86400"))
 # While testing, redirect every first-matches email here instead of to the
 # candidate. Unset in production so real candidates receive their own.
 TOP_JOBS_TEST_RECIPIENT = os.getenv("JOBBYO_TOP_JOBS_TEST_RECIPIENT", "").strip()
-_top_jobs_last_run = {}   # normalized uid/email -> datetime of last accepted call
+# /run/user/subscribed runs the whole pipeline, so each call takes minutes
+# and costs real money. Allow one per candidate per window. (Env var name
+# kept from this endpoint's now-removed sibling, /run/user/top-jobs, to
+# avoid a server .env change.)
+SUBSCRIBED_COOLDOWN_SECONDS = int(os.getenv("JOBBYO_TOP_JOBS_COOLDOWN_SECONDS", "86400"))
 _subscribed_last_run = {} # normalized uid/email -> datetime of last accepted /run/user/subscribed call
 
 BACKEND_BASE = os.getenv("JOBBYO_BACKEND_URL", "https://fastapi-service-03-160893319817.europe-southwest1.run.app")
@@ -85,6 +92,10 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_DAILY_RUN", "")
 SLACK_WEBHOOK_URLS = list(dict.fromkeys(
     url for url in (SLACK_WEBHOOK_URL, os.getenv("SLACK_WEBHOOK_URL_NEW_ATS", "")) if url
 ))
+# #marketing-team only, posted under a separate persona ("Jobbyo — the
+# retention specialist") from Laras -- hot-lead / retention-outreach events
+# specifically, not general ops reporting.
+SLACK_WEBHOOK_URL_RETENTION = os.getenv("SLACK_WEBHOOK_URL_RETENTION", "")
 # ---------------------------------------------------------------------------
 # Run state — in-memory, resets on restart
 # ---------------------------------------------------------------------------
@@ -106,9 +117,6 @@ _state = _State()
 class UserTarget(BaseModel):
     uid:   Optional[str] = None
     email: Optional[str] = None
-    # When true, /run/user/top-jobs emails the results straight to the
-    # candidate via Brevo, so a webhook caller needs only this one request.
-    send_email: bool = False
 
 class RunResponse(BaseModel):
     accepted: bool
@@ -122,14 +130,6 @@ class TopJob(BaseModel):
     location: Optional[str] = None
     grade:    Optional[int] = None
     reason:   Optional[str] = None
-
-
-class TopJobsResponse(BaseModel):
-    accepted:        bool
-    message:         str
-    duration_seconds: float
-    jobs:            list[TopJob]
-    emailed:         bool = False
 
 
 class SubscribedJobsResponse(BaseModel):
@@ -282,121 +282,6 @@ async def run_user(target: UserTarget, background_tasks: BackgroundTasks):
     return RunResponse(accepted=True, message=f"Top-up run started for {target.uid or target.email}.")
 
 
-@app.post("/run/user/top-jobs", response_model=TopJobsResponse)
-async def run_user_top_jobs(target: UserTarget, limit: int = 3):
-    """Run a top-up search for one user and block until it's done, returning
-    the top-graded jobs found this run. Meant for a frontend to call directly
-    and show a loading state for — this can take a few minutes."""
-    if not target.uid and not target.email:
-        raise HTTPException(status_code=422, detail="Provide uid or email.")
-
-    # One run per candidate per window: each call is a full pipeline run.
-    key = (target.uid or target.email or "").strip().lower()
-    last = _top_jobs_last_run.get(key)
-    now = datetime.now(timezone.utc)
-    if last is not None:
-        elapsed = (now - last).total_seconds()
-        if elapsed < TOP_JOBS_COOLDOWN_SECONDS:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Already ran for {key} recently. Try again in {int(TOP_JOBS_COOLDOWN_SECONDS - elapsed)}s.",
-            )
-    _top_jobs_last_run[key] = now
-
-    if target.uid:
-        args, label = ["--uid", target.uid], f"run:user:{target.uid}"
-    else:
-        args, label = ["--email", target.email], f"run:user:{target.email}"
-
-    existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
-    started_at = asyncio.get_event_loop().time()
-
-    try:
-        code = await asyncio.wait_for(
-            _run_subprocess([PYTHON, "send_jobbyo.py", *args], label),
-            timeout=SYNC_RUN_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504,
-            detail=f"Run for {target.uid or target.email} did not finish within {SYNC_RUN_TIMEOUT_SECONDS}s.",
-        )
-
-    duration_seconds = round(asyncio.get_event_loop().time() - started_at, 1)
-
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Run failed with exit code {code}. Check server logs for '{label}'.")
-
-    new_logs = sorted(set(RUN_LOG_DIR.glob("job_run_*.json")) - existing_logs)
-    match = None
-    for log_path in new_logs:
-        try:
-            with open(log_path, encoding="utf-8") as f:
-                results = json.load(f)
-        except Exception:
-            continue
-        match = next(
-            (r for r in results if (target.uid and r.get("uid") == target.uid) or (target.email and r.get("email") == target.email)),
-            None,
-        )
-        if match is not None:
-            break
-
-    if match is None:
-        return TopJobsResponse(
-            accepted=True,
-            message=f"Run finished for {target.uid or target.email}, but no run log entry was found.",
-            duration_seconds=duration_seconds,
-            jobs=[],
-        )
-
-    jobs_added = sorted(match.get("jobs_added") or [], key=lambda j: j.get("grade") or 0, reverse=True)[:limit]
-    jobs = [
-        TopJob(
-            title=j.get("title"),
-            company=j.get("company"),
-            url=j.get("job_url"),
-            location=j.get("location"),
-            grade=j.get("grade"),
-            reason=j.get("review_reason"),
-        )
-        for j in jobs_added
-    ]
-    emailed = False
-    if target.send_email and jobs_added:
-        # Send straight from here so a webhook caller needs one request, not a
-        # round trip back with the results.
-        try:
-            import send_jobbyo, approve_jobs
-
-            resolved_uid = match.get("uid")
-            profile = send_jobbyo.get_user_profile(resolved_uid) or {}
-            # A candidate whose jobs were not stored has no plan, so the email
-            # closes on signing up rather than on their queue.
-            is_paid = bool(match.get("jobs_added"))
-            recipient = TOP_JOBS_TEST_RECIPIENT or match.get("email") or target.email
-            emailed = bool(
-                await asyncio.to_thread(
-                    approve_jobs.send_first_matches_email,
-                    profile,
-                    jobs_added,
-                    recipient,
-                    is_paid,
-                )
-            )
-        except Exception as exc:
-            print(f"[{label}] email send failed: {exc}")
-
-    suffix = " Emailed." if emailed else (" Email failed." if target.send_email and jobs_added else "")
-    return TopJobsResponse(
-        accepted=True,
-        message=f"Found {len(jobs)} job(s) for {target.uid or target.email}.{suffix}",
-        duration_seconds=duration_seconds,
-        jobs=jobs,
-        emailed=emailed,
-    )
-
-
 async def _finish_subscribed_run(
     target: "UserTarget", label: str, existing_logs: set, started_at: float, code: int
 ) -> SubscribedJobsResponse:
@@ -443,9 +328,17 @@ async def _finish_subscribed_run(
     jobs_added.sort(key=lambda j: j.get("grade") or 0, reverse=True)
 
     if not jobs_added:
+        who = None
+        if resolved_uid:
+            try:
+                import send_jobbyo
+                who = (send_jobbyo.get_user_profile(resolved_uid) or {}).get("displayName")
+            except Exception:
+                who = None
+        who = who or resolved_email or target.email or target.uid
         await asyncio.to_thread(
-            _send_slack_sync,
-            f"Laras: subscribed search for {resolved_email or target.email or target.uid} — 0 jobs found, not emailed.",
+            _send_ops_only_slack_sync,
+            f"Laras: just ran {who}'s search and came up empty this round. Not emailing them yet, I'll catch it on the next pass.",
         )
         return SubscribedJobsResponse(
             accepted=True,
@@ -456,6 +349,7 @@ async def _finish_subscribed_run(
         )
 
     emailed = False
+    profile = {}
     try:
         import send_jobbyo, approve_jobs
 
@@ -481,11 +375,13 @@ async def _finish_subscribed_run(
     suffix = " Emailed (no matches yet)." if emailed and below_minimum else (" Emailed." if emailed else " Email failed.")
 
     recipient_for_slack = TOP_JOBS_TEST_RECIPIENT or resolved_email or target.email
-    status_icon = ":white_check_mark:" if emailed else ":x:"
-    await asyncio.to_thread(
-        _send_slack_sync,
-        f"Laras: {status_icon} subscribed search for {recipient_for_slack} — {len(jobs_added)} job(s) found.{suffix}",
-    )
+    who = profile.get("displayName") or recipient_for_slack
+    if emailed:
+        job_word = "job" if len(jobs_added) == 1 else "jobs"
+        slack_text = f"Laras: found {len(jobs_added)} {job_word} for {who} and just sent them a message with the details."
+    else:
+        slack_text = f"Laras: found {len(jobs_added)} job(s) for {who}, but the email failed to send — worth a look."
+    await asyncio.to_thread(_send_ops_only_slack_sync, slack_text)
 
     response_jobs = [
         TopJob(
@@ -510,18 +406,17 @@ async def _finish_subscribed_run(
 
 @app.post("/run/user/subscribed", response_model=SubscribedJobsResponse)
 async def run_user_subscribed(target: UserTarget):
-    """Call this the moment a user subscribes (e.g. from the signup/billing
-    webhook). Runs the full pipeline for that one user, blocking until done
-    (same as /run/user/top-jobs — can take a few minutes), then emails them
-    their first batch with a reason per job. The email is only sent once at
-    least MIN_JOBS_TO_NOTIFY_SUBSCRIBED (3) jobs were found; below the daily
-    target it tells the candidate more are on the way instead of implying
-    the search is finished, and above/at target it doesn't.
+    """Call this the moment a user's payment is confirmed (jobbyo-fastapi-
+    server's Stripe successful-checkout webhook). Runs the full pipeline for
+    that one user, blocking until done (can take a few minutes), then emails
+    them their first batch with a reason per job. The email is only sent
+    once at least MIN_JOBS_TO_NOTIFY_SUBSCRIBED (3) jobs were found; below
+    the daily target it tells the candidate more are on the way instead of
+    implying the search is finished, and above/at target it doesn't.
 
-    Both callers (Stripe webhook, automation-creation flow) fire this as a
-    detached background task with no read timeout of their own, so a slow
-    run is never abandoned here either: if it outlives
-    SUBSCRIBED_RUN_TIMEOUT_SECONDS, asyncio.shield keeps the subprocess
+    The caller fires this as a detached background task with no read
+    timeout of its own, so a slow run is never abandoned here either: if it
+    outlives SUBSCRIBED_RUN_TIMEOUT_SECONDS, asyncio.shield keeps the subprocess
     running and this returns a "still processing" response instead of
     failing the call outright — the user still gets their jobs + email once
     it finishes, just without a synchronous response to report it."""
@@ -533,10 +428,10 @@ async def run_user_subscribed(target: UserTarget):
     now = datetime.now(timezone.utc)
     if last is not None:
         elapsed = (now - last).total_seconds()
-        if elapsed < TOP_JOBS_COOLDOWN_SECONDS:
+        if elapsed < SUBSCRIBED_COOLDOWN_SECONDS:
             raise HTTPException(
                 status_code=429,
-                detail=f"Already ran for {key} recently. Try again in {int(TOP_JOBS_COOLDOWN_SECONDS - elapsed)}s.",
+                detail=f"Already ran for {key} recently. Try again in {int(SUBSCRIBED_COOLDOWN_SECONDS - elapsed)}s.",
             )
     _subscribed_last_run[key] = now
 
@@ -582,6 +477,73 @@ async def run_user_subscribed(target: UserTarget):
         return await _finish_subscribed_run(target, label, existing_logs, started_at, code)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# --- Hot leads ---------------------------------------------------------
+
+
+class HotLeadCandidate(BaseModel):
+    uid: str
+    email: Optional[str] = None
+    name: Optional[str] = None
+    salary: Optional[str] = None
+    salary_currency: Optional[str] = None
+    locations: list[str] = []
+
+
+class HotLeadResponse(BaseModel):
+    accepted: bool
+    qualified: bool
+    already_recorded: bool = False
+    message: str
+
+
+@app.post("/leads/hot", response_model=HotLeadResponse)
+async def add_hot_lead(candidate: HotLeadCandidate):
+    """Call this right after an automation is created for someone who isn't
+    already paid/trialing. Scores their salary/location (lead_scoring.py);
+    if they clear the hot-lead bar, records them to ./hot_leads/{uid}.json
+    and posts a Slack notification. Not yet wired to any outreach — a
+    separate daily job (not built yet) will read these records and decide
+    when to actually nudge someone, per the bounded-touches cadence design.
+    """
+    import lead_scoring
+
+    if await asyncio.to_thread(lead_scoring.already_recorded, candidate.uid):
+        return HotLeadResponse(
+            accepted=True, qualified=True, already_recorded=True,
+            message=f"{candidate.uid} was already recorded as a hot lead.",
+        )
+
+    lead = lead_scoring.qualifies(
+        uid=candidate.uid,
+        email=candidate.email,
+        name=candidate.name,
+        salary=candidate.salary,
+        salary_currency=candidate.salary_currency,
+        locations=candidate.locations,
+    )
+    if lead is None:
+        return HotLeadResponse(
+            accepted=True, qualified=False,
+            message=f"{candidate.uid} did not clear the salary/region bar.",
+        )
+
+    await asyncio.to_thread(lead_scoring.record_lead, lead)
+
+    fire_label = {1: "🔥", 2: "🔥🔥", 3: "🔥🔥🔥"}.get(lead.tier, "🔥")
+    tier_name = {1: "good", 2: "super good", 3: "super-duper good"}.get(lead.tier, "good")
+    await asyncio.to_thread(
+        _send_retention_slack_sync,
+        f"{fire_label} Just spotted a {tier_name} lead — {lead.name or lead.email or lead.uid} "
+        f"(${lead.salary_usd:,}, {lead.region}). They've set up their search but haven't started "
+        "their trial yet. I'll give them 24h, then reach out if they still haven't signed up.",
+    )
+
+    return HotLeadResponse(
+        accepted=True, qualified=True,
+        message=f"{candidate.uid} recorded as tier-{lead.tier} hot lead.",
+    )
 
 
 # --- Approve + email -------------------------------------------------------
@@ -661,6 +623,42 @@ def _send_slack_sync(text: str) -> bool:
             print(f"[slack] Webhook returned {resp.status_code}: {resp.text[:200]}")
             ok = False
     return ok
+
+
+def _send_ops_only_slack_sync(text: str) -> bool:
+    """Same Laras persona as _send_slack_sync, but #operations only -- for
+    per-user run confirmations, which #job-library doesn't need to see."""
+    if not SLACK_WEBHOOK_URL:
+        print("[slack] No ops Slack webhook configured — skipping notification.")
+        return False
+    resp = requests.post(
+        SLACK_WEBHOOK_URL,
+        json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        print(f"[slack] Webhook returned {resp.status_code}: {resp.text[:200]}")
+        return False
+    return True
+
+
+def _send_retention_slack_sync(text: str) -> bool:
+    """Hot-lead / retention-outreach events, posted to #marketing-team under
+    a distinct persona from Laras -- this is a different audience (growth/
+    marketing, not ops) watching for a different kind of signal (leads worth
+    chasing, not pipeline health)."""
+    if not SLACK_WEBHOOK_URL_RETENTION:
+        print("[slack] No retention Slack webhook configured — skipping notification.")
+        return False
+    resp = requests.post(
+        SLACK_WEBHOOK_URL_RETENTION,
+        json={"text": text, "username": "Jobbyo — the retention specialist", "icon_emoji": ":handshake:"},
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        print(f"[slack] Webhook returned {resp.status_code}: {resp.text[:200]}")
+        return False
+    return True
 
 
 def _uid_of(user: dict) -> Optional[str]:

@@ -101,10 +101,13 @@ COACH_ANALYSIS_SCHEMA = {
         "coach_recommendation": {"type": "string"},
         "positioning_pitch": {"type": "string"},
         "alternative_paths": {"type": "array", "items": {"type": "string"}},
+        "recommended_titles": {"type": "array", "items": {"type": "string"}},
+        "roles_to_avoid": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
         "strengths", "blind_spots", "market_reality_check",
         "coach_recommendation", "positioning_pitch", "alternative_paths",
+        "recommended_titles", "roles_to_avoid",
     ],
     "additionalProperties": False,
 }
@@ -136,7 +139,15 @@ give this person right now if you only got one sentence. Specific to them.
 themselves than however they currently frame it.
 - alternative_paths: 1-3 adjacent roles or directions worth considering \
 that they likely haven't thought of, each with a short reason grounded in \
-something specific from their actual background."""
+something specific from their actual background.
+- recommended_titles: 2-4 job title variants worth adding to their search \
+beyond what they already listed -- titles that describe the same real work \
+but that they may not be searching for, so real openings don't get missed. \
+Grounded in their actual level and background, not aspirational titles \
+above their reach.
+- roles_to_avoid: 1-3 title or role types NOT worth their time right now, \
+each as one short phrase with a brief reason (e.g. "Director-level roles, \
+not yet backed by people-management experience")."""
 
 
 def generate_coach_analysis(profile, prefs):
@@ -158,6 +169,92 @@ def generate_coach_analysis(profile, prefs):
         input=prompt,
         text={"format": {"type": "json_schema", "name": "coach_analysis", "schema": COACH_ANALYSIS_SCHEMA, "strict": True}},
     )
+    return json.loads(response.output_text)
+
+
+MARKET_OVERVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "market_size": {"type": "string"},
+        "competitive_landscape": {"type": "string"},
+        "compensation_range": {"type": "string"},
+        "sourcing_takeaway": {"type": "string"},
+    },
+    "required": ["market_size", "competitive_landscape", "compensation_range", "sourcing_takeaway"],
+    "additionalProperties": False,
+}
+
+# A condensed, candidate-facing cut of a market-mapping report -- same
+# underlying idea (how big is this pool, who else is competing for it, what
+# does it pay, what does that imply for the search) but four short labeled
+# lines instead of a multi-section recruiter deliverable, and framed as
+# demand-for-this-candidate rather than supply-of-candidates-for-a-role.
+MARKET_OVERVIEW_PROMPT = """You are a research analyst producing a short, honest market snapshot for a job \
+seeker, not a recruiter. Use web search to ground this in real, current \
+information -- current job listing counts, real companies actively hiring, \
+real compensation data. Where you can't find solid current data, say so and \
+give a broad, directional range instead of a falsely precise number.
+
+CANDIDATE:
+Target title(s): {job_titles}
+Recommended title variants to also search: {recommended_titles}
+Location preference: {location}
+Minimum acceptable salary: {min_salary}
+Current level, from their background: {level_summary}
+
+Write exactly four short items, each 1-2 sentences, plain language, no \
+jargon, no bullet sub-points:
+- market_size: roughly how many current openings/postings exist for this \
+role and level in this location right now. Cite the rough count and where \
+it's from (e.g. "~740 listed on Glassdoor, Aug 2026"). Label it clearly as \
+Observed, Estimated, or Inferred.
+- competitive_landscape: name 3-5 real companies actively hiring for this \
+kind of role in this market right now, and one honest line on how tight or \
+loose the talent pool looks (e.g. a couple of employers known for strong \
+retention that make outside moves harder to land).
+- compensation_range: a realistic total-comp range for this level and \
+location, from real current sources. If your sources are thin or generic, \
+say the range is broad and directional rather than precise.
+- sourcing_takeaway: one concrete sentence on what this means for THEIR \
+search specifically -- where to focus first, given the market size and \
+competition above.
+
+Write the four items now."""
+
+
+def generate_market_overview(profile, prefs, coach_analysis):
+    """Candidate-facing market snapshot, grounded via live web search (same
+    tools=[{"type": "web_search"}] pattern send_jobbyo.py already uses for
+    job-URL resolution, with the same web_search -> web_search_preview
+    fallback). A separate call from generate_coach_analysis so a slow/failed
+    search doesn't take the rest of the persona content down with it."""
+    prefs = prefs or {}
+    cv_text = send_jobbyo.cv_to_text(profile)
+    level_summary = (cv_text[:400] + "...") if len(cv_text) > 400 else cv_text
+
+    prompt = MARKET_OVERVIEW_PROMPT.format(
+        job_titles=", ".join(prefs.get("jobTitles") or []) or "not specified",
+        recommended_titles=", ".join(coach_analysis.get("recommended_titles") or []) or "none",
+        location=", ".join((prefs.get("location") or {}).get("places") or []) or "not specified",
+        min_salary=prefs.get("minimumAcceptableSalary") or "not specified",
+        level_summary=level_summary,
+    )
+
+    kwargs = dict(
+        model=send_jobbyo.SEARCH_MODEL,
+        input=prompt,
+        text={"format": {"type": "json_schema", "name": "market_overview", "schema": MARKET_OVERVIEW_SCHEMA, "strict": True}},
+    )
+    try:
+        response = send_jobbyo.responses_create(
+            tools=[{"type": "web_search", "search_context_size": "medium"}], **kwargs
+        )
+    except Exception as e:
+        if "web_search" not in str(e):
+            raise
+        response = send_jobbyo.responses_create(
+            tools=[{"type": "web_search_preview", "search_context_size": "medium"}], **kwargs
+        )
     return json.loads(response.output_text)
 
 
@@ -186,6 +283,12 @@ def _load_persona(uid, profile=None, prefs=None):
         except Exception as e:
             print(f"Coach analysis generation failed (non-fatal): {e}")
 
+    if not persona.get("market_overview") and profile is not None and persona.get("recommended_titles") is not None:
+        try:
+            persona["market_overview"] = generate_market_overview(profile, prefs or {}, persona)
+        except Exception as e:
+            print(f"Market overview generation failed (non-fatal): {e}")
+
     return persona
 
 
@@ -193,14 +296,27 @@ def _persona_summary(persona):
     lines = []
     if persona.get("career_hybrid"):
         lines.append(f"Career framing: {persona['career_hybrid']}")
-    if persona.get("target_titles"):
-        lines.append(f"Target titles: {', '.join(persona['target_titles'])}")
+    target_titles = list(persona.get("target_titles") or []) + list(persona.get("recommended_titles") or [])
+    if target_titles:
+        lines.append(f"Target titles (incl. ones worth adding): {', '.join(target_titles)}")
+    avoid = list(persona.get("avoid_roles") or []) + list(persona.get("roles_to_avoid") or [])
+    if avoid:
+        lines.append(f"Roles to avoid right now: {', '.join(avoid)}")
     if persona.get("strengths"):
         lines.append("Real strengths:\n" + "\n".join(f"  - {s}" for s in persona["strengths"]))
     if persona.get("blind_spots"):
         lines.append("Honest blind spots:\n" + "\n".join(f"  - {b}" for b in persona["blind_spots"]))
     if persona.get("market_reality_check"):
         lines.append(f"Market reality check: {persona['market_reality_check']}")
+    market = persona.get("market_overview") or {}
+    if market:
+        lines.append(
+            "Market snapshot (web-search grounded):\n"
+            f"  - Market size: {market.get('market_size', '')}\n"
+            f"  - Who else is hiring: {market.get('competitive_landscape', '')}\n"
+            f"  - Compensation: {market.get('compensation_range', '')}\n"
+            f"  - What this means for them: {market.get('sourcing_takeaway', '')}"
+        )
     if persona.get("coach_recommendation"):
         lines.append(f"Coach's one recommendation: {persona['coach_recommendation']}")
     if persona.get("alternative_paths"):
@@ -236,6 +352,127 @@ def build_context(uid):
     }
 
 
+PROSPECT_PROMPT_TEMPLATE = """You are writing a short, casual, first-person email as "Jobbyo" -- a job \
+search service, not a company sending a marketing blast. This person \
+signed up and set up their search preferences, but hasn't started their \
+free trial yet. This is your first real message to them, not a follow-up.
+
+The goal of THIS email is to show them you've already done real work on \
+their behalf, purely from the profile they gave you: a real read on their \
+background, one alternative angle worth considering, and an honest sense of \
+what the market looks like for them right now. You have real research below \
+(strengths, honest blind spots, a market snapshot grounded in current data, \
+one recommendation, and alternative paths). Draw from THAT actual research \
+rather than inventing your own take -- pick the pieces that would land \
+hardest for this specific person, and put them in your own words, casually. \
+This should feel like a genuinely sharp, personal read, not a report.
+
+After your text, the email continues with a short preview of real job \
+openings and then a link to start the trial -- you don't need to write \
+that part, it's added separately. Just end your text with ONE short, \
+casual line that naturally leads into "here's a taste of what's out there" \
+(you don't have the actual job list, so don't name specific companies or \
+roles in this transition line, just gesture at it).
+
+STRICT RULES:
+- Write like you're dashing off a quick, genuine note to someone, not \
+writing a professional memo. Contractions, everyday words, short \
+sentences. Skip corporate/consultant phrasing entirely -- no "leadership \
+scope", "P&L", "positioning", "market reality" as phrases; say the same \
+thing the way you'd actually say it out loud to a friend.
+- Never say "AI", "artificial intelligence", "bot", "automated", or anything \
+that frames you as software. Write like a person who has been working on \
+their search.
+- Never use an em dash (—) anywhere. Use a period, comma, or "and" instead.
+- Do not invent your own statistics or market claims -- the market snapshot \
+below is already grounded in real research; paraphrase it loosely and \
+casually (a rough number or company name is great, don't invent new ones \
+on top of it).
+- Reference their actual stated preferences (given below) so it's obviously \
+personal, not generic.
+- If there's a real blind spot below (something honestly working against \
+them), it is more useful to raise it gently than to avoid it -- don't be \
+harsh, but don't soften it into nothing either. Say it plainly, not \
+diplomatically.
+- Pull ONE alternative path from the notes below (not invented fresh) and \
+say briefly why it fits them specifically.
+- Work in ONE concrete detail from the market snapshot below (a rough \
+number of openings, a company actively hiring, or the comp range) so it \
+reads as real research, not a vague gesture at "the market."
+- Do NOT offer to hop on a call, schedule time, or anything implying you \
+personally can meet with them.
+- Do NOT write a sign-off, closing line, or signature ("Jobbyo", "Best,", \
+etc.) -- the email ends right after your transition line. That part is \
+added separately.
+- Plain, short paragraphs. Under 170 words total. No bullet points, no bold, \
+no emoji, no subject line -- just the body text.
+
+CANDIDATE:
+First name: {first_name}
+Target job title(s): {job_titles}
+Minimum acceptable salary: {min_salary}
+Location preference: {location}
+
+HOW WE'RE READING THEIR PROFILE (persona notes):
+{persona_summary}
+
+Write the email body now."""
+
+
+def build_prospect_context(uid):
+    """Same shape as build_context, for someone who hasn't started their
+    trial yet. sample_jobs is usually empty here -- their search hasn't run
+    yet unless the daily nudge job that calls this also runs a one-time
+    preview search first (not built yet; see the 24h-nudge job). Reads
+    automation.selectedJobs the same way build_context does so this picks
+    up real matches for free the moment that piece exists, no code change
+    needed here."""
+    profile = send_jobbyo.get_user_profile(uid) or {}
+    automation = send_jobbyo.get_user_automation(uid) or {}
+    prefs = (automation.get("settings") or {}).get("jobPreferences") or {}
+
+    name = profile.get("displayName") or (profile.get("email") or "").split("@")[0]
+    first_name = name.split()[0] if name else "there"
+
+    real_jobs = [j for j in (automation.get("selectedJobs") or []) if _looks_like_real_job(j)]
+    real_jobs.sort(key=lambda j: j.get("addedAt") or "", reverse=True)
+    sample_jobs = real_jobs[:3]
+
+    persona = _load_persona(uid, profile=profile, prefs=prefs)
+
+    return {
+        "profile": profile,
+        "first_name": first_name,
+        "job_titles": ", ".join(prefs.get("jobTitles") or []) or "not specified",
+        "min_salary": prefs.get("minimumAcceptableSalary") or "not specified",
+        "location": ", ".join((prefs.get("location") or {}).get("places") or []) or "not specified",
+        "sample_jobs": sample_jobs,
+        "persona": persona,
+        "persona_summary": _persona_summary(persona),
+    }
+
+
+def generate_prospect_message(context):
+    """Returns just the personal-read + transition text -- no sign-off, no
+    CTA. send_prospect_outreach_email appends the job-preview cards, the
+    "full breakdown is in the PDF" line, the trial CTA, and the sign-off as
+    fixed HTML, so those stay consistent and are never left to the model."""
+    prompt = PROSPECT_PROMPT_TEMPLATE.format(
+        first_name=context["first_name"],
+        job_titles=context["job_titles"],
+        min_salary=context["min_salary"],
+        location=context["location"],
+        persona_summary=context["persona_summary"],
+    )
+    response = send_jobbyo.responses_create(
+        model=send_jobbyo.SEARCH_MODEL,
+        input=prompt,
+    )
+    text = (response.output_text or "").strip()
+    text = text.replace("—", ",")
+    return text
+
+
 def generate_message(context):
     prompt = PROMPT_TEMPLATE.format(
         first_name=context["first_name"],
@@ -265,10 +502,24 @@ def generate_message(context):
 
 
 import html as _html
+import re as _re
 
 
 def _esc(text):
     return _html.escape(str(text or ""))
+
+
+_CITATION_RE = _re.compile(r"\s*\(\[[^\]]*\]\([^)]*\)\)")
+
+
+def _strip_citations(text):
+    """market_overview is grounded via web_search, and the model sometimes
+    inlines markdown-style source links (e.g. "([glassdoor.com](url))") --
+    fine in a chat reply, but this isn't a markdown renderer, so left alone
+    it would show up as literal bracket/paren text in the PDF. Strip it;
+    the grounding still shows up as the specific numbers/names in the text
+    itself, just without the raw link syntax."""
+    return _CITATION_RE.sub("", str(text or ""))
 
 
 PDF_CSS = """
@@ -277,112 +528,67 @@ PDF_CSS = """
 body {
     margin: 0;
     font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
-    color: #14151a;
-    font-size: 10.5pt;
-    line-height: 1.55;
+    color: #1a1b20;
+    font-size: 11pt;
+    line-height: 1.7;
 }
-/* One accent color (brand blue), used sparingly: header, headings, the one
-   recommendation callout, and target chips. Everything else is plain
-   typography -- no rainbow of tinted boxes competing for attention. */
+/* Deliberately plain -- one accent color (brand blue), used only for the
+   header band and section labels. No rules, no pills, no boxes. Reads like
+   a short personal letter, not a report. */
 .header {
     background: #3A56E2;
     color: #ffffff;
-    padding: 20px 40px 16px 40px;
+    padding: 30px 46px 24px 46px;
 }
 .header .eyebrow {
     font-size: 8.5pt;
     letter-spacing: 2px;
     text-transform: uppercase;
     opacity: 0.75;
-    margin: 0 0 6px 0;
+    margin: 0 0 8px 0;
 }
 .header h1 {
     margin: 0;
-    font-size: 20pt;
+    font-size: 22pt;
     font-weight: 700;
     letter-spacing: -0.3px;
 }
 .header .sub {
-    margin: 5px 0 0 0;
+    margin: 6px 0 0 0;
     font-size: 9.5pt;
     opacity: 0.85;
 }
-.content { padding: 16px 40px 8px 40px; }
+.content { padding: 32px 46px 16px 46px; }
 h2 {
-    font-size: 11pt;
-    color: #14151a;
-    margin: 14px 0 5px 0;
+    font-size: 9.5pt;
+    color: #3A56E2;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    margin: 28px 0 8px 0;
     font-weight: 700;
-    border-bottom: 1px solid #e6e8f0;
-    padding-bottom: 4px;
 }
 h2:first-child { margin-top: 0; }
-.quote {
+.quote, .pitch-text {
     font-style: italic;
-    color: #3d3f4d;
-    font-size: 10.5pt;
+    color: #2a2c34;
 }
 .story, .focus-text, .reality-text {
-    color: #3d3f4d;
-    font-size: 9.5pt;
-    margin-top: 4px;
+    color: #2a2c34;
 }
-.match-card {
-    border-bottom: 1px solid #eef0f4;
-    padding: 7px 0;
-    page-break-inside: avoid;
-}
-.match-card .row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-}
-.match-card .title { font-weight: 700; font-size: 10.5pt; color: #14151a; }
-.match-card .company { color: #6b7280; font-size: 9pt; margin-top: 1px; }
-.match-card .reason { color: #4b4d5a; font-size: 9pt; margin-top: 3px; }
-.badge {
-    display: inline-block;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 7.5pt;
-    font-weight: 700;
-    letter-spacing: 0.3px;
-    white-space: nowrap;
-    color: #ffffff;
-}
-.badge-strong { background: #16a34a; }
-.badge-good   { background: #d97706; }
-.badge-fair   { background: #6b7280; }
-.chips { display: flex; flex-wrap: wrap; gap: 5px; }
-.chip {
-    padding: 3px 10px;
-    border-radius: 4px;
-    font-size: 8.5pt;
-}
-.chip-target { background: #EEF1FD; color: #2338A8; }
-.chip-avoid  { background: #f3f4f6; color: #6b7280; }
-ul.plain { margin: 4px 0 0 0; padding-left: 16px; }
-ul.plain li { margin-bottom: 4px; font-size: 9.5pt; color: #3d3f4d; }
+ul.plain { margin: 0; padding-left: 18px; }
+ul.plain li { margin-bottom: 8px; color: #2a2c34; }
+.plain-list { margin: 0; color: #2a2c34; }
 .recommendation {
-    border-left: 3px solid #3A56E2;
-    padding: 2px 0 2px 14px;
-    margin-top: 4px;
-}
-.recommendation .text {
-    font-size: 10.5pt;
-    color: #14151a;
+    font-size: 12pt;
     font-weight: 600;
+    color: #14151a;
 }
-.pitch-text {
-    font-style: italic;
-    color: #3d3f4d;
-    font-size: 9.5pt;
-    margin-top: 4px;
-}
-.path-item { margin-bottom: 6px; font-size: 9.5pt; color: #3d3f4d; }
+.path-item { margin-bottom: 10px; color: #2a2c34; }
+.market-row { margin-bottom: 9px; color: #2a2c34; }
+.market-label { display: block; font-weight: 700; color: #14151a; font-size: 9pt; margin-bottom: 1px; }
 .footer {
-    margin-top: 14px;
-    padding-top: 8px;
+    margin-top: 30px;
+    padding-top: 12px;
     border-top: 1px solid #e6e8f0;
     text-align: center;
     color: #9aa0ae;
@@ -422,13 +628,13 @@ def generate_strategy_pdf(context):
         items = "".join(f"<li>{_esc(s)}</li>" for s in persona["strengths"])
         sections.append(f'<h2>Your real strengths</h2><ul class="plain">{items}</ul>')
 
-    if persona.get("target_titles"):
-        chips = "".join(f'<span class="chip chip-target">{_esc(t)}</span>' for t in persona["target_titles"])
-        sections.append(f'<h2>Targeting</h2><div class="chips">{chips}</div>')
+    target_titles = list(persona.get("target_titles") or []) + list(persona.get("recommended_titles") or [])
+    if target_titles:
+        sections.append(f'<h2>Titles worth adding to your search</h2><div class="plain-list">{_esc(", ".join(target_titles))}</div>')
 
-    if persona.get("avoid_roles"):
-        chips = "".join(f'<span class="chip chip-avoid">{_esc(t)}</span>' for t in persona["avoid_roles"])
-        sections.append(f'<h2>Intentionally skipping</h2><div class="chips">{chips}</div>')
+    avoid = list(persona.get("avoid_roles") or []) + list(persona.get("roles_to_avoid") or [])
+    if avoid:
+        sections.append(f'<h2>What to avoid right now</h2><div class="plain-list">{_esc(", ".join(avoid))}</div>')
 
     if persona.get("location_rules"):
         sections.append(f'<h2>Search focus</h2><div class="focus-text">{_esc(persona["location_rules"])}</div>')
@@ -444,10 +650,24 @@ def generate_strategy_pdf(context):
     if persona.get("market_reality_check"):
         sections.append(f'<h2>Market reality check</h2><div class="reality-text">{_esc(persona["market_reality_check"])}</div>')
 
+    market = persona.get("market_overview") or {}
+    if market:
+        rows = "".join(
+            f'<div class="market-row"><span class="market-label">{_esc(label)}</span>{_esc(_strip_citations(market[key]))}</div>'
+            for key, label in [
+                ("market_size", "Market size"),
+                ("competitive_landscape", "Who else is hiring"),
+                ("compensation_range", "Compensation"),
+                ("sourcing_takeaway", "What this means for you"),
+            ]
+            if market.get(key)
+        )
+        sections.append(f'<h2>Job market overview</h2>{rows}')
+
     if persona.get("coach_recommendation"):
         sections.append(
             '<h2>If you take one thing from this</h2>'
-            f'<div class="recommendation"><div class="text">{_esc(persona["coach_recommendation"])}</div></div>'
+            f'<div class="recommendation">{_esc(persona["coach_recommendation"])}</div>'
         )
 
     body_html = "\n".join(sections)
@@ -472,7 +692,7 @@ def generate_strategy_pdf(context):
     return HTML(string=full_html).write_pdf()
 
 
-def send_outreach_email(context, body_text, pdf_bytes=None, override_email=None):
+def send_outreach_email(context, body_text, pdf_bytes=None, override_email=None, subject=None):
     email = override_email or context["profile"].get("email") or ""
     first_name = context["first_name"]
 
@@ -491,7 +711,7 @@ def send_outreach_email(context, body_text, pdf_bytes=None, override_email=None)
     payload = {
         "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
         "to": [{"email": email, "name": first_name}, {"email": TEAM_CC_EMAIL, "name": "Thiago"}],
-        "subject": f"quick update, {first_name}",
+        "subject": subject or f"quick update, {first_name}",
         "htmlContent": html_content,
     }
 
@@ -516,6 +736,101 @@ def send_outreach_email(context, body_text, pdf_bytes=None, override_email=None)
         print(f"Brevo error {res.status_code}: {res.text[:200]}")
         return False
     print(f"Outreach email sent → {email}{' (with PDF)' if pdf_bytes else ''}")
+    return True
+
+
+PDF_CONTENTS_BLURB = [
+    "Your real strengths, and a few honest blind spots",
+    "Titles worth adding to your search, and a couple worth skipping",
+    "A grounded look at the market: how many roles are out there, who's hiring, what it pays",
+]
+
+
+def send_prospect_outreach_email(context, body_text, pdf_bytes=None, override_email=None, subject=None):
+    """Prospect version of send_outreach_email: same personal-note framing,
+    a plain list of real matches (title, match %, link) if
+    context["sample_jobs"] has any, a short list of what's in the attached
+    PDF, and one soft inline mention of starting the trial -- no button, no
+    hard sell. All appended as HTML so it's never left to the model."""
+    email = override_email or context["profile"].get("email") or ""
+    first_name = context["first_name"]
+    sample_jobs = context.get("sample_jobs") or []
+
+    paragraphs = "".join(f'<p style="margin:0 0 14px 0;">{p}</p>' for p in body_text.split("\n\n") if p.strip())
+
+    if sample_jobs:
+        lines = ""
+        for j in sample_jobs:
+            title = j.get("title") or ""
+            company = j.get("company") or ""
+            url = j.get("job_url") or j.get("url") or ""
+            grade = j.get("grade")
+            match_str = f" — {int(grade)}% match" if grade is not None else ""
+            label = f"{title} at {company}{match_str}"
+            row = f'<a href="{url}" style="color:#3A56E2;text-decoration:none;">{label}</a>' if url else label
+            lines += f'<li style="margin-bottom:6px;">{row}</li>'
+        preview_block = f'<ul style="margin:0 0 14px 0;padding-left:20px;">{lines}</ul>'
+    else:
+        preview_block = (
+            '<p style="margin:0 0 14px 0;color:#4b5563;font-style:italic;">'
+            "Still digging up your first matches, they'll be waiting in your queue the moment you start your trial."
+            "</p>"
+        )
+
+    pdf_block = ""
+    if pdf_bytes:
+        pdf_items = "".join(f'<li style="margin-bottom:4px;">{item}</li>' for item in PDF_CONTENTS_BLURB)
+        pdf_block = (
+            '<p style="margin:14px 0 6px 0;">There\'s more where that came from, plus the full picture on '
+            'where you stand, in the PDF I put together:</p>'
+            f'<ul style="margin:0 0 14px 0;padding-left:20px;color:#374151;">{pdf_items}</ul>'
+        )
+
+    closing = (
+        '<p style="margin:14px 0 0 0;">Whenever you\'re ready, I\'m happy to start actually applying for you, '
+        'not just finding these: <a href="https://app.jobbyo.ai/auto-apply" style="color:#3A56E2;">start your trial</a>.</p>'
+        '<p style="margin:16px 0 0 0;">Jobbyo</p>'
+    )
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.6;color:#111111;margin:0;padding:16px;">
+{paragraphs}
+{preview_block}
+{pdf_block}
+{closing}
+</body>
+</html>"""
+
+    payload = {
+        "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+        "to": [{"email": email, "name": first_name}, {"email": TEAM_CC_EMAIL, "name": "Thiago"}],
+        "subject": subject or f"{first_name}, a few things I found",
+        "htmlContent": html_content,
+    }
+
+    if pdf_bytes:
+        import base64
+        payload["attachment"] = [{
+            "content": base64.b64encode(pdf_bytes).decode("ascii"),
+            "name": f"{first_name.lower()}-job-search-strategy.pdf",
+        }]
+
+    if not BREVO_API_KEY:
+        print("BREVO_API_KEY not set — cannot send.")
+        return False
+
+    res = requests.post(
+        f"{BREVO_API_URL}/smtp/email",
+        headers={"accept": "application/json", "api-key": BREVO_API_KEY, "content-type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    if res.status_code >= 400:
+        print(f"Brevo error {res.status_code}: {res.text[:200]}")
+        return False
+    print(f"Prospect outreach email sent → {email}{' (with PDF)' if pdf_bytes else ''}")
     return True
 
 

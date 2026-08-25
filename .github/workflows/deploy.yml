@@ -1,0 +1,154 @@
+name: Deploy to Hetzner VM
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Two pushes close together must not run overlapping deploys against the
+# same VM/paths -- queue instead of racing, and never cancel a live deploy
+# mid-SSH-script (could leave the VM half-deployed). Same pattern as
+# jobbyo-job-crawler's deploy.yml.
+concurrency:
+  group: deploy-to-hetzner-search
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      HETZNER_HOST: ${{ secrets.HETZNER_HOST }}
+      HETZNER_USER: ${{ secrets.HETZNER_USER }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.HETZNER_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Create deployment artifact
+        run: |
+          git archive --format=tar.gz -o deploy.tar.gz HEAD
+
+      - name: Copy artifact to VM
+        run: |
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+            deploy.tar.gz "${HETZNER_USER}@${HETZNER_HOST}:/tmp/deploy.tar.gz"
+
+      - name: Create .env from APP_ENV_B64
+        env:
+          APP_ENV_B64: ${{ secrets.APP_ENV_B64 }}
+        run: |
+          echo "$APP_ENV_B64" | base64 -d > app.env
+
+      - name: Copy .env to VM
+        run: |
+          scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+            app.env "${HETZNER_USER}@${HETZNER_HOST}:/tmp/app.env"
+          rm -f app.env
+
+      - name: Deploy Docker containers on VM
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new "${HETZNER_USER}@${HETZNER_HOST}" '
+              set -euo pipefail
+              APP_DIR=/opt/script_job_search
+
+              if ! command -v docker >/dev/null 2>&1; then
+                echo "Docker not found, installing..."
+                curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+                sudo sh /tmp/get-docker.sh
+                rm -f /tmp/get-docker.sh
+              fi
+
+              COMPOSE="docker compose"
+              docker compose version >/dev/null 2>&1 || COMPOSE="docker-compose"
+
+              sudo mkdir -p "$APP_DIR"
+
+              # Same mktemp-failure guard as jobbyo-job-crawlers deploy.yml
+              # -- catches a silently-empty mktemp before anything
+              # destructive (the rsync --delete below) runs.
+              MKTEMP_OUTPUT=$(mktemp -d /tmp/jobbyo-search-deploy.XXXXXX 2>&1)
+              MKTEMP_EXIT=$?
+              TMP_EXTRACT_DIR="$MKTEMP_OUTPUT"
+              if [ $MKTEMP_EXIT -ne 0 ] || [ -z "$TMP_EXTRACT_DIR" ] || [ ! -d "$TMP_EXTRACT_DIR" ]; then
+                echo "FATAL: mktemp failed to create a temp directory, aborting before anything destructive runs."
+                exit 1
+              fi
+
+              TAR_OK=0
+              for attempt in 1 2 3 4 5; do
+                if [ -f /tmp/deploy.tar.gz ] && sudo tar -xzf /tmp/deploy.tar.gz -C "$TMP_EXTRACT_DIR" 2>/tmp/tar-error.log; then
+                  TAR_OK=1
+                  break
+                fi
+                echo "Attempt $attempt: deploy.tar.gz not ready yet, waiting 2s..."
+                sleep 2
+              done
+              if [ "$TAR_OK" -ne 1 ]; then
+                echo "FATAL: could not extract /tmp/deploy.tar.gz after 5 attempts."
+                cat /tmp/tar-error.log 2>/dev/null || true
+                exit 1
+              fi
+
+              sudo rsync -a --delete --one-file-system \
+                --exclude="personas/" \
+                --exclude="search_contracts/" \
+                --exclude="run_logs/" \
+                --exclude="strategy_reports/" \
+                --exclude="hot_leads/" \
+                --exclude="outreach_log/" \
+                --exclude=".env" \
+                --exclude="creds/" \
+                --exclude="__pycache__/" \
+                "$TMP_EXTRACT_DIR"/ "$APP_DIR"/
+              sudo rm -rf "$TMP_EXTRACT_DIR"
+
+              if [ -f /tmp/app.env ]; then
+                sudo mv /tmp/app.env "$APP_DIR/.env"
+                sudo chmod 600 "$APP_DIR/.env"
+                sudo chown root:root "$APP_DIR/.env"
+              fi
+
+              echo "Installing systemd units..."
+              for unit in jobbyo-search.service jobbyo-search-run.service jobbyo-search-run.timer jobbyo-search-run-final.service jobbyo-search-run-final.timer jobbyo-search-daily-report.service jobbyo-search-daily-report.timer jobbyo-boardlinks-topup.service; do
+                if [ -f "$APP_DIR/systemd/$unit" ]; then
+                  sudo cp "$APP_DIR/systemd/$unit" "/etc/systemd/system/$unit"
+                fi
+              done
+              sudo systemctl daemon-reload
+              sudo systemctl enable jobbyo-search.service
+              sudo systemctl enable --now jobbyo-search-run.timer
+              sudo systemctl enable --now jobbyo-search-run-final.timer
+              sudo systemctl enable --now jobbyo-search-daily-report.timer
+
+              cd "$APP_DIR"
+              echo "Building image..."
+              sudo $COMPOSE build
+              echo "Starting stack..."
+              sudo $COMPOSE up -d
+              sudo systemctl start jobbyo-search.service || true
+
+              sleep 5
+              echo "Container status:"
+              sudo docker ps --filter "name=jobbyo-search" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+              echo ""
+              echo "Running boardsLinks backfill..."
+              sudo systemctl start --wait jobbyo-boardlinks-topup.service || echo "boardsLinks backfill failed (non-fatal)"
+
+              echo ""
+              echo "Deployment complete!"
+              echo "sudo docker logs jobbyo-search"
+            '
+
+      - name: Clean up SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

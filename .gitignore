@@ -4,6 +4,8 @@ run_logs/
 search_contracts/
 strategy_reports/
 jobo_discovery_log/
+hot_leads/
+outreach_log/
 
 # Secrets
 .env
