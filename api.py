@@ -226,13 +226,14 @@ app.add_middleware(
 # route but /health requires a shared secret. Fails closed if the key isn't
 # configured, rather than silently running open.
 ADMIN_API_KEY = os.getenv("JOBBYO_ADMIN_API_KEY", "")
+# /run/user/subscribed used to be exempt here ("no shared secret to send"),
+# but both real callers now go through fire_subscribed_search() in
+# jobbyo-fastapi-server, which already sends X-Admin-Key -- and since
+# --assume-paid actually works now (see send_jobbyo.py's is_paid_user fix),
+# leaving this open would let anyone who knows a uid trigger a full paid
+# search + save + welcome email for them. Gated like every other route.
 PUBLIC_PATHS = {
     "/health",
-    # Called directly by jobbyo-fastapi-server's Stripe webhook the moment a
-    # user pays, before it has any shared secret to send -- keeping this key
-    # in sync between the two services has repeatedly drifted, so it's
-    # intentionally left open rather than gated.
-    "/run/user/subscribed",
 }
 
 @app.middleware("http")
