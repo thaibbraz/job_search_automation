@@ -50,6 +50,17 @@ def env_int(name, default):
         return default
 
 
+def env_float(name, default):
+    value = os.getenv(name)
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        return float(value)
+    except Exception:
+        print(f"WARNING: invalid float for {name}={value!r}; using {default}")
+        return default
+
+
 # --nogpt is intentionally detected before full CLI parsing so the script can
 # start without OPENAI_API_KEY when OpenAI is disabled. apply_cli_overrides()
 # normalizes the final value and supports env/CLI aliases.
@@ -210,13 +221,18 @@ ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 # inventory, running as a separate local service (see job-fit-engine repo).
 # Free/near-free per query (no Apify/Jobo per-call cost) so it's meant to run
 # BEFORE HC/Jobo, supplying candidates from data already paid for by the
-# crawler instead of a fresh paid search. Defaults OFF -- flip
-# JOBBYO_ENABLE_JFE_PREFETCH=true only after reviewing match quality; this
-# was built and tested by Claude while unsupervised and deliberately isn't
-# live for real users yet.
+# crawler instead of a fresh paid search.
 JFE_API_BASE = os.getenv("JOBBYO_JFE_API_BASE", "http://job-matching-api:80")
 JFE_MAX_ITEMS = env_int("JOBBYO_JFE_MAX_ITEMS", 30)
 ENABLE_JFE_PREFETCH = env_truthy("JOBBYO_ENABLE_JFE_PREFETCH", False)
+# Conservative estimate of what fraction of JFE's raw candidates survive the
+# AI review gate, used to size how much HC/Jobo still need to fetch after
+# JFE runs (see the "demand-aware pool sizing" block in find_jobs_for_user).
+# Real measured rate across 42 live users tested on 2026-08-26 was 28.1%;
+# kept a bit under that so a bad estimate under-shrinks HC/Jobo rather than
+# over-shrinks them -- any remaining shortfall is caught by round 2, which
+# recomputes jobs_needed from the real post-review count, not this estimate.
+JFE_ESTIMATED_APPROVAL_RATE = env_float("JOBBYO_JFE_ESTIMATED_APPROVAL_RATE", 0.25)
 
 # No-GPT mode: replace OpenAI search/review with more structured inventory from
 # Jobo ATS + HiringCafe, then use the same static URL, HTTP, duplicate, location,
@@ -6933,9 +6949,34 @@ def find_jobs_for_user(
         round_metrics["jfe_raw_results"] += _jfe_raw
         hc_inventory.extend(_jfe_jobs)
 
+    # Shrink the paid-source pull when JFE already covers part of today's
+    # quota. JFE_ESTIMATED_APPROVAL_RATE is deliberately conservative (real
+    # measured rate across 42 live users on 2026-08-26 was 28.1%; this uses
+    # 25% to avoid under-fetching) -- any shortfall from a bad estimate is
+    # self-corrected by round 2, which recomputes jobs_needed from the real
+    # post-review count rather than this estimate.
+    _hc_override = (source_limit_overrides or {}).get("hc")
+    _jobo_override = (source_limit_overrides or {}).get("jobo")
+    _skip_hc_jobo = False
+    if ENABLE_JFE_PREFETCH and _hc_override is None and _jobo_override is None:
+        _jfe_estimated_yield = round(len(hc_inventory) * JFE_ESTIMATED_APPROVAL_RATE)
+        _remaining_needed = max(0, jobs_needed - _jfe_estimated_yield)
+        _quota_fraction = min(1.0, _remaining_needed / max(TARGET_JOBS_PER_USER, 1))
+        print(
+            f"Demand-aware pool sizing: jobs_needed={jobs_needed}  "
+            f"jfe_candidates={len(hc_inventory)}  jfe_est_yield={_jfe_estimated_yield}  "
+            f"remaining_needed={_remaining_needed}  quota_fraction={_quota_fraction:.2f}"
+        )
+        if _remaining_needed <= 0:
+            _skip_hc_jobo = True
+            print("Demand-aware pool sizing: JFE estimated to cover full quota -- skipping HC/Jobo this round.")
+        else:
+            _hc_override = max(1, round(HIRING_CAFE_MAX_ITEMS * _quota_fraction))
+            _jobo_override = max(1, round(JOBO_ATS_MAX_ITEMS * _quota_fraction))
+
     # 1. Hiring Cafe
-    _hc_limit = (source_limit_overrides or {}).get("hc")
-    if ENABLE_HIRING_CAFE_PREFETCH and round_mode in ("first_round", "second_round"):
+    _hc_limit = _hc_override
+    if ENABLE_HIRING_CAFE_PREFETCH and not _skip_hc_jobo and round_mode in ("first_round", "second_round"):
         _hc_jobs, _hc_raw = fetch_hiring_cafe_for_user(
             automation=automation,
             search_contract=search_contract,
@@ -6949,8 +6990,8 @@ def find_jobs_for_user(
         hc_inventory.extend(_hc_jobs)
 
     # 2. Jobo ATS
-    _jobo_limit = (source_limit_overrides or {}).get("jobo")
-    if ENABLE_JOBO_ATS_PREFETCH and round_mode in ("first_round", "second_round", "minimum_viable"):
+    _jobo_limit = _jobo_override
+    if ENABLE_JOBO_ATS_PREFETCH and not _skip_hc_jobo and round_mode in ("first_round", "second_round", "minimum_viable"):
         _jobo_jobs, _jobo_raw = fetch_jobo_ats_for_user(
             automation=automation,
             search_contract=search_contract,
