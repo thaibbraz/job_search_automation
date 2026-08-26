@@ -206,6 +206,18 @@ JOBO_ATS_MAX_ITEMS = env_int("JOBBYO_JOBO_MAX_ITEMS", 90)  # raw results per cal
 JOBO_LOCAL_SCORE_MIN = env_int("JOBBYO_LOCAL_SCORE_MIN", 0)
 ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 
+# job-fit-engine: semantic search over jobbyo-job-crawler's own scraped
+# inventory, running as a separate local service (see job-fit-engine repo).
+# Free/near-free per query (no Apify/Jobo per-call cost) so it's meant to run
+# BEFORE HC/Jobo, supplying candidates from data already paid for by the
+# crawler instead of a fresh paid search. Defaults OFF -- flip
+# JOBBYO_ENABLE_JFE_PREFETCH=true only after reviewing match quality; this
+# was built and tested by Claude while unsupervised and deliberately isn't
+# live for real users yet.
+JFE_API_BASE = os.getenv("JOBBYO_JFE_API_BASE", "http://host.docker.internal:8080")
+JFE_MAX_ITEMS = env_int("JOBBYO_JFE_MAX_ITEMS", 30)
+ENABLE_JFE_PREFETCH = env_truthy("JOBBYO_ENABLE_JFE_PREFETCH", False)
+
 # No-GPT mode: replace OpenAI search/review with more structured inventory from
 # Jobo ATS + HiringCafe, then use the same static URL, HTTP, duplicate, location,
 # and posting pipeline. Defaults are intentionally higher because Jobbyo has a
@@ -266,6 +278,9 @@ MAX_BATCHES = FIRST_ROUND_BATCHES
 COST_PER_HC_RESULT = 0.00125
 # Jobo ATS: $49.99/month ÷ 100,000 jobs/month
 COST_PER_JOBO_RESULT = 0.0005
+# job-fit-engine: self-hosted, querying an already-indexed local Qdrant --
+# no per-call API cost, only the embedding call, negligible at this volume.
+COST_PER_JFE_RESULT = 0.0
 # OpenAI — gpt-4.1-mini + web_search per search batch (approx input+output tokens)
 COST_PER_OPENAI_SEARCH_CALL = 0.05
 # OpenAI — gpt-4.1 strict AI review per batch (approx ~1500 input + 200 output tokens)
@@ -6425,6 +6440,84 @@ def _log_jobo_discovery(raw_items):
         print(f"Jobo discovery tracking failed (non-fatal): {e}")
 
 
+def fetch_jfe_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
+    """Semantic search against job-fit-engine's index of jobbyo-job-crawler's
+    already-scraped jobs. Same (results, raw_count) contract as
+    fetch_hiring_cafe_for_user / fetch_jobo_ats_for_user so it can slot into
+    the same pre-fetch pool -- candidates from here go through the exact
+    same AI review as everything else, this only adds a cheaper source, it
+    doesn't bypass quality control.
+
+    Off by default (ENABLE_JFE_PREFETCH) until match quality has been
+    reviewed against real users.
+    """
+    if not ENABLE_JFE_PREFETCH:
+        return [], 0
+    limit = limit or JFE_MAX_ITEMS
+    keywords, locations, workplace_type = _build_hc_query(automation, search_contract, user_profile, persona)
+    if not keywords:
+        print("job-fit-engine: no keywords extracted — skipping prefetch")
+        return [], 0
+
+    query = ", ".join(keywords)
+    if locations:
+        query += " in " + " or ".join(locations)
+    elif workplace_type == "Remote":
+        query += " remote"
+
+    try:
+        resp = requests.post(
+            f"{JFE_API_BASE}/jobs/search",
+            params={"query": query, "search_type": "semantic", "max_results": limit},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        raw_results = resp.json().get("results", [])
+    except Exception as e:
+        print(f"job-fit-engine query failed (non-fatal, falls through to HC/Jobo): {e}")
+        return [], 0
+
+    print(f"job-fit-engine: query={query!r} -> {len(raw_results)} raw results")
+
+    avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
+    blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
+    seen_co_title = set()
+    results = []
+    for r in raw_results:
+        m = r.get("metadata") or {}
+        job_url = (m.get("job_url") or "").strip()
+        title = (m.get("title") or "").strip()
+        company = (m.get("company") or "").strip()
+        if not job_url or not title or not company:
+            continue
+        co = re.sub(r"\s+", " ", company.lower())
+        ti = re.sub(r"\s+", " ", title.lower())
+        if (co, ti) in seen_co_title:
+            continue
+        seen_co_title.add((co, ti))
+        norm = normalize_url(job_url)
+        if norm and norm in avoid_norm:
+            continue
+        if co and co in blocked_cos:
+            continue
+        results.append({
+            "job_url": job_url,
+            "title": title,
+            "company": company,
+            "description": (m.get("job_full_text") or m.get("description") or "")[:3000],
+            "location": m.get("location") or "",
+            "source": "job_fit_engine",
+            # Flat baseline like Jobo's -- the pool pre-grade AI review below
+            # does the real quality assessment uniformly across every
+            # source; a raw cosine similarity score isn't on the same scale
+            # as an AI review grade, so it isn't used as one.
+            "grade": 65,
+        })
+
+    print(f"job-fit-engine: {len(results)} jobs after local dedup/filtering")
+    return results, len(raw_results)
+
+
 def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_urls, rejected_companies, persona=None, limit=None):
     """Fetch and locally-score jobo.world ATS Jobs API candidates via direct API.
 
@@ -6755,9 +6848,11 @@ def find_jobs_for_user(
         "openai_pivot_calls": 0,
         "hc_raw_results": 0,
         "jobo_raw_results": 0,
+        "jfe_raw_results": 0,
         "persona_created_this_run": False,
         "contract_created_this_run": False,
         "source_funnel": {
+            "jfe":      {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
             "hc":       {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
             "jobo":     {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
             "openai":   {"sourced": 0, "static_pass": 0, "remote_pass": 0, "added": 0},
@@ -6821,8 +6916,22 @@ def find_jobs_for_user(
         apply_pivot(second_pivot)
 
     # Pre-fetch candidates once per user before the batch loop.
-    # Pool order: HC → Jobo → LinkedIn (last resort).  OpenAI fires only when pool empties.
+    # Pool order: JFE → HC → Jobo → LinkedIn (last resort).  OpenAI fires only when pool empties.
     hc_inventory = []   # variable name kept so the batch loop needs no changes
+
+    # 0. job-fit-engine (crawler-sourced, near-free) -- off by default, see
+    # ENABLE_JFE_PREFETCH.
+    if ENABLE_JFE_PREFETCH and round_mode in ("first_round", "second_round"):
+        _jfe_jobs, _jfe_raw = fetch_jfe_for_user(
+            automation=automation,
+            search_contract=search_contract,
+            user_profile=user_profile,
+            avoid_urls=avoid_urls,
+            rejected_companies=rejected_companies,
+            persona=persona,
+        )
+        round_metrics["jfe_raw_results"] += _jfe_raw
+        hc_inventory.extend(_jfe_jobs)
 
     # 1. Hiring Cafe
     _hc_limit = (source_limit_overrides or {}).get("hc")
@@ -7594,6 +7703,7 @@ def find_jobs_for_user(
         "openai_contract": round(COST_PER_CONTRACT_CREATE if round_metrics["contract_created_this_run"] else 0, 4),
         "apify_hc":        round(round_metrics["hc_raw_results"]      * COST_PER_HC_RESULT,        4),
         "jobo":            round(round_metrics["jobo_raw_results"]     * COST_PER_JOBO_RESULT,      4),
+        "jfe":             round(round_metrics["jfe_raw_results"]      * COST_PER_JFE_RESULT,       4),
     }
     round_metrics["cost_breakdown"] = _cost_breakdown
     round_metrics["estimated_cost_usd"] = round(sum(_cost_breakdown.values()), 4)
@@ -7716,14 +7826,33 @@ def resolve_requested_user(uid=None, email=None):
     # Paid status decides whether results are stored. Free candidates get the
     # jobs returned to them but nothing written to their queue.
     if ASSUME_PAID:
-        # Caller already knows this user just paid (e.g. the subscribe
-        # webhook) — /users/paid can lag a brand-new subscription by several
-        # seconds, so don't let that race misclassify them as free. Marked
-        # explicitly (not faked subscription/stripeId fields) so is_paid_user
-        # further down the pipeline actually honors this instead of still
-        # requiring fields this bare dict was never going to have.
+        # /run/user/subscribed (this endpoint's only real caller) is public
+        # -- no shared secret between the two services to gate on -- so
+        # don't just trust the caller's word for it. Verify against
+        # /users/paid for real, with a short retry: a brand-new subscription
+        # can lag /users/paid by a few seconds, which is the actual race
+        # --assume-paid exists for, not a reason to skip verification
+        # altogether. Marked explicitly (not faked subscription/stripeId
+        # fields) so is_paid_user further down the pipeline honors it
+        # without re-fetching.
+        verified = None
+        for attempt in range(4):
+            verified = next(
+                (u for u in (get_paid_users() or [])
+                 if u.get("uid") == uid
+                 or normalize_selected_email(u.get("email") or "") == normalize_selected_email(user["email"] or "")),
+                None,
+            )
+            if verified or attempt == 3:
+                break
+            time.sleep(5)
+
+        if not verified:
+            print(f"SKIP: --assume-paid given for {user['email']} but not found in /users/paid after retries.")
+            return None
+
         user["_assume_paid"] = True
-        print(f"Targeted run: {user['email']} — assumed paid, results will be saved.")
+        print(f"Targeted run: {user['email']} — verified paid, results will be saved.")
         return user
 
     paid_match = next(
