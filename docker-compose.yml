@@ -29,6 +29,14 @@ services:
       - ./creds:/app/creds:ro
     networks:
       - jobbyo-search-network
+      # job-fit-engine runs in its own separate docker-compose stack on
+      # this same host -- its API port is loopback-only (no public
+      # exposure, no auth in front of it), and host.docker.internal
+      # doesn't reach a 127.0.0.1-bound port from another container
+      # (confirmed by testing). This shared external network lets this
+      # container reach job-matching-api directly by container name --
+      # see JOBBYO_JFE_API_BASE in .env / send_jobbyo.py's fetch_jfe_for_user.
+      - jobbyo-shared
 
   caddy:
     image: caddy:2-alpine
@@ -51,6 +59,8 @@ services:
 networks:
   jobbyo-search-network:
     driver: bridge
+  jobbyo-shared:
+    external: true
 
 volumes:
   jobbyo-search-personas:

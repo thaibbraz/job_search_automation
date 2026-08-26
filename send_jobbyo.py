@@ -214,7 +214,7 @@ ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 # JOBBYO_ENABLE_JFE_PREFETCH=true only after reviewing match quality; this
 # was built and tested by Claude while unsupervised and deliberately isn't
 # live for real users yet.
-JFE_API_BASE = os.getenv("JOBBYO_JFE_API_BASE", "http://host.docker.internal:8080")
+JFE_API_BASE = os.getenv("JOBBYO_JFE_API_BASE", "http://job-matching-api:80")
 JFE_MAX_ITEMS = env_int("JOBBYO_JFE_MAX_ITEMS", 30)
 ENABLE_JFE_PREFETCH = env_truthy("JOBBYO_ENABLE_JFE_PREFETCH", False)
 
