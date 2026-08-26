@@ -10,24 +10,21 @@ reads job data back into the search pipeline.
 Requires GOOGLE_APPLICATION_CREDENTIALS pointing at a service account key
 with Storage write access to the bucket; if that's not configured, ingestion
 is skipped (logged, not fatal — this must never break a search run).
+
+No longer posts to Slack directly (this runs many times a day -- every
+scheduled pass, plus once per new paid signup). New links are recorded
+into meta/company_ingestion_today.json in the same bucket instead;
+jobbyo-job-crawler's daily crawler-numbers report reads that once a day
+and folds it into its one post.
 """
 
+import json
 import os
 import re
 from datetime import datetime
 
-import requests
-
 BUCKET_NAME = os.getenv("JOBBYO_DATA_BUCKET", "jobbyo-jobs-dev")
 PREFIX_TO_BOARDLINKS = "boardsLinks"
-
-# Same channel jobbyo-job-crawler posts its new-ATS first-scan notifications
-# to (see that repo's main_vm.py post_to_slack / SLACK_WEBHOOK_URL_NEW_ATS)
-# -- board-link ingestion is the same "new company/ATS coverage" story from
-# this project's side, so it belongs in that channel rather than
-# SLACK_WEBHOOK_URL_DAILY_RUN (run health/coverage) or
-# SLACK_WEBHOOK_URL_USER_DETAILS (per-user detail).
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_NEW_ATS", "")
 
 # (ats_name, url regex, board-URL template) — ats_name matches
 # jobbyo-job-crawler's src/URLs.py ATS_TO_URL keys so the crawler recognizes
@@ -178,37 +175,59 @@ def _get_existing_links(client, bucket_name, prefix):
     return existing
 
 
-def _post_slack_summary(added_by_ats):
-    """Best-effort ops notification — never raises, never blocks a run.
+ACCUMULATOR_BLOB_NAME = "meta/company_ingestion_today.json"
 
-    Only posts when something was actually added; a nightly "0 added" ping
-    is noise, not signal.
+
+def _record_for_daily_report(client, added_by_ats):
+    """No longer posts to Slack directly -- send_jobbyo.py runs many times a
+    day (every scheduled pass, plus once per new paid signup now that
+    /run/user/subscribed actually works), so a Slack post per run here was
+    firing constantly. Instead, accumulate today's counts into a small JSON
+    file in the same GCS bucket jobbyo-job-crawler already reads for its own
+    board-link data -- that repo's daily crawler-numbers report (once a day,
+    as "Erik") reads this and folds it into that one post, then clears it.
+    Best-effort; never raises, never blocks a run.
     """
-    if not added_by_ats or not SLACK_WEBHOOK_URL:
+    if not added_by_ats or client is None:
         return
-    total = sum(added_by_ats.values())
-    lines = "\n".join(f"  • {ats}: {count}" for ats, count in sorted(added_by_ats.items()))
-    text = f"Laras here — picked up {total} new board link(s) for the crawler bucket while going through today's jobs:\n{lines}"
     try:
-        requests.post(
-            SLACK_WEBHOOK_URL,
-            json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
-            timeout=10,
-        )
+        today = datetime.now().strftime("%Y-%m-%d")
+        blob = client.bucket(BUCKET_NAME).blob(ACCUMULATOR_BLOB_NAME)
+        try:
+            existing = json.loads(blob.download_as_text())
+        except Exception:
+            existing = {}
+        if existing.get("date") != today:
+            existing = {"date": today, "added_by_ats": {}}
+        totals = existing.setdefault("added_by_ats", {})
+        for ats, count in added_by_ats.items():
+            totals[ats] = totals.get(ats, 0) + count
+        blob.upload_from_string(json.dumps(existing, indent=2))
     except Exception as e:
-        print(f"  company_ingestion: Slack notification failed: {e}")
+        print(f"  company_ingestion: daily-report accumulator update failed (non-fatal): {e}")
+
+
+INGESTION_BLOB_NAME = "company_ingestion.txt"
 
 
 def ingest_new_companies(jobs):
     """Best-effort: pull board links out of this run's jobs and add any the
-    crawler doesn't already have to its bucket, one .txt file per ATS. Never
-    raises — a failure here should never take down a search run.
+    crawler doesn't already have to its bucket. Never raises — a failure
+    here should never take down a search run.
+
+    Writes into one stable file per ATS (INGESTION_BLOB_NAME), merging new
+    links in rather than creating a new timestamped file every run -- this
+    used to write a fresh {prefix}{timestamp}.txt on every call, which
+    could run many times a day (every scheduled pass, plus every new paid
+    signup), silently filling each ATS folder with dozens of near-empty
+    files over time.
 
     Returns {ats_name: count_added} for whatever the caller wants to do with
     it (e.g. logging); empty dict if nothing new was found or ingestion was
     skipped.
     """
     added_by_ats = {}
+    client = None
     try:
         by_ats = {}
         for job in jobs or []:
@@ -224,19 +243,27 @@ def ingest_new_companies(jobs):
         if client is None:
             return added_by_ats
 
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         for ats_name, links in by_ats.items():
             prefix = f"{PREFIX_TO_BOARDLINKS}/{ats_name}/"
             existing = _get_existing_links(client, BUCKET_NAME, prefix)
             new_links = sorted(links - existing)
             if not new_links:
                 continue
-            blob_name = f"{prefix}{timestamp}.txt"
-            client.bucket(BUCKET_NAME).blob(blob_name).upload_from_string("\n".join(new_links))
-            print(f"  company_ingestion: added {len(new_links)} new {ats_name} board link(s) -> {blob_name}")
+            blob = client.bucket(BUCKET_NAME).blob(f"{prefix}{INGESTION_BLOB_NAME}")
+            try:
+                current = blob.download_as_text()
+                current_links = {l.strip() for l in current.splitlines() if l.strip()}
+            except Exception:
+                current_links = set()
+            merged = sorted(current_links | set(new_links))
+            blob.upload_from_string("\n".join(merged))
+            print(
+                f"  company_ingestion: added {len(new_links)} new {ats_name} board link(s) "
+                f"-> {prefix}{INGESTION_BLOB_NAME} ({len(merged)} total)"
+            )
             added_by_ats[ats_name] = len(new_links)
     except Exception as e:
         print(f"  company_ingestion: skipped due to error: {e}")
 
-    _post_slack_summary(added_by_ats)
+    _record_for_daily_report(client, added_by_ats)
     return added_by_ats
