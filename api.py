@@ -10,7 +10,10 @@ POST /run/all                 Trigger send_jobbyo.py for all users
 POST /run/user                Trigger send_jobbyo.py for one user  (body: {uid?, email?})
 POST /run/user/subscribed     Run for one user, block until done, email their first matches
                                (body: {uid?, email?}) — called from the Stripe successful-
-                               checkout webhook, once payment is confirmed.
+                               checkout webhook, once payment is confirmed. On a successful
+                               send, also fires outreach.send_paid_welcome_email
+                               (PAID_WELCOME_DELAY_SECONDS later, in the background) — a
+                               personal follow-up note with a strategy PDF, no trial pitch.
 
 POST /email/all               Trigger approve_jobs.py for all users (promote + email)
 POST /email/user              Trigger approve_jobs.py for one user  (body: {email})
@@ -71,6 +74,12 @@ SUBSCRIBED_RUN_TIMEOUT_SECONDS = 1800
 # keeps the underlying subprocess going instead of abandoning it, but nothing
 # else holds a reference to that task once the request handler returns.
 _background_keepalive: set = set()
+
+# How long after the transactional welcome email (send_subscribed_jobs_email)
+# the personal follow-up note (outreach.send_paid_welcome_email, with the
+# strategy PDF) fires. Not zero -- landing at the same instant as the first
+# email reads as two automated messages, not one person following up.
+PAID_WELCOME_DELAY_SECONDS = int(os.getenv("JOBBYO_PAID_WELCOME_DELAY_SECONDS", "900"))
 
 # While testing, redirect every first-matches email here instead of to the
 # candidate. Unset in production so real candidates receive their own.
@@ -293,6 +302,42 @@ async def run_user(target: UserTarget, background_tasks: BackgroundTasks):
     return RunResponse(accepted=True, message=f"Top-up run started for {target.uid or target.email}.")
 
 
+def _fire_paid_welcome(uid: str, label: str) -> None:
+    """Fire-and-forget: waits PAID_WELCOME_DELAY_SECONDS, then sends the
+    personal follow-up note (outreach.send_paid_welcome_email) -- real
+    matches from build_context, persona coaching, strategy PDF, no trial
+    pitch. Best-effort; a failure here doesn't touch the transactional
+    welcome email that already went out."""
+
+    async def _run():
+        await asyncio.sleep(PAID_WELCOME_DELAY_SECONDS)
+        try:
+            import outreach
+
+            context = await asyncio.to_thread(outreach.build_context, uid)
+            body_text = await asyncio.to_thread(outreach.generate_paid_welcome_message, context)
+            try:
+                pdf_bytes = await asyncio.to_thread(outreach.generate_strategy_pdf, context)
+            except Exception as e:
+                print(f"[{label}] paid-welcome PDF generation failed (non-fatal, sends without it): {e}")
+                pdf_bytes = None
+            sent = await asyncio.to_thread(
+                outreach.send_paid_welcome_email, context, body_text, pdf_bytes,
+                TOP_JOBS_TEST_RECIPIENT or None,
+            )
+            if sent:
+                await asyncio.to_thread(
+                    _send_ops_only_slack_sync,
+                    f"Sent {context.get('first_name') or uid} a personal follow-up note with their strategy PDF.",
+                )
+        except Exception as e:
+            print(f"[{label}] paid-welcome send failed (non-fatal): {e}")
+
+    task = asyncio.ensure_future(_run())
+    _background_keepalive.add(task)
+    task.add_done_callback(_background_keepalive.discard)
+
+
 async def _finish_subscribed_run(
     target: "UserTarget", label: str, existing_logs: set, started_at: float, code: int
 ) -> SubscribedJobsResponse:
@@ -384,6 +429,9 @@ async def _finish_subscribed_run(
         )
     except Exception as exc:
         print(f"[{label}] email send failed: {exc}")
+
+    if emailed and resolved_uid:
+        _fire_paid_welcome(resolved_uid, label)
 
     # send_subscribed_jobs_email now always sends (a thin/empty batch just
     # gets a "still searching" variant instead of job cards -- see that
