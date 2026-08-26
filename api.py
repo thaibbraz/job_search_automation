@@ -8,12 +8,13 @@ GET  /run/status              Current run state + last run info
 
 POST /run/all                 Trigger send_jobbyo.py for all users
 POST /run/user                Trigger send_jobbyo.py for one user  (body: {uid?, email?})
-POST /run/user/subscribed     Run for one user, block until done, email their first matches
-                               (body: {uid?, email?}) — called from the Stripe successful-
-                               checkout webhook, once payment is confirmed. On a successful
-                               send, also fires outreach.send_paid_welcome_email
-                               (PAID_WELCOME_DELAY_SECONDS later, in the background) — a
-                               personal follow-up note with a strategy PDF, no trial pitch.
+POST /run/user/subscribed     Run for one user, block until done, then send the welcome
+                               email (body: {uid?, email?}) — called from the Stripe
+                               successful-checkout webhook, once payment is confirmed. The
+                               welcome email is outreach.send_paid_welcome_email: a personal
+                               note (persona coaching, one alternative angle, a market
+                               snapshot), all of that run's real matches, and a strategy PDF
+                               attached — no trial pitch, they're already a customer.
 
 POST /email/all               Trigger approve_jobs.py for all users (promote + email)
 POST /email/user              Trigger approve_jobs.py for one user  (body: {email})
@@ -74,12 +75,6 @@ SUBSCRIBED_RUN_TIMEOUT_SECONDS = 1800
 # keeps the underlying subprocess going instead of abandoning it, but nothing
 # else holds a reference to that task once the request handler returns.
 _background_keepalive: set = set()
-
-# How long after the transactional welcome email (send_subscribed_jobs_email)
-# the personal follow-up note (outreach.send_paid_welcome_email, with the
-# strategy PDF) fires. Not zero -- landing at the same instant as the first
-# email reads as two automated messages, not one person following up.
-PAID_WELCOME_DELAY_SECONDS = int(os.getenv("JOBBYO_PAID_WELCOME_DELAY_SECONDS", "900"))
 
 # While testing, redirect every first-matches email here instead of to the
 # candidate. Unset in production so real candidates receive their own.
@@ -302,42 +297,6 @@ async def run_user(target: UserTarget, background_tasks: BackgroundTasks):
     return RunResponse(accepted=True, message=f"Top-up run started for {target.uid or target.email}.")
 
 
-def _fire_paid_welcome(uid: str, label: str) -> None:
-    """Fire-and-forget: waits PAID_WELCOME_DELAY_SECONDS, then sends the
-    personal follow-up note (outreach.send_paid_welcome_email) -- real
-    matches from build_context, persona coaching, strategy PDF, no trial
-    pitch. Best-effort; a failure here doesn't touch the transactional
-    welcome email that already went out."""
-
-    async def _run():
-        await asyncio.sleep(PAID_WELCOME_DELAY_SECONDS)
-        try:
-            import outreach
-
-            context = await asyncio.to_thread(outreach.build_context, uid)
-            body_text = await asyncio.to_thread(outreach.generate_paid_welcome_message, context)
-            try:
-                pdf_bytes = await asyncio.to_thread(outreach.generate_strategy_pdf, context)
-            except Exception as e:
-                print(f"[{label}] paid-welcome PDF generation failed (non-fatal, sends without it): {e}")
-                pdf_bytes = None
-            sent = await asyncio.to_thread(
-                outreach.send_paid_welcome_email, context, body_text, pdf_bytes,
-                TOP_JOBS_TEST_RECIPIENT or None,
-            )
-            if sent:
-                await asyncio.to_thread(
-                    _send_ops_only_slack_sync,
-                    f"Sent {context.get('first_name') or uid} a personal follow-up note with their strategy PDF.",
-                )
-        except Exception as e:
-            print(f"[{label}] paid-welcome send failed (non-fatal): {e}")
-
-    task = asyncio.ensure_future(_run())
-    _background_keepalive.add(task)
-    task.add_done_callback(_background_keepalive.discard)
-
-
 async def _finish_subscribed_run(
     target: "UserTarget", label: str, existing_logs: set, started_at: float, code: int
 ) -> SubscribedJobsResponse:
@@ -414,37 +373,38 @@ async def _finish_subscribed_run(
     emailed = False
     profile = {}
     try:
-        import send_jobbyo, approve_jobs
+        import send_jobbyo, approve_jobs, outreach
 
         profile = send_jobbyo.get_user_profile(resolved_uid) or {}
         recipient = TOP_JOBS_TEST_RECIPIENT or resolved_email or target.email
+
+        # The welcome email itself IS the persona-coaching + strategy-PDF
+        # note now (was a separate, later follow-up) -- build_context's own
+        # sample_jobs caps at 3 for the follow-up-note use case, so override
+        # it with the full, just-found jobs_added list here instead of
+        # re-deriving a capped one from automation.selectedJobs.
+        context = await asyncio.to_thread(outreach.build_context, resolved_uid)
+        context["sample_jobs"] = jobs_added
+        body_text = await asyncio.to_thread(outreach.generate_paid_welcome_message, context)
+        try:
+            pdf_bytes = await asyncio.to_thread(outreach.generate_strategy_pdf, context)
+        except Exception as e:
+            print(f"[{label}] welcome PDF generation failed (non-fatal, sends without it): {e}")
+            pdf_bytes = None
+
         emailed = bool(
             await asyncio.to_thread(
-                approve_jobs.send_subscribed_jobs_email,
-                profile,
-                jobs_added,
-                send_jobbyo.TARGET_JOBS_PER_USER,
-                recipient,
+                outreach.send_paid_welcome_email, context, body_text, pdf_bytes, recipient,
             )
         )
     except Exception as exc:
         print(f"[{label}] email send failed: {exc}")
 
-    if emailed and resolved_uid:
-        _fire_paid_welcome(resolved_uid, label)
-
-    # send_subscribed_jobs_email now always sends (a thin/empty batch just
-    # gets a "still searching" variant instead of job cards -- see that
-    # function's docstring), so emailed=False here means an actual send
-    # failure (Brevo error, missing key), not a thin-batch skip.
-    below_minimum = len(jobs_added) < approve_jobs.MIN_JOBS_TO_NOTIFY_SUBSCRIBED
-    suffix = " Emailed (no matches yet)." if emailed and below_minimum else (" Emailed." if emailed else " Email failed.")
-
     recipient_for_slack = TOP_JOBS_TEST_RECIPIENT or resolved_email or target.email
     who = profile.get("displayName") or recipient_for_slack
     if emailed:
         job_word = "job" if len(jobs_added) == 1 else "jobs"
-        slack_text = f"Found {len(jobs_added)} {job_word} for {who} and just sent them a message with the details."
+        slack_text = f"Found {len(jobs_added)} {job_word} for {who} and sent them a personal note with their strategy PDF."
     else:
         slack_text = f"Found {len(jobs_added)} job(s) for {who}, but the email failed to send — worth a look."
     await asyncio.to_thread(_send_ops_only_slack_sync, slack_text)
@@ -462,7 +422,8 @@ async def _finish_subscribed_run(
     ]
     return SubscribedJobsResponse(
         accepted=True,
-        message=f"Found {len(jobs_added)} job(s) for {target.uid or target.email}.{suffix}",
+        message=f"Found {len(jobs_added)} job(s) for {target.uid or target.email}."
+        + (" Emailed." if emailed else " Email failed."),
         duration_seconds=duration_seconds,
         jobs_found=len(jobs_added),
         jobs=response_jobs,
