@@ -870,7 +870,7 @@ def send_prospect_outreach_email(context, body_text, pdf_bytes=None, override_em
             grade = j.get("grade")
             match_str = f" — {int(grade)}% match" if grade is not None else ""
             label = f"{title} at {company}{match_str}"
-            row = f'<a href="{url}" style="color:#3A56E2;text-decoration:none;">{label}</a>' if url else label
+            row = f'<a href="{url}" style="color:#3A56E2;text-decoration:underline;">{label}</a>' if url else label
             lines += f'<li style="margin-bottom:6px;">{row}</li>'
         preview_block = f'<ul style="margin:0 0 14px 0;padding-left:20px;">{lines}</ul>'
     else:
@@ -963,7 +963,7 @@ def send_paid_welcome_email(context, body_text, pdf_bytes=None, override_email=N
             grade = j.get("grade")
             match_str = f" — {int(grade)}% match" if grade is not None else ""
             label = f"{title} at {company}{match_str}"
-            row = f'<a href="{url}" style="color:#3A56E2;text-decoration:none;">{label}</a>' if url else label
+            row = f'<a href="{url}" style="color:#3A56E2;text-decoration:underline;">{label}</a>' if url else label
             lines += f'<li style="margin-bottom:6px;">{row}</li>'
         preview_block = f'<ul style="margin:0 0 14px 0;padding-left:20px;">{lines}</ul>'
     else:
