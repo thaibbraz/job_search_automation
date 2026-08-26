@@ -1,5 +1,9 @@
 """outreach.py — personalized, conversational follow-up to a candidate who
-opened their subscribed-search email.
+opened their subscribed-search email, plus two related sends:
+  - send_prospect_outreach_email: a hot lead who hasn't subscribed yet.
+  - send_paid_welcome_email: someone who just subscribed, alongside their
+    real matches -- same personal-read format as the hot-lead nudge, minus
+    any trial/pricing pitch since they're already a customer.
 
 Pulls the candidate's own stated preferences + a few of their actual matched
 jobs, has the LLM write a short first-person note in Jobbyo's voice (not
@@ -10,6 +14,7 @@ added once this is confirmed good.
 
 Usage:
     python3 outreach.py --uid <uid>
+    python3 outreach.py --uid <uid> --paid-welcome
     python3 outreach.py --email <email>
 """
 
@@ -505,6 +510,99 @@ def generate_message(context):
     return text
 
 
+PAID_WELCOME_PROMPT_TEMPLATE = """You are writing a short, casual, first-person email as "Jobbyo" -- a job \
+search service, not a company sending a marketing blast. This person just \
+subscribed and their first search already ran. This is a personal note \
+that goes alongside their real matches, not a sales message -- they're \
+already a customer, so there is nothing to sell them here.
+
+The goal of THIS email is to show them you already understand their \
+background: a real read on their profile, one alternative angle worth \
+considering, and an honest sense of what the market looks like for them \
+right now. You have real research below (strengths, honest blind spots, a \
+market snapshot grounded in current data, one recommendation, and \
+alternative paths). Draw from THAT actual research rather than inventing \
+your own take -- pick the pieces that would land hardest for this specific \
+person, and put them in your own words, casually. This should feel like a \
+genuinely sharp, personal read, not a report.
+
+After your text, the email continues with their actual job matches and \
+then a pointer to a more detailed PDF -- you don't need to write that \
+part, it's added separately. Just end your text with ONE short, casual \
+line that naturally leads into "here's what I found for you" (you don't \
+have the actual job list, so don't name specific companies or roles in \
+this transition line, just gesture at it).
+
+STRICT RULES:
+- Write like you're dashing off a quick, genuine note to someone, not \
+writing a professional memo. Contractions, everyday words, short \
+sentences. Skip corporate/consultant phrasing entirely -- no "leadership \
+scope", "P&L", "positioning", "market reality" as phrases; say the same \
+thing the way you'd actually say it out loud to a friend.
+- Never say "AI", "artificial intelligence", "bot", "automated", or anything \
+that frames you as software. Write like a person who has been working on \
+their search.
+- Never use an em dash (—) anywhere. Use a period, comma, or "and" instead.
+- Do not invent your own statistics or market claims -- the market snapshot \
+below is already grounded in real research; paraphrase it loosely and \
+casually (a rough number or company name is great, don't invent new ones \
+on top of it).
+- Reference their actual stated preferences (given below) so it's obviously \
+personal, not generic.
+- If there's a real blind spot below (something honestly working against \
+them), it is more useful to raise it gently than to avoid it -- don't be \
+harsh, but don't soften it into nothing either. Say it plainly, not \
+diplomatically.
+- Pull ONE alternative path from the notes below (not invented fresh) and \
+say briefly why it fits them specifically.
+- Work in ONE concrete detail from the market snapshot below (a rough \
+number of openings, a company actively hiring, or the comp range) so it \
+reads as real research, not a vague gesture at "the market."
+- Do NOT mention starting a trial, subscribing, upgrading, or pricing in \
+any way -- they are already a paying customer, so anything sales-shaped \
+here reads as tone-deaf.
+- Do NOT offer to hop on a call, schedule time, or anything implying you \
+personally can meet with them.
+- Do NOT write a sign-off, closing line, or signature ("Jobbyo", "Best,", \
+etc.) -- the email ends right after your transition line. That part is \
+added separately.
+- Plain, short paragraphs. Under 170 words total. No bullet points, no bold, \
+no emoji, no subject line -- just the body text.
+
+CANDIDATE:
+First name: {first_name}
+Target job title(s): {job_titles}
+Minimum acceptable salary: {min_salary}
+Location preference: {location}
+
+HOW WE'RE READING THEIR PROFILE (persona notes):
+{persona_summary}
+
+Write the email body now."""
+
+
+def generate_paid_welcome_message(context):
+    """Same idea as generate_prospect_message, for someone who already
+    subscribed -- build_context(uid) already has their real job matches, so
+    there's no "taste of what's out there" framing and no trial pitch, just
+    the personal read plus a transition into the real matches appended by
+    send_paid_welcome_email."""
+    prompt = PAID_WELCOME_PROMPT_TEMPLATE.format(
+        first_name=context["first_name"],
+        job_titles=context["job_titles"],
+        min_salary=context["min_salary"],
+        location=context["location"],
+        persona_summary=context["persona_summary"],
+    )
+    response = send_jobbyo.responses_create(
+        model=send_jobbyo.SEARCH_MODEL,
+        input=prompt,
+    )
+    text = (response.output_text or "").strip()
+    text = text.replace("—", ",")
+    return text
+
+
 import html as _html
 import re as _re
 
@@ -843,6 +941,96 @@ def send_prospect_outreach_email(context, body_text, pdf_bytes=None, override_em
     return True
 
 
+def send_paid_welcome_email(context, body_text, pdf_bytes=None, override_email=None, subject=None):
+    """Paid-user counterpart to send_prospect_outreach_email: same personal-
+    note framing and PDF-contents teaser, but the job list is their real
+    matches (context["sample_jobs"] from build_context, already saved to
+    their queue) and there's no trial CTA -- they're already subscribed, so
+    the closing just points at reviewing the queue instead of selling
+    anything."""
+    email = override_email or context["profile"].get("email") or ""
+    first_name = context["first_name"]
+    sample_jobs = context.get("sample_jobs") or []
+
+    paragraphs = "".join(f'<p style="margin:0 0 14px 0;">{p}</p>' for p in body_text.split("\n\n") if p.strip())
+
+    if sample_jobs:
+        lines = ""
+        for j in sample_jobs:
+            title = j.get("title") or ""
+            company = j.get("company") or ""
+            url = j.get("job_url") or j.get("url") or ""
+            grade = j.get("grade")
+            match_str = f" — {int(grade)}% match" if grade is not None else ""
+            label = f"{title} at {company}{match_str}"
+            row = f'<a href="{url}" style="color:#3A56E2;text-decoration:none;">{label}</a>' if url else label
+            lines += f'<li style="margin-bottom:6px;">{row}</li>'
+        preview_block = f'<ul style="margin:0 0 14px 0;padding-left:20px;">{lines}</ul>'
+    else:
+        preview_block = (
+            '<p style="margin:0 0 14px 0;color:#4b5563;font-style:italic;">'
+            "Still digging up more for you, they'll land in your queue as soon as I find them."
+            "</p>"
+        )
+
+    pdf_block = ""
+    if pdf_bytes:
+        pdf_items = "".join(f'<li style="margin-bottom:4px;">{item}</li>' for item in PDF_CONTENTS_BLURB)
+        pdf_block = (
+            '<p style="margin:14px 0 6px 0;">There\'s more where that came from, plus the full picture on '
+            'where you stand, in the PDF I put together:</p>'
+            f'<ul style="margin:0 0 14px 0;padding-left:20px;color:#374151;">{pdf_items}</ul>'
+        )
+
+    closing = (
+        '<p style="margin:14px 0 0 0;">These are already sitting in your '
+        '<a href="https://app.jobbyo.ai/auto-apply" style="color:#3A56E2;">queue</a> to review.</p>'
+        '<p style="margin:16px 0 0 0;">Jobbyo</p>'
+    )
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.6;color:#111111;margin:0;padding:16px;">
+{paragraphs}
+{preview_block}
+{pdf_block}
+{closing}
+</body>
+</html>"""
+
+    payload = {
+        "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+        "to": [{"email": email, "name": first_name}],
+        "cc": [{"email": TEAM_CC_EMAIL, "name": "Thiago"}],
+        "subject": subject or f"{first_name}, here's what I found for you",
+        "htmlContent": html_content,
+    }
+
+    if pdf_bytes:
+        import base64
+        payload["attachment"] = [{
+            "content": base64.b64encode(pdf_bytes).decode("ascii"),
+            "name": f"{first_name.lower()}-job-search-strategy.pdf",
+        }]
+
+    if not BREVO_API_KEY:
+        print("BREVO_API_KEY not set — cannot send.")
+        return False
+
+    res = requests.post(
+        f"{BREVO_API_URL}/smtp/email",
+        headers={"accept": "application/json", "api-key": BREVO_API_KEY, "content-type": "application/json"},
+        json=payload,
+        timeout=30,
+    )
+    if res.status_code >= 400:
+        print(f"Brevo error {res.status_code}: {res.text[:200]}")
+        return False
+    print(f"Paid welcome email sent → {email}{' (with PDF)' if pdf_bytes else ''}")
+    return True
+
+
 def main():
     args = sys.argv[1:]
     uid, email, send_to = None, None, None
@@ -852,6 +1040,10 @@ def main():
         email = args[args.index("--email") + 1]
     if "--send-to" in args:
         send_to = args[args.index("--send-to") + 1]
+    # --paid-welcome: the new-subscriber note (personal read + real matches
+    # + PDF, no trial pitch). Default (no flag) is the original follow-up
+    # to someone who already opened their welcome email.
+    paid_welcome = "--paid-welcome" in args
 
     if not uid and email:
         looked_up = send_jobbyo.api_get(f"{send_jobbyo.BASE_URL}/users/email/{email}/") or {}
@@ -865,17 +1057,22 @@ def main():
     print("=== Context ===")
     print(context)
 
-    body_text = generate_message(context)
-    print("\n=== Generated message ===")
-    print(body_text)
-
     pdf_bytes = generate_strategy_pdf(context)
     print(f"\n=== PDF generated: {bool(pdf_bytes)} ===")
 
     # --send-to redirects delivery without changing whose data the content
     # was generated from -- e.g. reviewing what a real user's email would
     # say without actually sending it to that real person.
-    send_outreach_email(context, body_text, pdf_bytes=pdf_bytes, override_email=send_to or email)
+    if paid_welcome:
+        body_text = generate_paid_welcome_message(context)
+        print("\n=== Generated message ===")
+        print(body_text)
+        send_paid_welcome_email(context, body_text, pdf_bytes=pdf_bytes, override_email=send_to or email)
+    else:
+        body_text = generate_message(context)
+        print("\n=== Generated message ===")
+        print(body_text)
+        send_outreach_email(context, body_text, pdf_bytes=pdf_bytes, override_email=send_to or email)
 
 
 if __name__ == "__main__":
