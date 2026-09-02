@@ -8415,12 +8415,17 @@ def send_daily_report(result):
         print(f"Daily report send failed ({to}): {e}")
 
 
-def send_slack_run_report(results_by_uid):
+def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
     run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     users = []
     total_found = 0
     total_needed = 0
     manual_search = []
+    # Per-source coverage -- "covered" means this user got >=1 job from that source this
+    # run, not that the source was merely queried. No dollar figures here on purpose:
+    # cost is internal-only, this report goes to a Slack channel with wider visibility.
+    SOURCE_KEYS = ("jfe", "jobo", "hc")
+    source_covered = {k: 0 for k in SOURCE_KEYS}
 
     for uid, r in results_by_uid.items():
         user_profile = r.get("user_profile") or {}
@@ -8438,6 +8443,11 @@ def send_slack_run_report(results_by_uid):
         total_found += jobs_found
         total_needed += max(0, TARGET_JOBS_PER_USER - pending)
 
+        funnel = (r.get("round_metrics") or {}).get("source_funnel", {})
+        for src in SOURCE_KEYS:
+            if (funnel.get(src) or {}).get("added", 0) > 0:
+                source_covered[src] += 1
+
         entry = {
             "uid": uid,
             "name": name,
@@ -8453,6 +8463,17 @@ def send_slack_run_report(results_by_uid):
         if needs_manual:
             manual_search.append({"name": name, "email": email, "keywords": keywords[:3], "location": location_places})
 
+    total_users = len(users)
+    source_coverage = {
+        src: {
+            "covered": source_covered[src],
+            "total": total_users,
+            "pct": round(100 * source_covered[src] / total_users, 1) if total_users else 0.0,
+        }
+        for src in SOURCE_KEYS
+    }
+    companies_added_by_ats = companies_added_by_ats or {}
+
     payload = {
         "run_date": run_date,
         "total_jobs_found": total_found,
@@ -8461,6 +8482,9 @@ def send_slack_run_report(results_by_uid):
         "emails_sent": len(users),
         "run_duration_minutes": 0,
         "user_results": users,
+        "companies_added_total": sum(companies_added_by_ats.values()),
+        "companies_added_by_ats": companies_added_by_ats,
+        "source_coverage": source_coverage,
     }
 
     try:
@@ -8936,9 +8960,27 @@ def main():
                     _merged_rm["estimated_cost_usd"] = round(sum(_bd.values()), 4)
                 results_by_uid[uid]["round_metrics"] = _merged_rm
 
+    # Company ingestion runs BEFORE the Slack report now (used to run after) so the
+    # report can include how many new companies were added this run.
+    _companies_added_by_ats = {}
+    try:
+        import company_ingestion
+        all_jobs_this_run = [
+            j for merged in results_by_uid.values() for j in (merged.get("jobs_added") or [])
+        ]
+        # Matched jobs (all sources) plus every raw Jobo/HC item this run
+        # saw, including ones filtering discarded -- the wider net the old
+        # jobo_discovery_log/backfill approach was meant to cover, now
+        # applied to both prefetch sources instead of just Jobo.
+        _companies_added_by_ats = company_ingestion.ingest_new_companies(
+            all_jobs_this_run + _JOBO_DISCOVERY_ITEMS + _HC_DISCOVERY_ITEMS
+        ) or {}
+    except Exception as e:
+        print(f"WARNING: company ingestion skipped: {e}")
+
     # Slack team summary — only for full runs, not single-user tests.
     if not (SINGLE_USER_EMAIL or SINGLE_USER_EMAILS or SINGLE_USER_UID):
-        send_slack_run_report(results_by_uid)
+        send_slack_run_report(results_by_uid, _companies_added_by_ats)
 
     total_new = sum(len(v.get("jobs_added") or []) for v in results_by_uid.values())
     total_rejected = sum(len(r.get("jobs_rejected_by_review") or []) for r in all_results)
@@ -9015,19 +9057,8 @@ def main():
 
     print()
     print(f"Users: {len(results_by_uid)}  ·  Jobs added: {total_new}  ·  Rejected: {total_rejected}")
-
-    try:
-        import company_ingestion
-        all_jobs_this_run = [
-            j for merged in results_by_uid.values() for j in (merged.get("jobs_added") or [])
-        ]
-        # Matched jobs (all sources) plus every raw Jobo/HC item this run
-        # saw, including ones filtering discarded -- the wider net the old
-        # jobo_discovery_log/backfill approach was meant to cover, now
-        # applied to both prefetch sources instead of just Jobo.
-        company_ingestion.ingest_new_companies(all_jobs_this_run + _JOBO_DISCOVERY_ITEMS + _HC_DISCOVERY_ITEMS)
-    except Exception as e:
-        print(f"WARNING: company ingestion skipped: {e}")
+    if _companies_added_by_ats:
+        print(f"Companies added to job-crawler: {sum(_companies_added_by_ats.values())} {_companies_added_by_ats}")
 
 
 if __name__ == "__main__":
