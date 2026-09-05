@@ -8110,6 +8110,17 @@ def run_round(
                 accumulated_results.append(result)
                 save_run_log(accumulated_results)
 
+            # Invalidate the cached automation snapshot: it's from before this
+            # round posted anything, so if this user runs again in a later
+            # round, find_jobs_for_user's own pending_today_before would still
+            # read the pre-this-round count and think the full quota is still
+            # needed -- stacking another ~10 jobs on top instead of topping up
+            # the remainder. Forces the next round to re-fetch the real,
+            # current count from the backend. (Real-world case: a user got
+            # +19 jobs in one run -- HC 10 + Jobo 9 -- because round 2 never
+            # saw round 1's additions.)
+            user.pop("_automation_cache", None)
+
         except Exception as e:
             print(f"FAILED USER {email}: {e}")
 
