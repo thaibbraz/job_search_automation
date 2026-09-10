@@ -6,12 +6,20 @@
 # fails with 401.
 #
 # Flags:
-#   --email        also promote pending_review jobs and email users this pass
-#   --report       also post the day's coverage % to Slack this pass
-#   --skip-search  don't trigger /run/all this pass -- for a pass that only
-#                  needs to send what the previous passes already found
-#                  (e.g. the 10:00 CEST daily-report send), so it doesn't
-#                  also kick off a redundant full search first
+#   --email          also promote pending_review jobs and email users this pass
+#   --report         also post the day's coverage % to Slack this pass
+#   --skip-search    don't trigger /run/all this pass -- for a pass that only
+#                    needs to send what the previous passes already found
+#                    (e.g. the 10:00 CEST daily-report send), so it doesn't
+#                    also kick off a redundant full search first
+#   --health-check   run the Interview Pipeline candidate health check (AI
+#                    reads each candidate's inbox tone + 1:1 recency, flags
+#                    healthy/at_risk/inactive, auto-tasks Tika on at_risk/
+#                    inactive -- skipped if they already have an open task --
+#                    and posts a summary to Slack). Lives on the separate
+#                    main fastapi-server deploy, not this search API --
+#                    best-effort: logs and continues on failure rather than
+#                    failing the whole pass.
 #
 # Three passes a day, driven by systemd timers:
 #   19:00 Europe/Madrid — plain search, builds up the queue
@@ -34,15 +42,20 @@ ADMIN_HEADER=(-H "X-Admin-Key: ${ADMIN_API_KEY}")
 # Run health alerts go to the same channel as the coverage report (api.py's
 # /coverage/today), not the per-user emailed/missing channel.
 SLACK_WEBHOOK_URL="${SLACK_WEBHOOK_URL_DAILY_RUN:-}"
+# The Interview Pipeline candidate health check lives on the separate main
+# fastapi-server deployment, not this search API.
+MAIN_API_URL="${JOBBYO_MAIN_API_URL:-https://fastapi-service-03-160893319817.europe-southwest1.run.app}"
 
 WITH_EMAIL=0
 WITH_REPORT=0
 SKIP_SEARCH=0
+WITH_HEALTH_CHECK=0
 for arg in "$@"; do
   case "$arg" in
     --email) WITH_EMAIL=1 ;;
     --report) WITH_REPORT=1 ;;
     --skip-search) SKIP_SEARCH=1 ;;
+    --health-check) WITH_HEALTH_CHECK=1 ;;
   esac
 done
 
@@ -141,4 +154,13 @@ if [ "$WITH_REPORT" = "1" ]; then
   curl -sf "${ADMIN_HEADER[@]}" "${API_URL}/coverage/today?send_slack=true" > /dev/null || log "Coverage report request failed"
 fi
 
-log "Pass complete (email=${WITH_EMAIL} report=${WITH_REPORT})."
+if [ "$WITH_HEALTH_CHECK" = "1" ]; then
+  log "Running candidate health check (Interview Pipeline)..."
+  # No admin key -- this lives on the separate main fastapi-server, not this
+  # search API. Long --max-time: one Nylas fetch + one Claude call per active
+  # candidate, run sequentially.
+  curl -sf --max-time 600 -X POST "${MAIN_API_URL}/api/pipeline/daily-health-check" > /dev/null \
+    || log "Candidate health check request failed (non-fatal)"
+fi
+
+log "Pass complete (email=${WITH_EMAIL} report=${WITH_REPORT} health_check=${WITH_HEALTH_CHECK})."
