@@ -1631,7 +1631,7 @@ def static_check(
     if domain == "jobs.workable.com" and "/view/" not in path_lower:
         return False, "career_homepage"
 
-    is_prefetch_job = str(job.get("source", "")).startswith(("hiring_cafe", "jobo_ats"))
+    is_prefetch_job = str(job.get("source", "")).startswith(("hiring_cafe", "jobo_ats", "job_fit_engine"))
     if not is_prefetch_job and not has_job_identifier(url) and not looks_like_specific_company_job_url(url):
         return False, "generic_or_homepage_url"
 
@@ -5908,7 +5908,7 @@ def nogpt_persona_fit_score(job, automation=None, persona=None, search_contract=
 
     if job.get("source"):
         source = str(job.get("source", "")).lower()
-        if source.startswith(("jobo_ats", "hiring_cafe")):
+        if source.startswith(("jobo_ats", "hiring_cafe", "job_fit_engine")):
             score += 5
             reasons.append("structured_source")
 
@@ -6691,12 +6691,13 @@ def classify_job_source(source_str):
     s = str(source_str or "").lower()
     if s.startswith("hiring_cafe"):     return "hc"
     if s.startswith("jobo_ats"):        return "jobo"
+    if s.startswith("job_fit_engine"):  return "jfe"
     if "direct_url_resolver" in s:      return "resolver"
     return "openai"
 
 
 def compute_source_success_rates(round_results):
-    totals = {src: {"sourced": 0, "added": 0} for src in ("hc", "jobo", "openai", "resolver")}
+    totals = {src: {"sourced": 0, "added": 0} for src in ("hc", "jobo", "jfe", "openai", "resolver")}
     for r in (round_results or []):
         funnel = (r.get("round_metrics") or {}).get("source_funnel", {})
         for src, counts in funnel.items():
