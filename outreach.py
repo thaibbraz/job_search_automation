@@ -985,6 +985,9 @@ def send_paid_welcome_email(context, body_text, pdf_bytes=None, override_email=N
     closing = (
         '<p style="margin:14px 0 0 0;">These are already sitting in your '
         '<a href="https://app.jobbyo.ai/auto-apply" style="color:#3A56E2;">queue</a> to review.</p>'
+        '<p style="margin:14px 0 0 0;">One thing I\'d really recommend: get a 1:1 on the calendar soon with our '
+        'job search specialists and career coaches, it makes a real difference starting your search off strong. '
+        '<a href="https://calendar.app.google/kQqE5ejNVw3rjgv67" style="color:#3A56E2;">Grab a time here</a>.</p>'
         '<p style="margin:16px 0 0 0;">Jobbyo</p>'
     )
 
