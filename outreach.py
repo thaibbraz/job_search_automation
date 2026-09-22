@@ -985,9 +985,18 @@ def send_paid_welcome_email(context, body_text, pdf_bytes=None, override_email=N
     closing = (
         '<p style="margin:14px 0 0 0;">These are already sitting in your '
         '<a href="https://app.jobbyo.ai/auto-apply" style="color:#3A56E2;">queue</a> to review.</p>'
-        '<p style="margin:14px 0 0 0;">One thing I\'d really recommend: get a 1:1 on the calendar soon with our '
-        'job search specialists and career coaches, it makes a real difference starting your search off strong. '
-        '<a href="https://calendar.app.google/kQqE5ejNVw3rjgv67" style="color:#3A56E2;">Grab a time here</a>.</p>'
+        '<p style="margin:20px 0 0 0;font-weight:bold;">⚠️ Crucial Next Step: Book Your 1:1 Strategy Call</p>'
+        '<p style="margin:10px 0 0 0;">Looking over a PDF is a great start, but reviewing these takeaways '
+        'together on a live 1:1 Strategy Call is where the real breakthrough happens.</p>'
+        '<p style="margin:14px 0 0 0;">Your Career Strategist will walk you step-by-step through your '
+        'diagnostic, map out your positioning, overhaul your target filters, so you don\'t waste any time '
+        'getting closer to your next role.</p>'
+        '<p style="margin:14px 0 0 0;">We normally charge $129 for this 1:1 Executive Strategy Call, but '
+        'because we want to make sure your campaign launches with total clarity, we\'re waiving that fee '
+        'for you today.</p>'
+        '<p style="margin:14px 0 0 0;">Let\'s make sure you get the best possible start. Grab a 1:1 time on '
+        '<a href="https://calendar.app.google/N1kkofZxeHDR943z5" style="color:#3A56E2;">our calendar here</a> '
+        'before your strategy slot expires.</p>'
         '<p style="margin:16px 0 0 0;">Jobbyo</p>'
     )
 
