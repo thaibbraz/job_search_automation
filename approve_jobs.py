@@ -460,11 +460,46 @@ def send_subscribed_jobs_email(user_profile, jobs, target_count, override_email=
         return False
 
 
+def _rejected_today_with_feedback(automation):
+    """Jobs rejected TODAY (by rejectedAt, not addedAt -- a job can be added
+    any day and rejected later) that came with a reason. rejectedAt is set
+    by jobbyo-fastapi-server's update_job_status_by_user_id the moment a
+    rejection is saved, so this is "since the last daily report", same
+    grain as the rest of this pass. Separate from process_user's own
+    rejected_today (that one's addedAt-scoped -- "added today, already
+    rejected" -- a different, narrower question)."""
+    today = datetime.now(timezone.utc).date()
+    out = []
+    for job in automation.get("selectedJobs") or []:
+        if not isinstance(job, dict) or str(job.get("status", "")).lower() != "rejected":
+            continue
+        feedback = str(job.get("feedback") or "").strip()
+        rejected_at = job.get("rejectedAt")
+        if feedback and rejected_at and is_same_utc_date(rejected_at, today):
+            out.append(job)
+    return out
+
+
 def send_email(user_profile, automation, jobs, override_email=None):
     """Send the daily report email directly via Brevo."""
     email = override_email or user_profile.get("email") or ""
     name = user_profile.get("displayName") or (user_profile.get("email") or "").split("@")[0]
     first_name = name.split()[0] if name else "there"
+
+    preferences_html = ""
+    rejected_with_reason = _rejected_today_with_feedback(automation)
+    if rejected_with_reason:
+        n = len(rejected_with_reason)
+        quotes = "; ".join(
+            f'&ldquo;{str(j.get("feedback") or "").strip()[:80]}&rdquo;' for j in rejected_with_reason[:3]
+        )
+        job_word, verb = ("job", "wasn't") if n == 1 else ("jobs", "weren't")
+        preferences_html = f"""
+    <div style="margin:0 0 28px 0;padding:16px 18px;background:#f0f9ff;border-radius:8px;border-left:3px solid #3A56E2;">
+      <p style="margin:0;font-size:13px;color:#374151;line-height:1.7;font-family:Arial,sans-serif;">
+        You told us why {n} {job_word} {verb} right ({quotes}) &mdash; we've sharpened your preferences with that in mind.
+      </p>
+    </div>"""
 
     jobs_html = ""
     for j in jobs:
@@ -500,7 +535,7 @@ def send_email(user_profile, automation, jobs, override_email=None):
     <p style="margin:0 0 6px 0;font-size:12px;font-weight:700;color:#3A56E2;text-transform:uppercase;letter-spacing:0.08em;font-family:Arial,sans-serif;">Jobbyo</p>
     <p style="margin:0 0 24px 0;font-size:15px;line-height:1.7;">Hi {first_name},</p>
     <p style="margin:0 0 28px 0;font-size:15px;line-height:1.7;">Here are the roles I found for you today.</p>
-
+    {preferences_html}
     {jobs_html if jobs_html else '<p style="font-size:15px;color:#6b7280;font-style:italic;">No new roles in this batch.</p>'}
 
     <p style="margin:28px 0 0 0;font-size:15px;line-height:1.7;">Best,<br>Jobbyo</p>

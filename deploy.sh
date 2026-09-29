@@ -65,7 +65,7 @@ fi
 COMPOSE="docker compose"
 docker compose version >/dev/null 2>&1 || COMPOSE="docker-compose"
 
-for unit in jobbyo-search.service jobbyo-search-run.service jobbyo-search-run.timer jobbyo-search-run-final.service jobbyo-search-run-final.timer jobbyo-search-daily-report.service jobbyo-search-daily-report.timer jobbyo-boardlinks-topup.service; do
+for unit in jobbyo-search.service jobbyo-search-run.service jobbyo-search-run.timer jobbyo-search-run-final.service jobbyo-search-run-final.timer jobbyo-search-daily-report.service jobbyo-search-daily-report.timer jobbyo-search-nudge.service jobbyo-search-nudge.timer jobbyo-search-rejection-poll.service jobbyo-search-rejection-poll.timer jobbyo-boardlinks-topup.service; do
   cp "\$APP_DIR/systemd/\$unit" "/etc/systemd/system/\$unit"
 done
 systemctl daemon-reload
@@ -73,6 +73,8 @@ systemctl enable jobbyo-search.service
 systemctl enable --now jobbyo-search-run.timer
 systemctl enable --now jobbyo-search-run-final.timer
 systemctl enable --now jobbyo-search-daily-report.timer
+systemctl enable --now jobbyo-search-nudge.timer
+systemctl enable --now jobbyo-search-rejection-poll.timer
 
 cd "\$APP_DIR"
 echo "Building image..."

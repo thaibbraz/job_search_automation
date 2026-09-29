@@ -1,0 +1,10 @@
+[Unit]
+Description=Jobbyo reject-batch search poll, every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Unit=jobbyo-search-rejection-poll.service
+
+[Install]
+WantedBy=timers.target

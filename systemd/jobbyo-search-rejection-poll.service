@@ -1,0 +1,10 @@
+[Unit]
+Description=Jobbyo reject-batch search poll — fires due top-up searches every 2 min
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/script_job_search
+EnvironmentFile=/opt/script_job_search/.env
+ExecStart=/opt/script_job_search/scripts/run_rejection_search_poll.sh
