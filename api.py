@@ -431,6 +431,37 @@ async def _finish_subscribed_run(
     )
 
 
+class SetupBriefRequest(BaseModel):
+    uid: str
+    prefs: Optional[dict] = None
+
+
+@app.post("/setup/titles")
+async def setup_titles(target: UserTarget):
+    """Job title variations (12-20), seniority and location from the user's parsed resume, for the
+    webapp's new-automation flow. See setup_brief.py. Cached per uid + CV for 24h."""
+    if not target.uid:
+        raise HTTPException(status_code=422, detail="Provide uid.")
+    import setup_brief
+    try:
+        return await asyncio.to_thread(setup_brief.suggest_titles, target.uid)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/setup/brief")
+async def setup_brief_endpoint(req: SetupBriefRequest):
+    """Strategy brief for the end of setup: coaching analysis, web-search-grounded market
+    snapshot, and advice on the location/titles/salary they just chose. Takes up to a minute or
+    two on a cold run; cached per uid + inputs for 24h. Never touches personas/ or
+    search_contracts/."""
+    import setup_brief
+    try:
+        return await asyncio.to_thread(setup_brief.build_brief, req.uid, req.prefs or {})
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.post("/run/user/subscribed", response_model=SubscribedJobsResponse)
 async def run_user_subscribed(target: UserTarget):
     """Call this the moment a user's payment is confirmed (jobbyo-fastapi-
