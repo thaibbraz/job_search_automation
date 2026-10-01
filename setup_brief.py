@@ -143,8 +143,22 @@ ADVICE_SCHEMA = {
         "titles_to_add": {"type": "array", "items": {"type": "string"}},
         "titles_to_drop": {"type": "array", "items": {"type": "string"}},
         "salary_advice": {"type": "string"},
+        "numbers": {
+            "type": "object",
+            "properties": {
+                "open_roles": {"type": "integer"},
+                "remote_share_percent": {"type": "integer"},
+                "pay_currency": {"type": "string"},
+                "pay_low": {"type": "integer"},
+                "pay_mid": {"type": "integer"},
+                "pay_high": {"type": "integer"},
+                "top_hirers": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["open_roles", "remote_share_percent", "pay_currency", "pay_low", "pay_mid", "pay_high", "top_hirers"],
+            "additionalProperties": False,
+        },
     },
-    "required": ["headline", "location_advice", "title_advice", "titles_to_add", "titles_to_drop", "salary_advice"],
+    "required": ["headline", "location_advice", "title_advice", "titles_to_add", "titles_to_drop", "salary_advice", "numbers"],
     "additionalProperties": False,
 }
 
@@ -176,8 +190,38 @@ Return:
 - titles_to_drop: 0-3 of the titles they picked that are likely to waste applications, if any.
 - salary_advice: one sentence comparing their minimum salary to the market range; "" if no
   minimum was set.
+- numbers: the figures from the MARKET SNAPSHOT only, for charts. Never estimate or invent:
+  - open_roles: the approximate number of open roles it mentions, or 0 if it gives none.
+  - remote_share_percent: the remote-friendly share it mentions (0-100), or 0 if none.
+  - pay_currency: the 3-letter currency of the pay range (e.g. USD, EUR, GBP), or "" if none.
+  - pay_low / pay_high: the yearly pay range it gives, in whole units (e.g. 75000), or 0 if none.
+  - pay_mid: the typical/median yearly pay if it gives one, otherwise 0.
+  - top_hirers: up to 5 companies or kinds of company it names as hiring, or [] if none.
 Do not invent numbers that are not in the market snapshot.
 """
+
+
+def _clean_numbers(n):
+    """Charts only get figures that make sense; anything zero/negative/inverted becomes null."""
+    def pos(v):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
+
+    low, mid, high = pos(n.get("pay_low")), pos(n.get("pay_mid")), pos(n.get("pay_high"))
+    if low and high and low > high:
+        low, high = high, low
+    if mid and not (low and high and low <= mid <= high):
+        mid = None
+    share = pos(n.get("remote_share_percent"))
+    return {
+        "open_roles": pos(n.get("open_roles")),
+        "remote_share_percent": share if share and share <= 100 else None,
+        "pay": {"currency": (n.get("pay_currency") or "").upper()[:3] or None, "low": low, "mid": mid, "high": high} if (low and high) else None,
+        "top_hirers": [str(h).strip() for h in (n.get("top_hirers") or []) if str(h).strip()][:5],
+    }
 
 
 def build_brief(uid, prefs):
@@ -189,6 +233,7 @@ def build_brief(uid, prefs):
         "location": prefs.get("location") or {},
         "minimumAcceptableSalary": prefs.get("minimumAcceptableSalary") or "",
         "salaryCurrency": prefs.get("salaryCurrency") or "",
+        "v": 2,  # bump when the brief's shape changes, so old cached briefs aren't served
     }
     path = _cache_path("brief", uid, inputs)
     hit = _cached(path)
@@ -243,6 +288,7 @@ def build_brief(uid, prefs):
             "titles_to_add": advice.get("titles_to_add", []),
             "titles_to_drop": advice.get("titles_to_drop", []),
         },
+        "numbers": _clean_numbers(advice.get("numbers") or {}),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     _store(path, result)
