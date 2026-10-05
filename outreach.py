@@ -995,7 +995,7 @@ def send_paid_welcome_email(context, body_text, pdf_bytes=None, override_email=N
         'because we want to make sure your campaign launches with total clarity, we\'re waiving that fee '
         'for you today.</p>'
         '<p style="margin:14px 0 0 0;">Let\'s make sure you get the best possible start. Grab a 1:1 time on '
-        '<a href="https://calendar.app.google/N1kkofZxeHDR943z5" style="color:#3A56E2;">our calendar here</a> '
+        '<a href="https://calendar.app.google/EY6gxPv2d5EfRxB86" style="color:#3A56E2;">our calendar here</a> '
         'before your strategy slot expires.</p>'
         '<p style="margin:16px 0 0 0;">Jobbyo</p>'
     )
