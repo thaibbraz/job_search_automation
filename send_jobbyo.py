@@ -401,6 +401,10 @@ _JOBO_DISCOVERY_ITEMS = []
 # is a much narrower slice than what HC returned. Both lists feed the same
 # ingest_new_companies() call at the end of main().
 _HC_DISCOVERY_ITEMS = []
+# Last Apify error seen this run (status + body snippet, never the token URL),
+# surfaced by send_source_health_alert() so a dead key shows up in Slack
+# instead of HC silently returning nothing for a week.
+_HC_LAST_ERROR = ""
 
 SEARCH_CONTRACT_DIR = Path("./search_contracts")
 SEARCH_CONTRACT_DIR.mkdir(exist_ok=True)
@@ -6168,6 +6172,7 @@ def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_
     across keywords so total raw cost stays the same.
     No-GPT mode: more keywords with higher maxItems budget.
     """
+    global _HC_LAST_ERROR
     if not ENABLE_HIRING_CAFE_PREFETCH:
         return [], 0
 
@@ -6207,7 +6212,12 @@ def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_
                 json=actor_input,
                 timeout=180,
             )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                # Don't raise_for_status(): its message includes the request
+                # URL, which carries the Apify token as a query param.
+                _HC_LAST_ERROR = f"HTTP {resp.status_code}: {resp.text[:300]}"
+                print(f"Hiring.cafe API error for keyword={kw!r}: {_HC_LAST_ERROR}")
+                continue
             raw_items = resp.json()
             if isinstance(raw_items, list):
                 raw_items_all.extend(raw_items)
@@ -8511,6 +8521,54 @@ def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
         print(f"Slack run report failed: {e}")
 
 
+def send_source_health_alert(results_by_uid):
+    """Post to Slack when an enabled sourcing API returned nothing all run.
+
+    HC sourced 0 jobs for at least a week (2026-09-30 → 10-07) because of a
+    dead Apify key, and nothing flagged it -- match quality just quietly
+    dropped as Jobo carried everything. This catches that the same night.
+    """
+    if len(results_by_uid) < 3:
+        return  # too few users to tell an outage from a thin pool
+
+    expected = {
+        "hc": ENABLE_HIRING_CAFE_PREFETCH,
+        "jobo": ENABLE_JOBO_ATS_PREFETCH,
+        "jfe": ENABLE_JFE_PREFETCH,
+    }
+    sourced = Counter()
+    for r in results_by_uid.values():
+        funnel = (r.get("round_metrics") or {}).get("source_funnel", {})
+        for src in expected:
+            sourced[src] += (funnel.get(src) or {}).get("sourced", 0)
+
+    problems = []
+    if not APIFY_API_TOKEN:
+        problems.append("• *Hiring.cafe* is disabled: `JOBBYO_APIFY_TOKEN` is not set")
+    for src, enabled in expected.items():
+        if enabled and sourced[src] == 0:
+            line = f"• *{src}* sourced 0 jobs across {len(results_by_uid)} users"
+            if src == "hc" and _HC_LAST_ERROR:
+                line += f" — last error: `{_HC_LAST_ERROR[:200]}`"
+            problems.append(line)
+    if not problems:
+        return
+
+    text = ":rotating_light: *Job search: sourcing API down*\n" + "\n".join(problems)
+    print(text)
+    webhook = os.getenv("SLACK_WEBHOOK_URL_DAILY_RUN", "")
+    if not webhook:
+        return
+    try:
+        requests.post(
+            webhook,
+            json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"Source health alert failed (non-fatal): {e}")
+
+
 def save_run_log(all_results):
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     path = RUN_LOG_DIR / f"job_run_{timestamp}.json"
@@ -8993,6 +9051,7 @@ def main():
     # Slack team summary — only for full runs, not single-user tests.
     if not (SINGLE_USER_EMAIL or SINGLE_USER_EMAILS or SINGLE_USER_UID):
         send_slack_run_report(results_by_uid, _companies_added_by_ats)
+        send_source_health_alert(results_by_uid)
 
     total_new = sum(len(v.get("jobs_added") or []) for v in results_by_uid.values())
     total_rejected = sum(len(r.get("jobs_rejected_by_review") or []) for r in all_results)
