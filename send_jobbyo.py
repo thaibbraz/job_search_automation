@@ -8448,6 +8448,12 @@ def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
     # cost is internal-only, this report goes to a Slack channel with wider visibility.
     SOURCE_KEYS = ("jfe", "jobo", "hc")
     source_covered = {k: 0 for k in SOURCE_KEYS}
+    # Plain counts for the simplified report: jobs per source, and match
+    # quality from the AI review grade/decision on every job actually added.
+    STRONG_DECISIONS = {"exact_match", "strong_adjacent", "good_match"}
+    run_jobs_by_source = Counter()
+    run_grades = []
+    run_strong = 0
 
     for uid, r in results_by_uid.items():
         user_profile = r.get("user_profile") or {}
@@ -8470,8 +8476,17 @@ def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
             if (funnel.get(src) or {}).get("added", 0) > 0:
                 source_covered[src] += 1
 
+        added = r.get("jobs_added") or []
+        user_jobs_by_source = Counter(classify_job_source(j.get("source", "")) for j in added)
+        user_grades = [j["grade"] for j in added if isinstance(j.get("grade"), (int, float))]
+        run_jobs_by_source.update(user_jobs_by_source)
+        run_grades.extend(user_grades)
+        run_strong += sum(1 for j in added if j.get("review_decision") in STRONG_DECISIONS)
+
         entry = {
             "uid": uid,
+            "jobs_by_source": dict(user_jobs_by_source),
+            "avg_score": round(sum(user_grades) / len(user_grades)) if user_grades else None,
             "name": name,
             "email": email,
             "jobs_found_today": jobs_found,
@@ -8507,6 +8522,9 @@ def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
         "companies_added_total": sum(companies_added_by_ats.values()),
         "companies_added_by_ats": companies_added_by_ats,
         "source_coverage": source_coverage,
+        "jobs_by_source": dict(run_jobs_by_source),
+        "avg_score": round(sum(run_grades) / len(run_grades)) if run_grades else None,
+        "strong_match_pct": round(100 * run_strong / total_found) if total_found else None,
     }
 
     try:
