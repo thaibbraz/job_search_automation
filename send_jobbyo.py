@@ -14,6 +14,7 @@ from datetime import date, datetime, timezone, timedelta
 import requests
 
 from date_utils import parse_utc_timestamp
+import fit_ranker
 
 try:
     from openai import OpenAI
@@ -210,6 +211,9 @@ HIRING_CAFE_LOCAL_SCORE_MIN = env_int("JOBBYO_LOCAL_SCORE_MIN", 0)
 # return an empty dataset rather than an error, so it must be omitted.
 HIRING_CAFE_SUPPORTED_LOCATIONS = {"United States"}
 ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
+
+# fit_ranker.py: hard rules + CV-embedding ranking on the structured pool.
+ENABLE_FIT_STAGE = env_truthy("JOBBYO_ENABLE_FIT_STAGE", True)
 
 JOBO_API_BASE = "https://connect.jobo.world"
 JOBO_API_KEY = os.getenv("JOBO_API_KEY", "")
@@ -6062,7 +6066,10 @@ def _parse_hiring_cafe_job(raw_item):
     job_info = raw_item.get("job_information") or {}
     enriched = raw_item.get("enriched_company_data") or {}
 
-    title = (v5.get("core_job_title") or job_info.get("title") or "").strip()
+    # Original posting title first: v5.core_job_title is a normalized form that
+    # drops seniority ("Senior Product Designer" -> "Product Designer"), which
+    # hid "too senior" mismatches from the AI reviewer.
+    title = (job_info.get("title") or v5.get("core_job_title") or "").strip()
     # enriched_company_data.name is more reliable than v5.company_name (v5 sometimes
     # misidentifies the company, e.g. "Overview" instead of "Central Health").
     company = (enriched.get("name") or v5.get("company_name") or "").strip()
@@ -6105,6 +6112,19 @@ def _parse_hiring_cafe_job(raw_item):
         "grade": 70,                         # placeholder; scored locally below
         "_hc_workplace_type": workplace_type,
         "_hc_object_id": raw_item.get("objectID", ""),
+        "_normalized_title": (v5.get("core_job_title") or "").strip(),
+        # Structured facts for fit_ranker's hard rules (location/experience).
+        "_hc_fit": {
+            "workplace_type": workplace_type,
+            "countries": v5.get("workplace_countries") or [],
+            "states": v5.get("workplace_states") or [],
+            "cities": v5.get("workplace_cities") or [],
+            "remote_countries": v5.get("boundless_workplace_countries") or [],
+            "worldwide_ok": bool(v5.get("is_workplace_worldwide_ok")),
+            "seniority": v5.get("seniority_level") or "",
+            "min_yoe": None if v5.get("is_min_industry_and_role_yoe_not_mentioned") else v5.get("min_industry_and_role_yoe"),
+            "industries": (enriched.get("industries") or []) + [v5.get("company_sector_and_industry") or ""],
+        },
     }
 
 
@@ -6114,14 +6134,13 @@ def _build_hc_query(automation, search_contract, user_profile, persona=None):
     Returns (keywords_list, location, workplace_type).
     """
     # Priority 1: persona target_titles (AI-generated, specific)
-    keywords = []
-    if persona and isinstance(persona, dict):
-        _target = persona.get("target_titles") or []
-        keywords = [str(t).strip() for t in _target if str(t).strip()][:3]
-
-    # Priority 2: extract from automation prefs
-    if not keywords:
-        keywords = extract_automation_job_titles(automation, limit=3)
+    # The user's own titles come first -- persona titles are AI-generated and
+    # were seen drifting off what the user picked (an Ombudsman user searched
+    # as "Claims Manager"). Persona titles only fill the remaining slots.
+    keywords = extract_automation_job_titles(automation, limit=3)
+    if persona and isinstance(persona, dict) and len(keywords) < 3:
+        _target = [str(t).strip() for t in (persona.get("target_titles") or []) if str(t).strip()]
+        keywords = list(dict.fromkeys(keywords + _target))[:3]
 
     # Priority 3: raw jobTitles from prefs (e.g. "Retail")
     if not keywords:
@@ -7018,6 +7037,18 @@ def find_jobs_for_user(
     if hc_inventory:
         _pool_sources = "HC + Jobo ATS"
         print(f"Pre-fetch pool: {len(hc_inventory)} total jobs ({_pool_sources})")
+
+    # Experience-first fit: hard rules from the user's own settings, then
+    # CV-embedding ranking -- only the best-fitting jobs reach the AI review.
+    if hc_inventory and ENABLE_FIT_STAGE:
+        hc_inventory, _fit_rejected = fit_ranker.apply_fit_stage(
+            hc_inventory,
+            user_profile=user_profile,
+            prefs=extract_job_preferences(automation),
+            cv_text=cv_text,
+            openai_client=None if NO_GPT_MODE else client,
+        )
+        round_metrics["fit_rejected"] = round_metrics.get("fit_rejected", 0) + len(_fit_rejected)
 
     # PROPER FIX: pre-grade the full HC/Jobo pool with a single AI review call
     # before batching. Every pool job gets an AI grade + reason upfront so that:
