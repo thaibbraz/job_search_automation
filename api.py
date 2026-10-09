@@ -462,6 +462,18 @@ async def setup_brief_endpoint(req: SetupBriefRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+@app.post("/setup/calibration")
+async def setup_calibration(req: SetupBriefRequest):
+    """Example roles (AI-written, not real postings) for the user to rate while their first search
+    runs, each varying company size, industry, culture, workplace, seniority and pay. Cached per
+    uid + inputs for 24h. See setup_brief.py."""
+    import setup_brief
+    try:
+        return await asyncio.to_thread(setup_brief.calibration_jobs, req.uid, req.prefs or {})
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.post("/run/user/subscribed", response_model=SubscribedJobsResponse)
 async def run_user_subscribed(target: UserTarget):
     """Call this the moment a user's payment is confirmed (jobbyo-fastapi-

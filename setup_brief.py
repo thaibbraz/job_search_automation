@@ -293,3 +293,139 @@ def build_brief(uid, prefs):
     }
     _store(path, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Calibration roles
+# ---------------------------------------------------------------------------
+# Shown while the first search runs, for a quick "would you apply?" rating. These are EXAMPLE
+# roles written by the model (never real postings, never real company names, no links): each one
+# deliberately varies company size, industry, culture, workplace, seniority and pay so every
+# rating says something about the candidate's preferences. The webapp saves the ratings (with
+# these tags) on the automation as `calibration`, plus a short `calibrationProfile` summary; the
+# search learns from both (see send_jobbyo.extract_rejected_jobs_from_automation).
+
+CALIBRATION_COUNT = 7
+COMPANY_SIZES = ["startup", "scaleup", "midsize", "enterprise"]
+SENIORITY_SHIFTS = ["same_level", "step_up", "step_down"]
+WORKPLACES = ["remote", "hybrid", "onsite"]
+
+CALIBRATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "roles": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "company": {"type": "string"},
+                    "company_size": {"type": "string", "enum": COMPANY_SIZES},
+                    "industry": {"type": "string"},
+                    "culture": {"type": "string"},
+                    "workplace": {"type": "string", "enum": WORKPLACES},
+                    "location": {"type": "string"},
+                    "seniority": {"type": "string", "enum": SENIORITY_SHIFTS},
+                    "salary_min": {"type": "integer"},
+                    "salary_max": {"type": "integer"},
+                    "currency": {"type": "string"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "company", "company_size", "industry", "culture", "workplace", "location",
+                             "seniority", "salary_min", "salary_max", "currency", "skills"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["roles"],
+    "additionalProperties": False,
+}
+
+CALIBRATION_PROMPT = """You are calibrating a job-search agent for this candidate. Write {count} EXAMPLE job \
+roles for them to rate ("would you apply?"). These are not real postings: they exist only to learn the \
+candidate's preferences, so design them as a set where every role tests something.
+
+CANDIDATE'S SEARCH:
+{choices}
+
+CV (excerpt):
+{cv_excerpt}
+
+Rules for the set:
+- Every role must be one this candidate could realistically apply to: their target titles, close
+  variants, or a role similar to their most recent jobs. Realistic for their seniority and skills.
+- Vary these across the set so each rating is informative: company_size (startup, scaleup, midsize,
+  enterprise), industry (mostly ones close to their background, plus one or two adjacent ones),
+  culture (e.g. fast-paced and scrappy, structured and process-driven, mission-driven, client-facing
+  agency), workplace (remote, hybrid, onsite), seniority (mostly same_level, one step_up, at most one
+  step_down) and pay (around their minimum, and above it).
+- Locations: their target cities and nearby cities or metro areas; for remote roles say which
+  country or region it's open to.
+- company: a short DESCRIPTION, never a real company name. E.g. "Series B fintech, ~80 people",
+  "Global logistics group, 20,000 employees", "Regional hospital network".
+- title: 2-6 words, in English. skills: 3-4 short skills the role asks for.
+- salary_min / salary_max: yearly, whole units, in {currency}. Plausible for the role and location.
+- No two roles alike. Never use an em dash.
+"""
+
+
+def calibration_jobs(uid, prefs=None):
+    """Example roles for calibration. `prefs` is the jobPreferences the user just set (the
+    automation may not be saved yet); falls back to the saved automation."""
+    profile, cv_text = _profile_or_raise(uid)
+    prefs = prefs or {}
+    if not prefs.get("jobTitles"):
+        automation = send_jobbyo.get_user_automation(uid) or {}
+        prefs = (automation.get("settings") or {}).get("jobPreferences") or automation.get("jobPreferences") or prefs
+    currency = (prefs.get("salaryCurrency") or "USD").upper()
+    choices = {
+        "job_titles": (prefs.get("jobTitles") or [])[:8],
+        "workplace": (prefs.get("location") or {}).get("type"),
+        "locations": (prefs.get("location") or {}).get("places"),
+        "minimum_salary": prefs.get("minimumAcceptableSalary") or "",
+        "currency": currency,
+    }
+
+    path = _cache_path("calibration", uid, {"cv": cv_text, "choices": choices, "v": 1})
+    hit = _cached(path)
+    if hit:
+        return hit
+
+    response = send_jobbyo.responses_create(
+        model=send_jobbyo.SEARCH_MODEL,
+        input=CALIBRATION_PROMPT.format(
+            count=CALIBRATION_COUNT,
+            choices=json.dumps(choices, indent=2),
+            cv_excerpt=cv_text[:2500],
+            currency=currency,
+        ),
+        text={"format": {"type": "json_schema", "name": "calibration_roles", "schema": CALIBRATION_SCHEMA, "strict": True}},
+    )
+    roles = json.loads(response.output_text).get("roles") or []
+
+    jobs = []
+    for i, r in enumerate(roles[:CALIBRATION_COUNT]):
+        title = " ".join(str(r.get("title") or "").split())
+        if not title:
+            continue
+        lo, hi = int(r.get("salary_min") or 0), int(r.get("salary_max") or 0)
+        jobs.append({
+            "id": f"cal-{i}-{hashlib.sha1(title.encode()).hexdigest()[:6]}",
+            "example": True,
+            "title": title,
+            "company": str(r.get("company") or "").replace("\u2014", ","),
+            "location": str(r.get("location") or ""),
+            "workplace": r.get("workplace") or "",
+            "salary": {"min": lo, "max": hi, "currency": (r.get("currency") or currency).upper()} if hi > 0 else None,
+            "tags": {
+                "size": r.get("company_size") or "",
+                "industry": str(r.get("industry") or ""),
+                "culture": str(r.get("culture") or ""),
+                "workplace": r.get("workplace") or "",
+                "seniority": r.get("seniority") or "",
+            },
+            "skills": [str(x) for x in (r.get("skills") or [])][:4],
+        })
+    result = {"jobs": jobs}
+    _store(path, result)
+    return result

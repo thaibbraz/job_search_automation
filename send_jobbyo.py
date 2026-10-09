@@ -1968,7 +1968,52 @@ def extract_rejected_jobs_from_automation(automation, limit=80):
         seen.add(dedupe_key)
         rejected.append(job)
 
+    # "Not for me" ratings of the AI-written example roles shown during setup
+    # (automation.calibration, saved by the webapp while the first search runs). The companies are
+    # descriptions, not real names, so these shape preferences (size, industry, culture, workplace)
+    # and never block a real company.
+    for item in (automation or {}).get("calibration") or []:
+        if not isinstance(item, dict) or item.get("liked") is not False:
+            continue
+        title = str(item.get("title") or "").strip()
+        company = str(item.get("company") or "").strip()
+        dedupe_key = normalize_url(item.get("url") or "") or f"{company.lower()}|{title.lower()}|calibration"
+        if not (title or company) or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        rejected.insert(0, {
+            "title": title,
+            "company": company,
+            "location": str(item.get("location") or ""),
+            "job_url": str(item.get("url") or ""),
+            "status": REJECTED_STATUS,
+            "feedback": "Not interested in this example role (setup calibration)"
+                        + (f": {_calibration_tag_text(item)}" if _calibration_tag_text(item) else ""),
+            "reason": "setup_calibration",
+        })
+
     return rejected[-limit:]
+
+
+def _calibration_tag_text(item):
+    tags = item.get("tags") if isinstance(item.get("tags"), dict) else {}
+    parts = [tags.get("size"), tags.get("industry"), tags.get("culture"), tags.get("workplace")]
+    return ", ".join(str(p) for p in parts if p)
+
+
+def calibration_preference_context(automation):
+    """Soft preferences from the setup calibration, for the AI review prompt; empty if none."""
+    profile = (automation or {}).get("calibrationProfile") or {}
+    liked = [i for i in (automation or {}).get("calibration") or [] if isinstance(i, dict) and i.get("liked") is True]
+    summary = str(profile.get("summary") or "").strip()
+    if not summary and not liked:
+        return ""
+    lines = ["FROM THIS USER'S SETUP CALIBRATION (soft preferences, not hard rules; favour matches that fit):"]
+    if summary:
+        lines.append(f"- {summary[:300]}")
+    for i in liked[-6:]:
+        lines.append(f"- Would apply to: {str(i.get('title') or '')[:80]} ({_calibration_tag_text(i)[:120]})")
+    return "\n".join(lines)
 
 
 def parse_feedback_rating(feedback):
@@ -6830,9 +6875,10 @@ def find_jobs_for_user(
     learned_notes = feedback_learning.preference_notes(
         None if NO_GPT_MODE else client, user_profile.get("uid"), rejected_jobs_from_automation,
     )
-    _LEARNED_REVIEW_CONTEXT[user_profile.get("uid")] = feedback_learning.review_context(
-        learned_notes, rejected_jobs_from_automation,
-    )
+    _LEARNED_REVIEW_CONTEXT[user_profile.get("uid")] = "\n\n".join(p for p in [
+        feedback_learning.review_context(learned_notes, rejected_jobs_from_automation),
+        calibration_preference_context(automation),
+    ] if p)
     if learned_notes.get("rules") or learned_notes.get("blocked_companies"):
         print(f"Learned from rejections: rules={learned_notes.get('rules')} blocked={learned_notes.get('blocked_companies')}")
 
