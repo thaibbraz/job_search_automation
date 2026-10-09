@@ -179,11 +179,28 @@ def job_facts(job: dict) -> dict:
         "seniority": _norm(hc.get("seniority")),
         "min_years": min_years,
         "industries": _norm(" ".join(hc.get("industries") or [])),
+        "salary_max": hc.get("salary_max"),
     }
+
+
+def _company_key(name) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
 
 
 def hard_reject_reason(job: dict, cand: dict) -> str | None:
     f = job_facts(job)
+
+    # Learned from the user's own rejections + excluded companies (feedback_learning.py).
+    company = _company_key(job.get("company"))
+    if company and company in cand.get("blocked_companies", ()):
+        return "company blocked by user"
+    seen = (cand.get("company_counts") or {}).get(company, 0)
+    if company and seen >= cand.get("company_cap", 99):
+        return f"already {seen} jobs from this company in 30 days"
+    floor = cand.get("salary_floor")
+    if floor and f["salary_max"] and f["salary_max"] < floor:
+        return f"salary below user's minimum"
+
     is_remote = f["type"] == "remote"
     places = cand["places"]
 
@@ -266,9 +283,16 @@ def rank_by_cv_fit(client, jobs: list[dict], cv_text: str, titles: list[str]) ->
     return sorted(jobs, key=lambda j: j["fit_score"], reverse=True)
 
 
-def apply_fit_stage(jobs, user_profile, prefs, cv_text, openai_client=None, keep=FIT_POOL_KEEP):
+def apply_fit_stage(jobs, user_profile, prefs, cv_text, openai_client=None, keep=FIT_POOL_KEEP,
+                    blocked_companies=None, company_counts=None, company_cap=None, salary_floor=None):
     """Hard rules, then CV-fit ranking. Returns (kept_jobs, rejected_with_reasons)."""
     cand = candidate_profile(user_profile, prefs)
+    cand.update({
+        "blocked_companies": blocked_companies or set(),
+        "company_counts": company_counts or {},
+        "company_cap": company_cap or 99,
+        "salary_floor": salary_floor,
+    })
     kept, rejected = [], []
     for job in jobs:
         reason = hard_reject_reason(job, cand)
@@ -305,6 +329,6 @@ def apply_fit_stage(jobs, user_profile, prefs, cv_text, openai_client=None, keep
 def _top_reasons(rejected, n=6):
     counts: dict[str, int] = {}
     for _, reason in rejected:
-        key = re.sub(r"\d+", "N", reason) if reason.startswith("needs") else reason
+        key = re.sub(r"\d+", "N", reason) if reason.startswith(("needs", "already")) else reason
         counts[key] = counts.get(key, 0) + 1
     return sorted(counts.items(), key=lambda kv: -kv[1])[:n]

@@ -15,6 +15,7 @@ import requests
 
 from date_utils import parse_utc_timestamp
 import fit_ranker
+import feedback_learning
 
 try:
     from openai import OpenAI
@@ -409,6 +410,8 @@ _HC_DISCOVERY_ITEMS = []
 # surfaced by send_source_health_alert() so a dead key shows up in Slack
 # instead of HC silently returning nothing for a week.
 _HC_LAST_ERROR = ""
+# uid -> learned-feedback block for the AI review prompt (feedback_learning.py)
+_LEARNED_REVIEW_CONTEXT = {}
 
 SEARCH_CONTRACT_DIR = Path("./search_contracts")
 SEARCH_CONTRACT_DIR.mkdir(exist_ok=True)
@@ -4489,7 +4492,10 @@ def review_jobs_with_ai(user_profile, automation, cv_text, persona, jobs, minimu
     review_prefs = {k: prefs[k] for k in (
         "jobTitles", "location", "remote", "salary", "salaryMin", "salaryMax",
         "forbiddenTitles", "forbidden", "employmentType", "seniority",
+        # The real app field names -- the reviewer never saw the salary floor before.
+        "minimumAcceptableSalary", "salaryCurrency", "companyPreferences", "preferredJobTypes",
     ) if k in prefs and prefs[k] not in (None, [], {}, "")}
+    learned_context = _LEARNED_REVIEW_CONTEXT.get(user_profile.get("uid")) or ""
 
     # Trim job descriptions in the review payload — title/company/location already
     # carry 80% of the signal; 800 chars of description is enough for the rest.
@@ -4564,6 +4570,8 @@ PERSONA:
 
 CV:
 {cv_for_review}
+
+{learned_context}
 
 JOBS TO REVIEW:
 {json.dumps(jobs_for_review, indent=2)}
@@ -6124,6 +6132,7 @@ def _parse_hiring_cafe_job(raw_item):
             "seniority": v5.get("seniority_level") or "",
             "min_yoe": None if v5.get("is_min_industry_and_role_yoe_not_mentioned") else v5.get("min_industry_and_role_yoe"),
             "industries": (enriched.get("industries") or []) + [v5.get("company_sector_and_industry") or ""],
+            "salary_max": v5.get("yearly_max_compensation"),
         },
     }
 
@@ -6816,6 +6825,17 @@ def find_jobs_for_user(
     )
     pending_today_before = count_jobs_today(existing_jobs, job_status)
 
+    # Nightly learning from the user's rejections (feedback_learning.py):
+    # hard rules for the fit stage + context for every AI review of this user.
+    learned_notes = feedback_learning.preference_notes(
+        None if NO_GPT_MODE else client, user_profile.get("uid"), rejected_jobs_from_automation,
+    )
+    _LEARNED_REVIEW_CONTEXT[user_profile.get("uid")] = feedback_learning.review_context(
+        learned_notes, rejected_jobs_from_automation,
+    )
+    if learned_notes.get("rules") or learned_notes.get("blocked_companies"):
+        print(f"Learned from rejections: rules={learned_notes.get('rules')} blocked={learned_notes.get('blocked_companies')}")
+
     jobs_needed = max(0, TARGET_JOBS_PER_USER - pending_today_before)
 
     print(f"Round: {round_number}")
@@ -7044,9 +7064,13 @@ def find_jobs_for_user(
         hc_inventory, _fit_rejected = fit_ranker.apply_fit_stage(
             hc_inventory,
             user_profile=user_profile,
-            prefs=extract_job_preferences(automation),
+            prefs=prefs,
             cv_text=cv_text,
             openai_client=None if NO_GPT_MODE else client,
+            blocked_companies=feedback_learning.blocked_companies(prefs, learned_notes),
+            company_counts=feedback_learning.recent_company_counts(extract_selected_jobs(automation)),
+            company_cap=feedback_learning.COMPANY_CAP,
+            salary_floor=feedback_learning.min_salary_usd(prefs, learned_notes),
         )
         round_metrics["fit_rejected"] = round_metrics.get("fit_rejected", 0) + len(_fit_rejected)
 
@@ -8485,6 +8509,9 @@ def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
     run_jobs_by_source = Counter()
     run_grades = []
     run_strong = 0
+    # How often users reject what we send them, this week vs last -- the
+    # number that should keep dropping as feedback_learning kicks in.
+    rej_totals = {"week": [0, 0], "prev_week": [0, 0]}
 
     for uid, r in results_by_uid.items():
         user_profile = r.get("user_profile") or {}
@@ -8514,9 +8541,14 @@ def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
         run_grades.extend(user_grades)
         run_strong += sum(1 for j in added if j.get("review_decision") in STRONG_DECISIONS)
 
+        rej = feedback_learning.rejection_counts(extract_selected_jobs(automation))
+        for k in rej_totals:
+            rej_totals[k][0] += rej[k][0]
+            rej_totals[k][1] += rej[k][1]
+
         entry = {
             "uid": uid,
-            "jobs_by_source": dict(user_jobs_by_source),
+            "rejection_rate_7d": feedback_learning.pct(*rej["week"]),
             "avg_score": round(sum(user_grades) / len(user_grades)) if user_grades else None,
             "name": name,
             "email": email,
@@ -8556,6 +8588,8 @@ def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
         "jobs_by_source": dict(run_jobs_by_source),
         "avg_score": round(sum(run_grades) / len(run_grades)) if run_grades else None,
         "strong_match_pct": round(100 * run_strong / total_found) if total_found else None,
+        "rejection_rate_7d": feedback_learning.pct(*rej_totals["week"]),
+        "rejection_rate_prev_7d": feedback_learning.pct(*rej_totals["prev_week"]),
     }
 
     try:
