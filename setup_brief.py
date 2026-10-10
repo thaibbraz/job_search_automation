@@ -157,8 +157,25 @@ ADVICE_SCHEMA = {
             "required": ["open_roles", "remote_share_percent", "pay_currency", "pay_low", "pay_mid", "pay_high", "top_hirers"],
             "additionalProperties": False,
         },
+        "market_is_small": {"type": "boolean"},
+        "expansions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["add_title", "add_location", "add_remote", "lower_salary"]},
+                    "value": {"type": "string"},
+                    "label": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "estimated_roles_added": {"type": "integer"},
+                },
+                "required": ["kind", "value", "label", "reason", "estimated_roles_added"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["headline", "location_advice", "title_advice", "titles_to_add", "titles_to_drop", "salary_advice", "numbers"],
+    "required": ["headline", "location_advice", "title_advice", "titles_to_add", "titles_to_drop", "salary_advice", "numbers",
+                 "market_is_small", "expansions"],
     "additionalProperties": False,
 }
 
@@ -197,6 +214,20 @@ Return:
   - pay_low / pay_high: the yearly pay range it gives, in whole units (e.g. 75000), or 0 if none.
   - pay_mid: the typical/median yearly pay if it gives one, otherwise 0.
   - top_hirers: up to 5 companies or kinds of company it names as hiring, or [] if none.
+- market_is_small: true if their current choices leave a small pool (roughly under 1,500 open roles,
+  or the snapshot says roles are scarce for this profile/location), else false.
+- expansions: 2-4 concrete one-tap changes that would grow their pool the most, realistic for
+  their background. Each has:
+  - kind: add_title (a close title they didn't pick), add_location (a nearby city/metro or
+    country they could work in), add_remote (only if they excluded remote), or lower_salary.
+  - value: exactly what to apply: the title text, the location text, "remote", or the new yearly
+    minimum as digits in their currency.
+  - label: 2-6 words for a button, e.g. "Add Data Analyst", "Add Madrid", "Include remote roles",
+    "Lower minimum to 55,000".
+  - reason: one short sentence on why it helps.
+  - estimated_roles_added: your best estimate of extra open roles it adds, consistent with
+    numbers.open_roles; 0 if you cannot estimate.
+  Don't suggest titles or locations they already chose.
 Do not invent numbers that are not in the market snapshot.
 """
 
@@ -224,6 +255,39 @@ def _clean_numbers(n):
     }
 
 
+def _clean_expansions(items, prefs):
+    """Drop suggestions that repeat what's already chosen or can't be applied."""
+    titles = {str(t).strip().lower() for t in prefs.get("jobTitles") or []}
+    places = {str(p).strip().lower() for p in (prefs.get("location") or {}).get("places") or []}
+    types = (prefs.get("location") or {}).get("type") or []
+    types = [types] if isinstance(types, str) else types
+    out, seen = [], set()
+    for e in items:
+        kind, value = e.get("kind"), " ".join(str(e.get("value") or "").split())
+        if not value or (kind, value.lower()) in seen:
+            continue
+        if kind == "add_title" and value.lower() in titles:
+            continue
+        if kind == "add_location" and value.lower() in places:
+            continue
+        if kind == "add_remote" and "remote" in types:
+            continue
+        if kind == "lower_salary":
+            digits = "".join(ch for ch in value if ch.isdigit())
+            if not digits:
+                continue
+            value = digits
+        seen.add((kind, value.lower()))
+        out.append({
+            "kind": kind,
+            "value": value,
+            "label": str(e.get("label") or value)[:60].replace("\u2014", ","),
+            "reason": str(e.get("reason") or "")[:200].replace("\u2014", ","),
+            "estimated_roles_added": max(0, int(e.get("estimated_roles_added") or 0)),
+        })
+    return out[:4]
+
+
 def build_brief(uid, prefs):
     prefs = prefs or {}
     profile, cv_text = _profile_or_raise(uid)
@@ -233,7 +297,7 @@ def build_brief(uid, prefs):
         "location": prefs.get("location") or {},
         "minimumAcceptableSalary": prefs.get("minimumAcceptableSalary") or "",
         "salaryCurrency": prefs.get("salaryCurrency") or "",
-        "v": 2,  # bump when the brief's shape changes, so old cached briefs aren't served
+        "v": 3,  # bump when the brief's shape changes, so old cached briefs aren't served
     }
     path = _cache_path("brief", uid, inputs)
     hit = _cached(path)
@@ -289,6 +353,8 @@ def build_brief(uid, prefs):
             "titles_to_drop": advice.get("titles_to_drop", []),
         },
         "numbers": _clean_numbers(advice.get("numbers") or {}),
+        "market_is_small": bool(advice.get("market_is_small")),
+        "expansions": _clean_expansions(advice.get("expansions") or [], prefs),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     _store(path, result)
