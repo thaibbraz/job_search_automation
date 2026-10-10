@@ -50,8 +50,12 @@ def _store(path, data):
         print(f"setup_brief cache write failed (non-fatal): {e}")
 
 
-def _profile_or_raise(uid):
+def _profile_or_raise(uid, cv=None):
+    """The user's profile and CV text. `cv` is the resume the webapp is showing right now (it may
+    not be saved to the account yet); when given it wins over the saved one."""
     profile = send_jobbyo.get_user_profile(uid) or {}
+    if isinstance(cv, dict) and (cv.get("first_name") or cv.get("experiences") or cv.get("title")):
+        profile = {**profile, "cv": cv}
     cv_text = send_jobbyo.cv_to_text(profile) if profile else ""
     if not cv_text.strip():
         raise ValueError("No parsed resume on file for this user yet.")
@@ -105,8 +109,8 @@ Return:
 """
 
 
-def suggest_titles(uid):
-    profile, cv_text = _profile_or_raise(uid)
+def suggest_titles(uid, cv=None):
+    profile, cv_text = _profile_or_raise(uid, cv)
     path = _cache_path("titles", uid, {"cv": cv_text})
     hit = _cached(path)
     if hit:
@@ -288,9 +292,9 @@ def _clean_expansions(items, prefs):
     return out[:4]
 
 
-def build_brief(uid, prefs):
+def build_brief(uid, prefs, cv=None):
     prefs = prefs or {}
-    profile, cv_text = _profile_or_raise(uid)
+    profile, cv_text = _profile_or_raise(uid, cv)
     inputs = {
         "cv": cv_text,
         "jobTitles": prefs.get("jobTitles") or [],
@@ -435,10 +439,10 @@ Rules for the set:
 """
 
 
-def calibration_jobs(uid, prefs=None):
+def calibration_jobs(uid, prefs=None, cv=None):
     """Example roles for calibration. `prefs` is the jobPreferences the user just set (the
     automation may not be saved yet); falls back to the saved automation."""
-    profile, cv_text = _profile_or_raise(uid)
+    profile, cv_text = _profile_or_raise(uid, cv)
     prefs = prefs or {}
     if not prefs.get("jobTitles"):
         automation = send_jobbyo.get_user_automation(uid) or {}

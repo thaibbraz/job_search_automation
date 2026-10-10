@@ -434,17 +434,18 @@ async def _finish_subscribed_run(
 class SetupBriefRequest(BaseModel):
     uid: str
     prefs: Optional[dict] = None
+    cv: Optional[dict] = None  # the resume the webapp is showing; wins over the saved one
 
 
 @app.post("/setup/titles")
-async def setup_titles(target: UserTarget):
+async def setup_titles(target: SetupBriefRequest):
     """Job title variations (12-20), seniority and location from the user's parsed resume, for the
     webapp's new-automation flow. See setup_brief.py. Cached per uid + CV for 24h."""
     if not target.uid:
         raise HTTPException(status_code=422, detail="Provide uid.")
     import setup_brief
     try:
-        return await asyncio.to_thread(setup_brief.suggest_titles, target.uid)
+        return await asyncio.to_thread(setup_brief.suggest_titles, target.uid, target.cv)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -457,7 +458,7 @@ async def setup_brief_endpoint(req: SetupBriefRequest):
     search_contracts/."""
     import setup_brief
     try:
-        return await asyncio.to_thread(setup_brief.build_brief, req.uid, req.prefs or {})
+        return await asyncio.to_thread(setup_brief.build_brief, req.uid, req.prefs or {}, req.cv)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -469,7 +470,7 @@ async def setup_calibration(req: SetupBriefRequest):
     uid + inputs for 24h. See setup_brief.py."""
     import setup_brief
     try:
-        return await asyncio.to_thread(setup_brief.calibration_jobs, req.uid, req.prefs or {})
+        return await asyncio.to_thread(setup_brief.calibration_jobs, req.uid, req.prefs or {}, req.cv)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
