@@ -493,6 +493,24 @@ async def setup_recount(req: SetupRecountRequest):
                                    req.prefs or {}, req.market or {}, req.open_roles)
 
 
+class SetupProfileRequest(BaseModel):
+    uid: str
+    ratings: Optional[list] = None
+    prefs: Optional[dict] = None
+    cv: Optional[dict] = None
+
+
+@app.post("/setup/calibration/profile")
+async def setup_calibration_profile(req: SetupProfileRequest):
+    """A short read on the candidate plus industries / company sizes / culture / levels, from their
+    calibration ratings and resume. Cached per uid + inputs for 24h. See setup_brief.py."""
+    import setup_brief
+    try:
+        return await asyncio.to_thread(setup_brief.calibration_profile, req.uid, req.ratings or [], req.prefs or {}, req.cv)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @app.post("/run/user/subscribed", response_model=SubscribedJobsResponse)
 async def run_user_subscribed(target: UserTarget):
     """Call this the moment a user's payment is confirmed (jobbyo-fastapi-

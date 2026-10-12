@@ -645,3 +645,109 @@ def calibration_jobs(uid, prefs=None, cv=None):
     result = {"jobs": jobs}
     _store(path, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Job profile from calibration
+# ---------------------------------------------------------------------------
+# After the candidate rates the example roles, turn the ratings plus their resume into a short read
+# on what suits them and the structured preferences the app keeps in settings. Option lists match
+# the webapp's automation settings (jobPreferences.companyPreferences.industries / .sizes and
+# jobPreferences.experienceLevel), so whatever is filled here shows up there and can be edited.
+
+PROFILE_INDUSTRIES = ["Technology", "Healthcare", "Finance", "Education", "Retail", "Manufacturing", "Media", "Consulting"]
+PROFILE_SIZES = ["Startup", "Small", "Mid-size", "Large"]
+
+PROFILE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "industries": {"type": "array", "items": {"type": "string", "enum": PROFILE_INDUSTRIES}},
+        "company_sizes": {"type": "array", "items": {"type": "string", "enum": PROFILE_SIZES}},
+        "culture": {"type": "array", "items": {"type": "string"}},
+        "levels": {"type": "array", "items": {"type": "string", "enum": SENIORITY_LEVELS}},
+    },
+    "required": ["summary", "industries", "company_sizes", "culture", "levels"],
+    "additionalProperties": False,
+}
+
+PROFILE_PROMPT = """You are a sharp, warm career coach. A job seeker just rated example roles ("would apply" or \
+"not for me"). From their ratings and resume, tell them what suits them and fill in their job
+preferences.
+
+THEIR SEARCH:
+{choices}
+
+RATINGS (each role's company size, industry, culture, workplace and seniority, and their answer):
+{ratings}
+
+CV (excerpt):
+{cv_excerpt}
+
+Return:
+- summary: 2-3 sentences written to them ("you"), a real analysis rather than a list: what kind of
+  company and environment they are drawn to and what they avoid, and why that fits (or stretches)
+  their background. Specific, plain language, no flattery, no em dashes.
+- industries: 1-3 from the allowed list that best match what they would apply to and their background.
+- company_sizes: 1-3 from the allowed list (Startup <50, Small 50-200, Mid-size 201-1000, Large 1000+).
+- culture: 1-3 short traits they lean towards, 1-3 words each, e.g. "Calm", "Mission-driven",
+  "Fast-paced", "Structured".
+- levels: 1-2 seniority levels to target, from: {levels}.
+Base it on the ratings first; use the resume to break ties. If they said "not for me" to everything,
+infer from what they rejected and their resume."""
+
+
+def calibration_profile(uid, ratings, prefs=None, cv=None):
+    """{"summary", "industries", "company_sizes", "culture", "levels"} for the candidate, from their
+    calibration ratings (title, company, tags, liked) and resume. Cached per uid + inputs."""
+    _, cv_text = _profile_or_raise(uid, cv)
+    prefs = prefs or {}
+    rated = []
+    for r in ratings or []:
+        if not isinstance(r, dict) or not isinstance(r.get("liked"), bool):
+            continue
+        rated.append({
+            "role": f"{str(r.get('title') or '')[:80]} at {str(r.get('company') or '')[:80]}",
+            "tags": r.get("tags") if isinstance(r.get("tags"), dict) else {},
+            "answer": "would apply" if r["liked"] else "not for me",
+        })
+    if not rated:
+        raise ValueError("No calibration ratings to analyse.")
+    choices = {
+        "job_titles": prefs.get("jobTitles") or [],
+        "locations": (prefs.get("location") or {}).get("places") or [],
+    }
+    path = _cache_path("profile", uid, {"cv": cv_text, "rated": rated, "choices": choices, "v": 1})
+    hit = _cached(path)
+    if hit:
+        return hit
+
+    response = send_jobbyo.responses_create(
+        model=send_jobbyo.SEARCH_MODEL,
+        input=PROFILE_PROMPT.format(
+            choices=json.dumps(choices, indent=2),
+            ratings=json.dumps(rated, indent=2),
+            cv_excerpt=cv_text[:2000],
+            levels=", ".join(SENIORITY_LEVELS),
+        ),
+        text={"format": {"type": "json_schema", "name": "job_profile", "schema": PROFILE_SCHEMA, "strict": True}},
+    )
+    data = json.loads(response.output_text)
+
+    def uniq(items, allowed=None, limit=3):
+        out = []
+        for x in items or []:
+            x = " ".join(str(x).split())[:40]
+            if x and x not in out and (allowed is None or x in allowed):
+                out.append(x)
+        return out[:limit]
+
+    result = {
+        "summary": str(data.get("summary") or "").replace("—", ",").strip()[:600],
+        "industries": uniq(data.get("industries"), PROFILE_INDUSTRIES),
+        "company_sizes": uniq(data.get("company_sizes"), PROFILE_SIZES),
+        "culture": uniq(data.get("culture")),
+        "levels": uniq(data.get("levels"), SENIORITY_LEVELS, 2),
+    }
+    _store(path, result)
+    return result
