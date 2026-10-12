@@ -423,7 +423,7 @@ def recount_open_roles(uid, base_prefs, prefs, market=None, open_roles=0):
     before, after = _search_summary(base_prefs), _search_summary(prefs)
     if before == after or not base:
         return {"open_roles": base}
-    path = _cache_path("recount", uid, {"before": before, "after": after, "base": base, "v": 1})
+    path = _cache_path("recount", uid, {"before": before, "after": after, "base": base, "v": 2})
     hit = _cached(path)
     if hit:
         return hit
@@ -438,9 +438,37 @@ def recount_open_roles(uid, base_prefs, prefs, market=None, open_roles=0):
     except Exception as e:
         print(f"setup_brief recount failed (non-fatal): {e}")
         return {"open_roles": base}
+    # Hold the model to the direction of the change: a broader search never shows fewer roles.
+    direction = _search_direction(base_prefs, prefs)
+    if direction > 0:
+        n = max(n, base)
+    elif direction < 0:
+        n = min(n, base) if n else base
     result = {"open_roles": n or base}
     _store(path, result)
     return result
+
+
+def _search_direction(before, after):
+    """1 if `after` only widens `before` (more titles/places/workplaces, lower minimum), -1 if it
+    only narrows it, 0 otherwise."""
+    def parts(p):
+        p = p or {}
+        loc = p.get("location") or {}
+        t = loc.get("type")
+        types = t if isinstance(t, list) else [t] if t else []
+        try:
+            sal = float(str(p.get("minimumAcceptableSalary") or 0).replace(",", "") or 0)
+        except ValueError:
+            sal = 0.0
+        return set(p.get("jobTitles") or []), set(loc.get("places") or []), set(types), sal
+    t0, p0, w0, s0 = parts(before)
+    t1, p1, w1, s1 = parts(after)
+    if t1 >= t0 and p1 >= p0 and w1 >= w0 and (s1 <= s0 or not s0):
+        return 1
+    if t1 <= t0 and p1 <= p0 and w1 <= w0 and (s1 >= s0 or not s1):
+        return -1
+    return 0
 
 
 # ---------------------------------------------------------------------------
