@@ -475,6 +475,24 @@ async def setup_calibration(req: SetupBriefRequest):
         raise HTTPException(status_code=404, detail=str(e))
 
 
+class SetupRecountRequest(BaseModel):
+    uid: str
+    base_prefs: Optional[dict] = None  # the search the brief's estimate was made for
+    prefs: Optional[dict] = None       # the search now, after "grow your pool" changes
+    market: Optional[dict] = None      # the brief's market snapshot
+    open_roles: int = 0                # the brief's estimate for base_prefs
+
+
+@app.post("/setup/recount")
+async def setup_recount(req: SetupRecountRequest):
+    """Re-estimated open roles after the candidate toggles a pool change on the brief, anchored on
+    the brief's own estimate so the number stays consistent. Quick (no web search). See
+    setup_brief.py."""
+    import setup_brief
+    return await asyncio.to_thread(setup_brief.recount_open_roles, req.uid, req.base_prefs or {},
+                                   req.prefs or {}, req.market or {}, req.open_roles)
+
+
 @app.post("/run/user/subscribed", response_model=SubscribedJobsResponse)
 async def run_user_subscribed(target: UserTarget):
     """Call this the moment a user's payment is confirmed (jobbyo-fastapi-

@@ -366,6 +366,84 @@ def build_brief(uid, prefs, cv=None):
 
 
 # ---------------------------------------------------------------------------
+# Pool re-estimate
+# ---------------------------------------------------------------------------
+# When the candidate taps a "grow your pool" change on the brief, the webapp asks for a fresh total
+# for the whole updated search instead of adding a per-change guess to the original number (those
+# guesses were made relative to the first estimate and drifted far from what a fresh brief for the
+# same choices reports). Same market snapshot, no web search, so it is quick and stays consistent.
+
+RECOUNT_SCHEMA = {
+    "type": "object",
+    "properties": {"open_roles": {"type": "integer"}},
+    "required": ["open_roles"],
+    "additionalProperties": False,
+}
+
+RECOUNT_PROMPT = """You estimated how many open roles fit a job seeker's search. They changed their \
+search. Estimate the open roles for the UPDATED search, on the same basis as the original estimate.
+
+ORIGINAL SEARCH:
+{before}
+
+ORIGINAL ESTIMATE: about {open_roles} open roles.
+
+UPDATED SEARCH:
+{after}
+
+MARKET SNAPSHOT used for the original estimate:
+{market}
+
+Rules:
+- Count roles that fit the whole updated search: any of its titles, in any of its locations or
+  remote if included, at or above its minimum salary.
+- Be consistent with the original estimate: if the search only grew (more titles, more places,
+  remote added, lower minimum) the number must not go down; if it only shrank it must not go up;
+  if nothing that matters changed, return the original number.
+- Size the change realistically for what was added: a big metro or "remote" for a common role can
+  add a lot; a niche title or a small town adds little.
+- open_roles: one whole number."""
+
+
+def _search_summary(prefs):
+    loc = (prefs or {}).get("location") or {}
+    return json.dumps({
+        "job_titles": (prefs or {}).get("jobTitles") or [],
+        "workplace": loc.get("type"),
+        "locations": loc.get("places"),
+        "minimum_salary": (prefs or {}).get("minimumAcceptableSalary") or "",
+        "currency": (prefs or {}).get("salaryCurrency") or "",
+    }, indent=2)
+
+
+def recount_open_roles(uid, base_prefs, prefs, market=None, open_roles=0):
+    """Estimated open roles for `prefs`, anchored on the brief's estimate (`open_roles`) for
+    `base_prefs`. Returns {"open_roles": int}; falls back to the original number on failure."""
+    base = max(0, int(open_roles or 0))
+    before, after = _search_summary(base_prefs), _search_summary(prefs)
+    if before == after or not base:
+        return {"open_roles": base}
+    path = _cache_path("recount", uid, {"before": before, "after": after, "base": base, "v": 1})
+    hit = _cached(path)
+    if hit:
+        return hit
+    try:
+        response = send_jobbyo.responses_create(
+            model=send_jobbyo.SEARCH_MODEL,
+            input=RECOUNT_PROMPT.format(before=before, after=after, open_roles=base,
+                                        market=json.dumps(market or {}, indent=2)[:4000]),
+            text={"format": {"type": "json_schema", "name": "pool_recount", "schema": RECOUNT_SCHEMA, "strict": True}},
+        )
+        n = max(0, int(json.loads(response.output_text).get("open_roles") or 0))
+    except Exception as e:
+        print(f"setup_brief recount failed (non-fatal): {e}")
+        return {"open_roles": base}
+    result = {"open_roles": n or base}
+    _store(path, result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Calibration roles
 # ---------------------------------------------------------------------------
 # Shown while the first search runs, for a quick "would you apply?" rating. These are EXAMPLE
