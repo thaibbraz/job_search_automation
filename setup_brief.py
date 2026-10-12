@@ -654,15 +654,16 @@ def calibration_jobs(uid, prefs=None, cv=None):
 # on what suits them and the structured preferences the app keeps in settings. Option lists match
 # the webapp's automation settings (jobPreferences.companyPreferences.industries / .sizes and
 # jobPreferences.experienceLevel), so whatever is filled here shows up there and can be edited.
+# Industries are free text (AI-picked, as specific as the ratings allow); sizes and levels use the
+# settings' fixed options.
 
-PROFILE_INDUSTRIES = ["Technology", "Healthcare", "Finance", "Education", "Retail", "Manufacturing", "Media", "Consulting"]
 PROFILE_SIZES = ["Startup", "Small", "Mid-size", "Large"]
 
 PROFILE_SCHEMA = {
     "type": "object",
     "properties": {
         "summary": {"type": "string"},
-        "industries": {"type": "array", "items": {"type": "string", "enum": PROFILE_INDUSTRIES}},
+        "industries": {"type": "array", "items": {"type": "string"}},
         "company_sizes": {"type": "array", "items": {"type": "string", "enum": PROFILE_SIZES}},
         "culture": {"type": "array", "items": {"type": "string"}},
         "levels": {"type": "array", "items": {"type": "string", "enum": SENIORITY_LEVELS}},
@@ -688,7 +689,9 @@ Return:
 - summary: 2-3 sentences written to them ("you"), a real analysis rather than a list: what kind of
   company and environment they are drawn to and what they avoid, and why that fits (or stretches)
   their background. Specific, plain language, no flattery, no em dashes.
-- industries: 1-3 from the allowed list that best match what they would apply to and their background.
+- industries: 1-3 specific industries or sectors that best match what they would apply to and their
+  background, 1-3 words each, as precise as the ratings allow (e.g. "Public healthcare", "Fintech",
+  "Renewable energy", "B2B SaaS"), not broad buckets like "Other".
 - company_sizes: 1-3 from the allowed list (Startup <50, Small 50-200, Mid-size 201-1000, Large 1000+).
 - culture: 1-3 short traits they lean towards, 1-3 words each, e.g. "Calm", "Mission-driven",
   "Fast-paced", "Structured".
@@ -717,7 +720,7 @@ def calibration_profile(uid, ratings, prefs=None, cv=None):
         "job_titles": prefs.get("jobTitles") or [],
         "locations": (prefs.get("location") or {}).get("places") or [],
     }
-    path = _cache_path("profile", uid, {"cv": cv_text, "rated": rated, "choices": choices, "v": 1})
+    path = _cache_path("profile", uid, {"cv": cv_text, "rated": rated, "choices": choices, "v": 2})
     hit = _cached(path)
     if hit:
         return hit
@@ -744,7 +747,7 @@ def calibration_profile(uid, ratings, prefs=None, cv=None):
 
     result = {
         "summary": str(data.get("summary") or "").replace("—", ",").strip()[:600],
-        "industries": uniq(data.get("industries"), PROFILE_INDUSTRIES),
+        "industries": uniq(data.get("industries")),
         "company_sizes": uniq(data.get("company_sizes"), PROFILE_SIZES),
         "culture": uniq(data.get("culture")),
         "levels": uniq(data.get("levels"), SENIORITY_LEVELS, 2),
