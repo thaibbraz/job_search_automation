@@ -143,6 +143,19 @@ ADVICE_SCHEMA = {
     "properties": {
         "headline": {"type": "string"},
         "location_advice": {"type": "string"},
+        "location_options": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["add_remote", "add_hybrid", "add_location"]},
+                    "value": {"type": "string"},
+                    "label": {"type": "string"},
+                },
+                "required": ["kind", "value", "label"],
+                "additionalProperties": False,
+            },
+        },
         "title_advice": {"type": "string"},
         "titles_to_add": {"type": "array", "items": {"type": "string"}},
         "titles_to_drop": {"type": "array", "items": {"type": "string"}},
@@ -178,7 +191,7 @@ ADVICE_SCHEMA = {
             },
         },
     },
-    "required": ["headline", "location_advice", "title_advice", "titles_to_add", "titles_to_drop", "salary_advice", "numbers",
+    "required": ["headline", "location_advice", "location_options", "title_advice", "titles_to_add", "titles_to_drop", "salary_advice", "numbers",
                  "market_is_small", "expansions"],
     "additionalProperties": False,
 }
@@ -205,6 +218,11 @@ Return:
 - location_advice: 1-2 sentences on their location choices (for example, if remote-only shrinks
   the pool a lot, or a nearby hub or a specific country is worth adding). If their choices are
   already right, say so briefly.
+- location_options: the one-tap changes your location_advice recommends, 0-3, so the candidate can
+  apply them right there. Each: kind add_remote, add_hybrid or add_location; value "remote",
+  "hybrid", or the city/metro/country text; label 2-5 words for a button, e.g. "Include remote",
+  "Include hybrid", "Add Porto". Only what the advice actually suggests, never something they
+  already chose; [] if the advice says their choices are already right.
 - title_advice: 1-2 sentences on the titles they picked: which pivot or title change would open
   the most doors, grounded in their background.
 - titles_to_add: 0-4 titles worth adding to their search that they did not pick.
@@ -292,6 +310,27 @@ def _clean_expansions(items, prefs):
     return out[:4]
 
 
+def _clean_location_options(items, prefs):
+    """Location advice as buttons: skip anything already chosen or empty."""
+    loc = prefs.get("location") or {}
+    places = {str(p).strip().lower() for p in loc.get("places") or []}
+    types = loc.get("type") or []
+    types = [types] if isinstance(types, str) else types
+    out, seen = [], set()
+    for o in items:
+        kind = o.get("kind")
+        value = " ".join(str(o.get("value") or "").split())
+        if kind == "add_remote":
+            value = "remote"
+        elif kind == "add_hybrid":
+            value = "hybrid"
+        if not value or (kind, value.lower()) in seen or value in types or value.lower() in places:
+            continue
+        seen.add((kind, value.lower()))
+        out.append({"kind": kind, "value": value, "label": str(o.get("label") or value)[:40].replace("\u2014", ",")})
+    return out[:3]
+
+
 def build_brief(uid, prefs, cv=None):
     prefs = prefs or {}
     profile, cv_text = _profile_or_raise(uid, cv)
@@ -301,7 +340,7 @@ def build_brief(uid, prefs, cv=None):
         "location": prefs.get("location") or {},
         "minimumAcceptableSalary": prefs.get("minimumAcceptableSalary") or "",
         "salaryCurrency": prefs.get("salaryCurrency") or "",
-        "v": 3,  # bump when the brief's shape changes, so old cached briefs aren't served
+        "v": 4,  # bump when the brief's shape changes, so old cached briefs aren't served
     }
     path = _cache_path("brief", uid, inputs)
     hit = _cached(path)
@@ -351,6 +390,7 @@ def build_brief(uid, prefs, cv=None):
         "market": {k: strip(v) for k, v in (market or {}).items()},
         "advice": {
             "location": advice.get("location_advice", ""),
+            "location_options": _clean_location_options(advice.get("location_options") or [], prefs),
             "titles": advice.get("title_advice", ""),
             "salary": advice.get("salary_advice", ""),
             "titles_to_add": advice.get("titles_to_add", []),
