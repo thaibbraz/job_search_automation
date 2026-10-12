@@ -331,6 +331,18 @@ def _clean_location_options(items, prefs):
     return out[:3]
 
 
+def _location_options(advice, prefs):
+    """The model's location buttons, plus remote/hybrid whenever the advice text recommends them but
+    the model left them out of the list (it sometimes does)."""
+    options = _clean_location_options(advice.get("location_options") or [], prefs)
+    text = str(advice.get("location_advice") or "").lower()
+    have = {o["kind"] for o in options}
+    for kind, word, label in (("add_hybrid", "hybrid", "Include hybrid"), ("add_remote", "remote", "Include remote")):
+        if kind not in have and word in text:
+            options += _clean_location_options([{"kind": kind, "value": word, "label": label}], prefs)
+    return options[:3]
+
+
 def build_brief(uid, prefs, cv=None):
     prefs = prefs or {}
     profile, cv_text = _profile_or_raise(uid, cv)
@@ -340,7 +352,7 @@ def build_brief(uid, prefs, cv=None):
         "location": prefs.get("location") or {},
         "minimumAcceptableSalary": prefs.get("minimumAcceptableSalary") or "",
         "salaryCurrency": prefs.get("salaryCurrency") or "",
-        "v": 4,  # bump when the brief's shape changes, so old cached briefs aren't served
+        "v": 5,  # bump when the brief's shape changes, so old cached briefs aren't served
     }
     path = _cache_path("brief", uid, inputs)
     hit = _cached(path)
@@ -390,7 +402,7 @@ def build_brief(uid, prefs, cv=None):
         "market": {k: strip(v) for k, v in (market or {}).items()},
         "advice": {
             "location": advice.get("location_advice", ""),
-            "location_options": _clean_location_options(advice.get("location_options") or [], prefs),
+            "location_options": _location_options(advice, prefs),
             "titles": advice.get("title_advice", ""),
             "salary": advice.get("salary_advice", ""),
             "titles_to_add": advice.get("titles_to_add", []),
