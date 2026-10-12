@@ -686,9 +686,10 @@ CV (excerpt):
 {cv_excerpt}
 
 Return:
-- summary: 2-3 sentences written to them ("you"), a real analysis rather than a list: what kind of
-  company and environment they are drawn to and what they avoid, and why that fits (or stretches)
-  their background. Specific, plain language, no flattery, no em dashes.
+- summary: 2 short sentences to them ("you"), under 35 words total, everyday words. First: what
+  kind of place suits them. Second: what they avoid, or why it fits their background. No jargon,
+  no flattery, no em dashes. Example: "You do best in calm, well-run hospitals. You skip fast
+  startups, which fits your hands-on ICU work."
 - industries: 1-3 specific industries or sectors that best match what they would apply to and their
   background, 1-3 words each, as precise as the ratings allow (e.g. "Public healthcare", "Fintech",
   "Renewable energy", "B2B SaaS"), not broad buckets like "Other".
@@ -720,7 +721,7 @@ def calibration_profile(uid, ratings, prefs=None, cv=None):
         "job_titles": prefs.get("jobTitles") or [],
         "locations": (prefs.get("location") or {}).get("places") or [],
     }
-    path = _cache_path("profile", uid, {"cv": cv_text, "rated": rated, "choices": choices, "v": 2})
+    path = _cache_path("profile", uid, {"cv": cv_text, "rated": rated, "choices": choices, "v": 3})
     hit = _cached(path)
     if hit:
         return hit
