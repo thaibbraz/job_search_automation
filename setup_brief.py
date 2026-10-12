@@ -366,7 +366,7 @@ def build_brief(uid, prefs, cv=None):
         "location": prefs.get("location") or {},
         "minimumAcceptableSalary": prefs.get("minimumAcceptableSalary") or "",
         "salaryCurrency": prefs.get("salaryCurrency") or "",
-        "v": 6,  # bump when the brief's shape changes, so old cached briefs aren't served
+        "v": 7,  # bump when the brief's shape changes, so old cached briefs aren't served
     }
     path = _cache_path("brief", uid, inputs)
     hit = _cached(path)
@@ -440,7 +440,7 @@ def build_brief(uid, prefs, cv=None):
 # only the totals are read. Salary isn't filtered: most postings don't list one, and filtering on
 # it would hide them. Falls back to the AI estimate when Jobo is unavailable.
 
-OPEN_ROLES_WINDOW_HOURS = 24
+OPEN_ROLES_WINDOW_HOURS = 24 * 30  # 30 days
 
 
 def jobo_open_roles(prefs):
