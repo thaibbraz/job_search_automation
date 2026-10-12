@@ -17,7 +17,10 @@ inputs so re-opening the last setup screen doesn't re-bill the LLM calls.
 import hashlib
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import requests
 
 import outreach
 import send_jobbyo
@@ -331,6 +334,17 @@ def _clean_location_options(items, prefs):
     return out[:3]
 
 
+def _with_real_counts(numbers, prefs):
+    """Swap the AI's open-roles / remote-share figures for Jobo's real counts when available."""
+    real = jobo_open_roles(prefs)
+    if not real:
+        return {**numbers, "source": "estimate"}
+    out = {**numbers, "open_roles": real["open_roles"], "window_hours": real["window_hours"], "source": "jobo"}
+    if real["remote_share_percent"] is not None:
+        out["remote_share_percent"] = real["remote_share_percent"]
+    return out
+
+
 def _location_options(advice, prefs):
     """The model's location buttons, plus remote/hybrid whenever the advice text recommends them but
     the model left them out of the list (it sometimes does)."""
@@ -352,7 +366,7 @@ def build_brief(uid, prefs, cv=None):
         "location": prefs.get("location") or {},
         "minimumAcceptableSalary": prefs.get("minimumAcceptableSalary") or "",
         "salaryCurrency": prefs.get("salaryCurrency") or "",
-        "v": 5,  # bump when the brief's shape changes, so old cached briefs aren't served
+        "v": 6,  # bump when the brief's shape changes, so old cached briefs aren't served
     }
     path = _cache_path("brief", uid, inputs)
     hit = _cached(path)
@@ -408,13 +422,63 @@ def build_brief(uid, prefs, cv=None):
             "titles_to_add": advice.get("titles_to_add", []),
             "titles_to_drop": advice.get("titles_to_drop", []),
         },
-        "numbers": _clean_numbers(advice.get("numbers") or {}),
+        "numbers": _with_real_counts(_clean_numbers(advice.get("numbers") or {}), prefs),
         "market_is_small": bool(advice.get("market_is_small")),
         "expansions": _clean_expansions(advice.get("expansions") or [], prefs),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     _store(path, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Real open-role counts (Jobo)
+# ---------------------------------------------------------------------------
+# "Open roles that fit your search" is a real count from Jobo's job index (company career sites,
+# the same source the nightly search uses): jobs for any of their titles, in their places, with
+# their workplace types, posted in the last OPEN_ROLES_WINDOW_HOURS. One call with page_size 1, so
+# only the totals are read. Salary isn't filtered: most postings don't list one, and filtering on
+# it would hide them. Falls back to the AI estimate when Jobo is unavailable.
+
+OPEN_ROLES_WINDOW_HOURS = 24
+
+
+def jobo_open_roles(prefs):
+    """{"open_roles", "remote_share_percent", "window_hours"} for the search, or None."""
+    if not getattr(send_jobbyo, "JOBO_API_KEY", ""):
+        return None
+    prefs = prefs or {}
+    titles = [str(t).strip() for t in prefs.get("jobTitles") or [] if str(t).strip()][:20]
+    if not titles:
+        return None
+    loc = prefs.get("location") or {}
+    types = loc.get("type") or []
+    types = [types] if isinstance(types, str) else types
+    work_models = [t for t in types if t in ("remote", "hybrid", "onsite")] or ["remote", "hybrid", "onsite"]
+    posted_after = (datetime.now(timezone.utc) - timedelta(hours=OPEN_ROLES_WINDOW_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    base = {"queries": titles, "page_size": 1, "posted_after": posted_after}
+    places = [str(p).strip() for p in loc.get("places") or [] if str(p).strip()]
+    if places:
+        base["locations"] = places
+
+    def total(models):
+        resp = requests.post(f"{send_jobbyo.JOBO_API_BASE}/api/jobs/search",
+                             headers={"X-Api-Key": send_jobbyo.JOBO_API_KEY, "Content-Type": "application/json"},
+                             json={**base, "work_models": models}, timeout=30)
+        resp.raise_for_status()
+        return max(0, int(resp.json().get("total") or 0))
+
+    try:
+        # Jobo has no work-model breakdown for multi-title queries, so the remote share comes
+        # from two counts: every workplace, and remote only.
+        everything = total(["remote", "hybrid", "onsite"])
+        remote_only = total(["remote"])
+        mine = everything if len(work_models) == 3 else total(work_models)
+    except Exception as e:
+        print(f"setup_brief Jobo count failed (falls back to the AI estimate): {e}")
+        return None
+    share = round(100 * remote_only / everything) if everything else None
+    return {"open_roles": mine, "remote_share_percent": share, "window_hours": OPEN_ROLES_WINDOW_HOURS}
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +535,9 @@ def _search_summary(prefs):
 def recount_open_roles(uid, base_prefs, prefs, market=None, open_roles=0):
     """Estimated open roles for `prefs`, anchored on the brief's estimate (`open_roles`) for
     `base_prefs`. Returns {"open_roles": int}; falls back to the original number on failure."""
+    real = jobo_open_roles(prefs)
+    if real:
+        return {"open_roles": real["open_roles"], "source": "jobo", "window_hours": real["window_hours"]}
     base = max(0, int(open_roles or 0))
     before, after = _search_summary(base_prefs), _search_summary(prefs)
     if before == after or not base:
