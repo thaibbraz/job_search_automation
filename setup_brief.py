@@ -335,13 +335,17 @@ def _clean_location_options(items, prefs):
 
 
 def _with_real_counts(numbers, prefs):
-    """Swap the AI's open-roles / remote-share figures for Jobo's real counts when available."""
+    """Open roles: the AI's estimate from the web-search market snapshot (LinkedIn and job boards),
+    with Jobo's real count as a floor. Jobo only sees company career sites, so on its own it
+    undercounts badly (1 role where the market shows hundreds). The remote share comes from Jobo
+    when it has enough roles to say."""
     real = jobo_open_roles(prefs)
-    if not real:
-        return {**numbers, "source": "estimate"}
-    out = {**numbers, "open_roles": real["open_roles"], "window_hours": real["window_hours"], "source": "jobo"}
-    if real["remote_share_percent"] is not None:
-        out["remote_share_percent"] = real["remote_share_percent"]
+    est = numbers.get("open_roles") or 0
+    out = {**numbers, "source": "estimate"}
+    if real:
+        out["open_roles"] = max(est, real["open_roles"]) or None
+        if real["remote_share_percent"] is not None and real["open_roles"] >= 30:
+            out["remote_share_percent"] = real["remote_share_percent"]
     return out
 
 
@@ -366,7 +370,7 @@ def build_brief(uid, prefs, cv=None):
         "location": prefs.get("location") or {},
         "minimumAcceptableSalary": prefs.get("minimumAcceptableSalary") or "",
         "salaryCurrency": prefs.get("salaryCurrency") or "",
-        "v": 7,  # bump when the brief's shape changes, so old cached briefs aren't served
+        "v": 8,  # bump when the brief's shape changes, so old cached briefs aren't served
     }
     path = _cache_path("brief", uid, inputs)
     hit = _cached(path)
@@ -535,14 +539,11 @@ def _search_summary(prefs):
 def recount_open_roles(uid, base_prefs, prefs, market=None, open_roles=0):
     """Estimated open roles for `prefs`, anchored on the brief's estimate (`open_roles`) for
     `base_prefs`. Returns {"open_roles": int}; falls back to the original number on failure."""
-    real = jobo_open_roles(prefs)
-    if real:
-        return {"open_roles": real["open_roles"], "source": "jobo", "window_hours": real["window_hours"]}
     base = max(0, int(open_roles or 0))
     before, after = _search_summary(base_prefs), _search_summary(prefs)
     if before == after or not base:
         return {"open_roles": base}
-    path = _cache_path("recount", uid, {"before": before, "after": after, "base": base, "v": 2})
+    path = _cache_path("recount", uid, {"before": before, "after": after, "base": base, "v": 3})
     hit = _cached(path)
     if hit:
         return hit
@@ -563,6 +564,9 @@ def recount_open_roles(uid, base_prefs, prefs, market=None, open_roles=0):
         n = max(n, base)
     elif direction < 0:
         n = min(n, base) if n else base
+    real = jobo_open_roles(prefs)
+    if real:
+        n = max(n, real["open_roles"])
     result = {"open_roles": n or base}
     _store(path, result)
     return result
