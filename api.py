@@ -44,7 +44,9 @@ Set JOBBYO_TARGET_JOBS in .env to control the per-user daily target (default 9).
 import asyncio
 import json
 import os
+import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -163,11 +165,12 @@ class StatusResponse(BaseModel):
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 
-async def _run_subprocess(cmd: list[str], label: str) -> int:
+async def _run_subprocess(cmd: list[str], label: str, env: Optional[dict] = None) -> int:
     print(f"[{label}] Starting: {' '.join(cmd)}")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(SCRIPT_DIR),
+        env={**os.environ, **env} if env else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
@@ -318,6 +321,7 @@ async def _finish_subscribed_run(
     # user (one per round they were part of), deduped by job_url.
     new_logs = sorted(set(RUN_LOG_DIR.glob("job_run_*.json")) - existing_logs)
     jobs_added = []
+    user_entries = []
     resolved_uid, resolved_email = None, None
     if new_logs:
         try:
@@ -331,6 +335,7 @@ async def _finish_subscribed_run(
                 continue
             resolved_uid = resolved_uid or r.get("uid")
             resolved_email = resolved_email or r.get("email")
+            user_entries.append(r)
             for j in (r.get("jobs_added") or []):
                 url = j.get("job_url")
                 if url and url in seen_urls:
@@ -369,14 +374,80 @@ async def _finish_subscribed_run(
             emailed=False,
         )
 
-    emailed = False
-    profile = {}
+    # The signup run was a first-match dry run (see run_user_subscribed):
+    # nothing is in their queue yet. Curate, then post only what survives.
+    import send_jobbyo, approve_jobs, outreach, first_match
+
+    profile = send_jobbyo.get_user_profile(resolved_uid) or {}
+    recipient = TOP_JOBS_TEST_RECIPIENT or resolved_email or target.email
+    who = profile.get("displayName") or recipient
+    job_status = next((r.get("job_status") for r in user_entries if r.get("job_status")), "waiting_approval")
+    report = None
     try:
-        import send_jobbyo, approve_jobs, outreach
+        report = await asyncio.to_thread(first_match.curate, resolved_uid, user_entries, profile)
+    except Exception as exc:
+        print(f"[{label}] first-match curation failed, falling back to the plain first email: {exc}")
 
-        profile = send_jobbyo.get_user_profile(resolved_uid) or {}
-        recipient = TOP_JOBS_TEST_RECIPIENT or resolved_email or target.email
+    if report is not None:
+        kept = report["kept"]
+        try:
+            await asyncio.to_thread(first_match.post_kept, report, job_status)
+        except Exception as exc:
+            print(f"[{label}] posting curated jobs failed: {exc}")
+            await asyncio.to_thread(
+                _send_ops_only_slack_sync,
+                f"Curated {len(kept)} first matches for {who} but couldn't save them to their queue ({exc}). "
+                f"Nothing was emailed. Saved in run_logs/first_match_{resolved_uid}.json.",
+            )
+            kept = []
+            emailed = False
+        else:
+            emailed = False
+            if len(kept) >= first_match.MIN_JOBS_TO_EMAIL:
+                try:
+                    emailed = await asyncio.to_thread(first_match.send_first_match_email, report, recipient)
+                except Exception as exc:
+                    print(f"[{label}] first-match email failed: {exc}")
+                slack_text = (
+                    f"First matches for {who}: kept {len(kept)} of {report['stats']['checked']} checked"
+                    + (" and sent the welcome email." if emailed else ", but the email failed to send — worth a look.")
+                )
+            else:
+                # Never send a thin first email: hold it for the team to top up.
+                tags = " ".join(t for t in (SLACK_MENTION_GALIH, SLACK_MENTION_NADIA) if t)
+                drops = Counter(d.get("drop_category") for d in report["dropped"]).most_common(3)
+                slack_text = (
+                    f"Only {len(kept)} strong first match(es) for {who} out of {report['stats']['checked']} checked "
+                    f"(main drops: {', '.join(f'{c} {n}' for c, n in drops) or 'none'}). Saved to their queue; "
+                    f"welcome email is held. {tags} can you find a few more by hand? Then send it with "
+                    f"`python3 first_match.py --uid {resolved_uid} --send`.".strip()
+                )
+            await asyncio.to_thread(_send_ops_only_slack_sync, slack_text)
 
+        response_jobs = [
+            TopJob(title=j.get("title"), company=j.get("company"), url=j.get("job_url"),
+                   location=j.get("location"), grade=j.get("grade"), reason=j.get("fit_line"))
+            for j in kept
+        ]
+        return SubscribedJobsResponse(
+            accepted=True,
+            message=f"Kept {len(kept)} first match(es) for {target.uid or target.email}."
+            + (" Emailed." if emailed else " Not emailed."),
+            duration_seconds=duration_seconds,
+            jobs_found=len(kept),
+            jobs=response_jobs,
+            emailed=emailed,
+        )
+
+    # Fallback (curation crashed): save what the pipeline found and send the
+    # plain first email, so a new user is never left with nothing.
+    try:
+        jobs_added = jobs_added[:send_jobbyo.TARGET_JOBS_PER_USER]
+        send_jobbyo.api_post_jobs(resolved_email, jobs_added, default_status=job_status, uid=resolved_uid)
+    except Exception as exc:
+        print(f"[{label}] fallback posting failed: {exc}")
+    emailed = False
+    try:
         # The welcome email itself IS the persona-coaching + strategy-PDF
         # note now (was a separate, later follow-up) -- build_context's own
         # sample_jobs caps at 3 for the follow-up-note use case, so override
@@ -549,7 +620,15 @@ async def run_user_subscribed(target: UserTarget):
     existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
     started_at = asyncio.get_event_loop().time()
 
-    task = asyncio.ensure_future(_run_subprocess([PYTHON, "send_jobbyo.py", *args], label))
+    # First match: gather a wider pool and post nothing -- first_match.py
+    # curates it in _finish_subscribed_run before anything reaches the user.
+    first_match_env = {
+        "JOBBYO_DRY_RUN": "1",
+        "JOBBYO_FIRST_MATCH": "1",
+        "JOBBYO_TARGET_JOBS": os.getenv("JOBBYO_FIRST_MATCH_POOL", "25"),
+        "JOBBYO_DRY_RUN_FILE": f"run_logs/dry_run_first_match_{re.sub(r'[^A-Za-z0-9]+', '_', key)}.json",
+    }
+    task = asyncio.ensure_future(_run_subprocess([PYTHON, "send_jobbyo.py", *args], label, env=first_match_env))
     _background_keepalive.add(task)
     task.add_done_callback(_background_keepalive.discard)
 

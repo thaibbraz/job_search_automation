@@ -941,13 +941,17 @@ def send_prospect_outreach_email(context, body_text, pdf_bytes=None, override_em
     return True
 
 
-def send_paid_welcome_email(context, body_text, pdf_bytes=None, override_email=None, subject=None):
+def send_paid_welcome_email(context, body_text, pdf_bytes=None, override_email=None, subject=None, body_html=None):
     """Paid-user counterpart to send_prospect_outreach_email: same personal-
     note framing and PDF-contents teaser, but the job list is their real
     matches (context["sample_jobs"] from build_context, already saved to
     their queue) and there's no trial CTA -- they're already subscribed, so
     the closing just points at reviewing the queue instead of selling
-    anything."""
+    anything.
+
+    body_html (first_match.render_body_html) replaces the coaching
+    paragraphs and job list with the curated first-matches body; the PDF
+    block and closing stay the same."""
     email = override_email or context["profile"].get("email") or ""
     first_name = context["first_name"]
     sample_jobs = context.get("sample_jobs") or []
@@ -1004,8 +1008,7 @@ def send_paid_welcome_email(context, body_text, pdf_bytes=None, override_email=N
 <html>
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
 <body style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.6;color:#111111;margin:0;padding:16px;">
-{paragraphs}
-{preview_block}
+{body_html or (paragraphs + preview_block)}
 {pdf_block}
 {closing}
 </body>

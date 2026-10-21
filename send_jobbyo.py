@@ -372,6 +372,9 @@ OPENAI_MAX_BATCHES_PER_USER = env_int("JOBBYO_OPENAI_MAX_BATCHES_PER_USER", 1)
 _OPENAI_BATCHES_USED = {}
 
 DRY_RUN = os.getenv("JOBBYO_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+# A new user's first run (api.py run_user_subscribed): gather a wider pool for
+# first_match.py to curate instead of stopping at the usual quota.
+FIRST_MATCH_MODE = os.getenv("JOBBYO_FIRST_MATCH", "").strip().lower() in ("1", "true", "yes")
 
 # Set at runtime when a targeted run resolves to a non-paying candidate: the
 # jobs are found and returned, but nothing is written to their queue.
@@ -6644,7 +6647,9 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
     if not keywords:
         print("Jobo ATS: no keywords extracted — skipping prefetch")
         return [], 0
-    salary_floor = _extract_salary_floor_for_jobo(search_contract)
+    # First match: Jobo's salary filter drops every posting that doesn't list
+    # pay -- most of them. first_match.py checks pay on the full posting.
+    salary_floor = None if FIRST_MATCH_MODE else _extract_salary_floor_for_jobo(search_contract)
     posted_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     bodies = build_jobo_search_bodies(
         keywords=keywords,
