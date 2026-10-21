@@ -1,0 +1,11 @@
+[Unit]
+Description=Jobbyo hot-lead nudge, 15:00 Europe/Madrid
+Requires=jobbyo-search.service
+
+[Timer]
+OnCalendar=*-*-* 15:00:00 Europe/Madrid
+Persistent=true
+Unit=jobbyo-search-nudge.service
+
+[Install]
+WantedBy=timers.target

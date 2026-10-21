@@ -22,6 +22,10 @@ services:
       - jobbyo-search-personas:/app/personas
       - jobbyo-search-contracts:/app/search_contracts
       - jobbyo-search-run-logs:/app/run_logs
+      # Hot-lead queue + outreach touch history: the latter is what stops the
+      # same person being emailed twice, so both must outlive redeploys.
+      - jobbyo-search-hot-leads:/app/hot_leads
+      - jobbyo-search-outreach-log:/app/outreach_log
       # GCS service account key for company_ingestion.py (writes newly-found
       # board links to the jobbyo-job-crawler bucket). Bind-mounted rather
       # than baked into the image so the key never lands in a Docker layer;
@@ -68,6 +72,10 @@ volumes:
   jobbyo-search-contracts:
     driver: local
   jobbyo-search-run-logs:
+    driver: local
+  jobbyo-search-hot-leads:
+    driver: local
+  jobbyo-search-outreach-log:
     driver: local
   caddy-data:
     driver: local

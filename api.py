@@ -27,9 +27,12 @@ GET  /coverage/missing        Paid users not yet emailed today (per approve_jobs
 POST /email/missing           Force-send the daily report to everyone not yet emailed today
 
 POST /leads/hot                Score a just-created automation's salary/location; if it clears
-                               the hot-lead bar (see lead_scoring.py), record it and Slack-post.
+                               the hot-lead bar (see lead_scoring.py), record it.
                                Called from jobbyo-fastapi-server's create_automation_job for
                                anyone not already paid/trialing — no-ops otherwise.
+POST /leads/hot/nudge-due      Daily job: first-touch email to leads older than 24h who still
+                               haven't started a trial (query: ?dry_run=false to actually send;
+                               defaults to a dry run that only returns previews).
 
 Usage
 -----
@@ -96,10 +99,6 @@ SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL_DAILY_RUN", "")
 SLACK_WEBHOOK_URLS = list(dict.fromkeys(
     url for url in (SLACK_WEBHOOK_URL, os.getenv("SLACK_WEBHOOK_URL_NEW_ATS", "")) if url
 ))
-# #marketing-team only, posted under a separate persona ("Jobbyo — the
-# retention specialist") from Laras -- hot-lead / retention-outreach events
-# specifically, not general ops reporting.
-SLACK_WEBHOOK_URL_RETENTION = os.getenv("SLACK_WEBHOOK_URL_RETENTION", "")
 # Slack member IDs (the "Copy member ID" value from a person's Slack
 # profile, not their @handle) for the zero-match escalation below. Rendered
 # as a real <@ID> mention (pings them) when set; falls back to a plain,
@@ -653,14 +652,12 @@ class NudgeResponse(BaseModel):
 
 @app.post("/leads/hot/{uid}/nudge", response_model=NudgeResponse)
 async def send_hot_lead_nudge(uid: str):
-    """Send the prospect nudge email to a recorded hot lead. Meant to be
-    called by the daily outreach job (not built yet) -- exposed as an
-    endpoint too so it can be triggered/tested manually in the meantime.
-    Once it sends: removes the lead from hot_leads/ (a lead only sits there
-    while its first touch is still pending -- ongoing cadence tracking
-    lives in outreach_log/, which this also writes to) and posts a
-    retention Slack summary with who they are, their salary/location, and
-    a snippet of what the email said."""
+    """Send the prospect nudge email to a recorded hot lead. Called per lead
+    by /leads/hot/nudge-due (the daily job); also usable manually. Does NOT
+    check paid status itself -- nudge-due does that first. Once it sends:
+    removes the lead from hot_leads/ (a lead only sits there while its first
+    touch is still pending -- ongoing cadence tracking lives in
+    outreach_log/, which this also writes to). No Slack post."""
     import lead_scoring, outreach_log, outreach
 
     lead = await asyncio.to_thread(lead_scoring.load_lead, uid)
@@ -685,17 +682,93 @@ async def send_hot_lead_nudge(uid: str):
         await asyncio.to_thread(
             outreach_log.record_touch, uid, "hot_lead_nudge", lead.get("tier"), summary,
         )
-        where = lead.get("location_text") or lead.get("region")
-        await asyncio.to_thread(
-            _send_retention_slack_sync,
-            f"📨 Sent a nudge to {lead.get('name') or lead.get('email') or uid} "
-            f"(${lead.get('salary_usd', 0):,}, {where}). What I said: "
-            f"“{summary}…”",
-        )
 
     return NudgeResponse(
         accepted=True, sent=sent,
         message=f"Nudge {'sent' if sent else 'failed'} for {uid}.",
+    )
+
+
+class NudgeDueResponse(BaseModel):
+    dry_run: bool
+    considered: int
+    too_recent: int
+    converted: int
+    no_email: int
+    already_nudged: int
+    sent: int
+    failed: int
+    previews: list[dict] = []
+
+
+NUDGE_MAX_PER_RUN = 25
+
+
+@app.post("/leads/hot/nudge-due", response_model=NudgeDueResponse)
+async def nudge_due_hot_leads(dry_run: bool = True, min_age_hours: float = 24.0):
+    """The daily outreach job's body: first-touch nudge for every recorded
+    hot lead older than min_age_hours who still hasn't started a trial.
+    Defaults to dry_run so a stray call never emails anyone -- the systemd
+    script passes dry_run=false explicitly. Anyone now in /users/paid
+    (trialing counts) is treated as converted: dropped from the queue, not
+    emailed. If the paid list can't be fetched this refuses to run rather
+    than risk emailing someone who already signed up."""
+    import lead_scoring, outreach_log, outreach, send_jobbyo
+
+    paid_users = await asyncio.to_thread(send_jobbyo.get_paid_users)
+    paid_uids = {u for u in (_uid_of(p) for p in paid_users) if u}
+    if not paid_uids:
+        raise HTTPException(status_code=503, detail="Could not load /users/paid; refusing to send nudges blind.")
+
+    leads = await asyncio.to_thread(lead_scoring.list_leads)
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=min_age_hours)
+    counts = dict(too_recent=0, converted=0, no_email=0, already_nudged=0, sent=0, failed=0)
+    previews: list[dict] = []
+    attempts = 0
+
+    for lead in leads:
+        uid = lead.get("uid")
+        added_at = parse_utc_timestamp(lead.get("added_at"))
+        if not uid or added_at is None or added_at > cutoff:
+            counts["too_recent"] += 1
+            continue
+        if uid in paid_uids:
+            counts["converted"] += 1
+            if not dry_run:
+                await asyncio.to_thread(lead_scoring.remove_lead, uid)
+            continue
+        if not lead.get("email"):
+            counts["no_email"] += 1
+            continue
+        history = await asyncio.to_thread(outreach_log.get_touch_history, uid)
+        if any(t.get("campaign") == "hot_lead_nudge" for t in history):
+            counts["already_nudged"] += 1
+            if not dry_run:
+                await asyncio.to_thread(lead_scoring.remove_lead, uid)
+            continue
+
+        if dry_run:
+            context = await asyncio.to_thread(outreach.build_prospect_context, uid)
+            body_text = await asyncio.to_thread(outreach.generate_prospect_message, context)
+            previews.append({
+                "uid": uid, "email": lead.get("email"), "name": lead.get("name"),
+                "tier": lead.get("tier"), "added_at": lead.get("added_at"),
+                "message": body_text,
+            })
+            continue
+
+        if attempts >= NUDGE_MAX_PER_RUN:
+            break
+        attempts += 1
+        try:
+            result = await send_hot_lead_nudge(uid)
+            counts["sent" if result.sent else "failed"] += 1
+        except Exception as e:
+            print(f"[nudge_due] {uid} failed: {e}")
+            counts["failed"] += 1
+
+    return NudgeDueResponse(
+        dry_run=dry_run, considered=len(leads), previews=previews, **counts,
     )
 
 
@@ -787,25 +860,6 @@ def _send_ops_only_slack_sync(text: str) -> bool:
     resp = requests.post(
         SLACK_WEBHOOK_URL,
         json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"},
-        timeout=10,
-    )
-    if resp.status_code != 200:
-        print(f"[slack] Webhook returned {resp.status_code}: {resp.text[:200]}")
-        return False
-    return True
-
-
-def _send_retention_slack_sync(text: str) -> bool:
-    """Hot-lead / retention-outreach events, posted to #marketing-team under
-    a distinct persona from Laras -- this is a different audience (growth/
-    marketing, not ops) watching for a different kind of signal (leads worth
-    chasing, not pipeline health)."""
-    if not SLACK_WEBHOOK_URL_RETENTION:
-        print("[slack] No retention Slack webhook configured — skipping notification.")
-        return False
-    resp = requests.post(
-        SLACK_WEBHOOK_URL_RETENTION,
-        json={"text": text, "username": "Jobbyo — the retention specialist", "icon_emoji": ":handshake:"},
         timeout=10,
     )
     if resp.status_code != 200:

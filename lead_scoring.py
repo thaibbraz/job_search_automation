@@ -5,11 +5,9 @@ re-added on every automation edit.
 Called from api.py's POST /leads/hot, which jobbyo-fastapi-server's
 create_automation_job hits (best-effort, fire-and-forget) for anyone who
 isn't already a paying/trialing user at automation-creation time. This is
-the qualification half only -- the daily outreach agent that actually
-nudges these people (24h after they qualify, bounded follow-ups, Slack per
-send) is a separate, not-yet-built piece; today this module only decides
-"is this person worth chasing" and records them for that later job to pick
-up.
+the qualification half only -- api.py's POST /leads/hot/nudge-due (run daily
+by jobbyo-search-nudge.timer) picks these records up 24h after they qualify
+and sends the first touch. The 3-day/7-day follow-ups are not built yet.
 """
 
 import json
@@ -181,6 +179,18 @@ def load_lead(uid: str) -> Optional[dict]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def list_leads() -> list:
+    """Every lead still pending first touch, unparseable files skipped."""
+    if not HOT_LEADS_DIR.exists():
+        return []
+    leads = []
+    for path in sorted(HOT_LEADS_DIR.glob("*.json")):
+        lead = load_lead(path.stem)
+        if lead:
+            leads.append(lead)
+    return leads
 
 
 def remove_lead(uid: str) -> None:

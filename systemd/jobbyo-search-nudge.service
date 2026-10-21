@@ -1,0 +1,10 @@
+[Unit]
+Description=Jobbyo hot-lead nudge — 15:00 Europe/Madrid (first-touch email to leads who haven't started a trial)
+After=jobbyo-search.service docker.service
+Requires=jobbyo-search.service docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/script_job_search
+EnvironmentFile=/opt/script_job_search/.env
+ExecStart=/opt/script_job_search/scripts/run_hot_lead_nudges.sh
