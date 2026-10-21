@@ -636,17 +636,8 @@ async def add_hot_lead(candidate: HotLeadCandidate):
             message=f"{candidate.uid} did not clear the salary/region bar.",
         )
 
+    # Recorded quietly: the per-lead Slack post to #marketing-team was removed.
     await asyncio.to_thread(lead_scoring.record_lead, lead)
-
-    fire_label = {1: "🔥", 2: "🔥🔥", 3: "🔥🔥🔥"}.get(lead.tier, "🔥")
-    tier_name = {1: "good", 2: "super good", 3: "super-duper good"}.get(lead.tier, "good")
-    where = lead.location_text or lead.region
-    await asyncio.to_thread(
-        _send_retention_slack_sync,
-        f"{fire_label} Just spotted a {tier_name} lead — {lead.name or lead.email or lead.uid} "
-        f"(${lead.salary_usd:,}, {where}). They've set up their search but haven't started "
-        "their trial yet. I'll give them 24h, then reach out if they still haven't signed up.",
-    )
 
     return HotLeadResponse(
         accepted=True, qualified=True,
