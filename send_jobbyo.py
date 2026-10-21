@@ -3972,9 +3972,12 @@ def candidate_forbids_title_or_function(job, search_contract=None):
     if not isinstance(search_contract, dict):
         return False
 
-    title = _norm_words(job.get("title", ""))
-    description = _norm_words(job.get("description", ""))
-    combined = f"{title} {description}"
+    # Title only, whole words: matching the description as raw substrings
+    # rejected ~1/3 of these for the wrong reason ("intern" in "internal",
+    # "lead" in "leading", "director" in "reports to the Director") -- the
+    # same reason role_family_conflicts_candidate below is title-only.
+    title = " ".join(_norm_words(job.get("title", "")).split())
+    combined = f" {title} "
 
     allowed_terms = [
         _norm_words(x)
@@ -3990,10 +3993,10 @@ def candidate_forbids_title_or_function(job, search_contract=None):
     for forbidden in forbidden_terms:
         if not forbidden or len(forbidden) < 3:
             continue
-        if forbidden in combined:
+        if f" {' '.join(forbidden.split())} " in combined:
             # If a term is both forbidden and explicitly allowed due to a noisy
             # contract, do not cheap-reject. Let AI review resolve the conflict.
-            if any(allowed and allowed in combined for allowed in allowed_terms):
+            if any(allowed and f" {' '.join(allowed.split())} " in combined for allowed in allowed_terms):
                 return False
             return True
 
@@ -6234,6 +6237,14 @@ def _build_hc_query(automation, search_contract, user_profile, persona=None):
             locations = ["United Kingdom"]
         elif "eu" in allowed_regions:
             locations = ["Europe"]
+
+    # Remote-only: their places are where they live, not where the job must
+    # be. Searching "Dumfries, Virginia" + remote returned 0 from Jobo; the
+    # same search on "United States" returned dozens.
+    if loc_types == {"remote"}:
+        country = str((((automation or {}).get("settings") or {}).get("address") or {}).get("country") or "").strip()
+        if country:
+            locations = [country]
 
     return keywords, locations, workplace_type
 
