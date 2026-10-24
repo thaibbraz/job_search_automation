@@ -238,13 +238,7 @@ ENABLE_JFE_PREFETCH = env_truthy("JOBBYO_ENABLE_JFE_PREFETCH", False)
 # kept a bit under that so a bad estimate under-shrinks HC/Jobo rather than
 # over-shrinks them -- any remaining shortfall is caught by round 2, which
 # recomputes jobs_needed from the real post-review count, not this estimate.
-# Re-measured 2026-10-09 on the refreshed index: 56 approved of 938 sourced
-# (~6%). The old 0.25 made the pool sizing believe JFE covered the quota and
-# skip HC/Jobo outright -- 7 users ended a run with 0 jobs.
-JFE_ESTIMATED_APPROVAL_RATE = env_float("JOBBYO_JFE_ESTIMATED_APPROVAL_RATE", 0.06)
-# HC/Jobo always fetch at least this share of their normal size, however
-# good JFE looks -- an estimate must never zero out the paid sources.
-MIN_PAID_SOURCE_FRACTION = env_float("JOBBYO_MIN_PAID_SOURCE_FRACTION", 0.5)
+JFE_ESTIMATED_APPROVAL_RATE = env_float("JOBBYO_JFE_ESTIMATED_APPROVAL_RATE", 0.25)
 
 # No-GPT mode: replace OpenAI search/review with more structured inventory from
 # Jobo ATS + HiringCafe, then use the same static URL, HTTP, duplicate, location,
@@ -7080,14 +7074,18 @@ def find_jobs_for_user(
     if ENABLE_JFE_PREFETCH and _hc_override is None and _jobo_override is None:
         _jfe_estimated_yield = round(len(hc_inventory) * JFE_ESTIMATED_APPROVAL_RATE)
         _remaining_needed = max(0, jobs_needed - _jfe_estimated_yield)
-        _quota_fraction = max(MIN_PAID_SOURCE_FRACTION, min(1.0, _remaining_needed / max(TARGET_JOBS_PER_USER, 1)))
+        _quota_fraction = min(1.0, _remaining_needed / max(TARGET_JOBS_PER_USER, 1))
         print(
             f"Demand-aware pool sizing: jobs_needed={jobs_needed}  "
             f"jfe_candidates={len(hc_inventory)}  jfe_est_yield={_jfe_estimated_yield}  "
             f"remaining_needed={_remaining_needed}  quota_fraction={_quota_fraction:.2f}"
         )
-        _hc_override = max(1, round(HIRING_CAFE_MAX_ITEMS * _quota_fraction))
-        _jobo_override = max(1, round(JOBO_ATS_MAX_ITEMS * _quota_fraction))
+        if _remaining_needed <= 0:
+            _skip_hc_jobo = True
+            print("Demand-aware pool sizing: JFE estimated to cover full quota -- skipping HC/Jobo this round.")
+        else:
+            _hc_override = max(1, round(HIRING_CAFE_MAX_ITEMS * _quota_fraction))
+            _jobo_override = max(1, round(JOBO_ATS_MAX_ITEMS * _quota_fraction))
 
     # 1. Hiring Cafe
     _hc_limit = _hc_override
@@ -8717,59 +8715,6 @@ def send_source_health_alert(results_by_uid):
         print(f"Source health alert failed (non-fatal): {e}")
 
 
-def send_rejections_for_galih(results_by_uid):
-    """Daily Slack list of users who rejected jobs in the last 24h, with their
-    reasons and what they're looking for -- so Galih can find replacements."""
-    blocks_text = []
-    total = 0
-    for r in results_by_uid.values():
-        automation = r.get("automation") or {}
-        rejected = feedback_learning.rejected_since(extract_selected_jobs(automation), hours=24)
-        if not rejected:
-            continue
-        total += len(rejected)
-        profile = r.get("user_profile") or {}
-        prefs = extract_job_preferences(automation)
-        name = profile.get("displayName") or (profile.get("email") or "").split("@")[0] or "?"
-        titles = ", ".join((prefs.get("jobTitles") or [])[:3]) or "—"
-        places = ", ".join(((prefs.get("location") or {}).get("places") or [])[:3]) or "—"
-        lines = [f"*{name}* `{profile.get('email') or ''}` · {len(rejected)} rejected · wants {titles} · {places}"]
-        for j in rejected[:6]:
-            reason = str(j.get("feedback") or "").strip()
-            lines.append(f"   • {j.get('title') or '?'} at {j.get('company') or '?'}: "
-                         + (f"_{reason[:140]}_" if reason else "no reason given"))
-        blocks_text.append("\n".join(lines))
-    if not blocks_text:
-        return
-    # Both nightly passes (19:00 + 22:00) are full runs: post once per day.
-    marker = RUN_LOG_DIR / f"galih_rejections_{datetime.now(timezone.utc):%Y-%m-%d}.done"
-    if marker.exists() and not DRY_RUN:
-        return
-
-    header = f"🔍 *Galih — {total} jobs rejected in the last 24h ({len(blocks_text)} users)*\nFind replacements that avoid these reasons:"
-    sections, current = [], header
-    for chunk in blocks_text:  # Slack caps a section at 3000 chars
-        if len(current) + len(chunk) + 2 > 2900:
-            sections.append(current)
-            current = ""
-        current += ("\n\n" if current else "") + chunk
-    sections.append(current)
-
-    webhook = os.getenv("SLACK_WEBHOOK_URL_DAILY_RUN", "")
-    print(header)
-    if not webhook:
-        return
-    try:
-        requests.post(webhook, json={
-            "text": f"Galih — {total} jobs rejected in the last 24h",
-            "username": "Laras", "icon_emoji": ":bar_chart:",
-            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": t}} for t in sections[:45]],
-        }, timeout=15)
-        marker.write_text("posted")
-    except Exception as e:
-        print(f"Rejections-for-Galih Slack post failed (non-fatal): {e}")
-
-
 def save_run_log(all_results):
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     path = RUN_LOG_DIR / f"job_run_{timestamp}.json"
@@ -9253,7 +9198,6 @@ def main():
     if not (SINGLE_USER_EMAIL or SINGLE_USER_EMAILS or SINGLE_USER_UID):
         send_slack_run_report(results_by_uid, _companies_added_by_ats)
         send_source_health_alert(results_by_uid)
-        send_rejections_for_galih(results_by_uid)
 
     total_new = sum(len(v.get("jobs_added") or []) for v in results_by_uid.values())
     total_rejected = sum(len(r.get("jobs_rejected_by_review") or []) for r in all_results)
