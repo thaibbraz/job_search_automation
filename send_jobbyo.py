@@ -376,6 +376,11 @@ DRY_RUN = os.getenv("JOBBYO_DRY_RUN", "").strip().lower() in ("1", "true", "yes"
 # A new user's first run (api.py run_user_subscribed): gather a wider pool for
 # first_match.py to curate instead of stopping at the usual quota.
 FIRST_MATCH_MODE = os.getenv("JOBBYO_FIRST_MATCH", "").strip().lower() in ("1", "true", "yes")
+# Search profile (set from the admin's Job Search page): "quality" posts only
+# Tier A/B matches and skips the loosened minimum-viable round -- better
+# batches, fewer jobs. "volume" is configured through the pool-size knobs.
+SEARCH_PROFILE = os.getenv("JOBBYO_PROFILE", "balanced").strip().lower() or "balanced"
+STRICT_QUALITY = SEARCH_PROFILE == "quality" or os.getenv("JOBBYO_STRICT_QUALITY", "").strip().lower() in ("1", "true", "yes")
 
 # Set at runtime when a targeted run resolves to a non-paying candidate: the
 # jobs are found and returned, but nothing is written to their queue.
@@ -455,6 +460,30 @@ ANTHROPIC_MAX_TOKENS = env_int("JOBBYO_ANTHROPIC_MAX_TOKENS", 16000)
 # reasoning, so they do not need the default effort. Raise if grades look weak.
 ANTHROPIC_EFFORT = os.getenv("JOBBYO_ANTHROPIC_EFFORT", "medium").strip()
 
+# $ per 1M tokens (input, output). The COST_PER_OPENAI_* estimates below were
+# calibrated on gpt-4.1-mini; other models scale them by price, so the cost
+# reports (and the admin's Job Search page) stay right when the model changes.
+LLM_PRICES = {
+    "gpt-4.1": (2.00, 8.00), "gpt-4.1-mini": (0.40, 1.60), "gpt-4.1-nano": (0.10, 0.40),
+    "gpt-4o": (2.50, 10.00), "gpt-4o-mini": (0.15, 0.60),
+    "claude-opus-5-5": (4.00, 20.00), "claude-opus-5": (5.00, 25.00),
+    "claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50), "claude-haiku-4-5": (1.00, 5.00),
+}
+_COST_BASELINE_MODEL = "gpt-4.1-mini"
+
+
+def llm_cost_factor(model):
+    """Price of `model` relative to gpt-4.1-mini, weighted ~88% input / 12% output
+    (the review/search prompts are long, the answers short)."""
+    blend = lambda p: 0.88 * p[0] + 0.12 * p[1]
+    price = LLM_PRICES.get(str(model or "").strip())
+    return round(blend(price) / blend(LLM_PRICES[_COST_BASELINE_MODEL]), 3) if price else 1.0
+
+
+def active_model(openai_model):
+    """The model that actually serves a call given the provider setting."""
+    return ANTHROPIC_MODEL if LLM_PROVIDER == "anthropic" else openai_model
+
 anthropic_client = None
 if ANTHROPIC_API_KEY and not NO_GPT_MODE and anthropic is not None:
     anthropic_client = anthropic.Anthropic(
@@ -477,20 +506,23 @@ def _anthropic_text(response):
     )
 
 
-def _anthropic_create(prompt, schema, want_web_search):
-    """Run one OpenAI-shaped request on Claude."""
+def _anthropic_create(prompt, schema, want_web_search, model=None):
+    """Run one OpenAI-shaped request on Claude. model overrides ANTHROPIC_MODEL
+    for one call (first_match.py uses a stronger model for the first batch)."""
     if anthropic_client is None:
         raise RuntimeError("ANTHROPIC_API_KEY is not set — Claude provider unavailable.")
 
+    model = model or ANTHROPIC_MODEL
     kwargs = {
-        "model": ANTHROPIC_MODEL,
+        "model": model,
+
         "max_tokens": ANTHROPIC_MAX_TOKENS,
         "messages": [{"role": "user", "content": prompt}],
     }
     if want_web_search:
         kwargs["tools"] = [{"type": "web_search_20260209", "name": "web_search"}]
     # effort is rejected on the Haiku tier — only send it where it is supported.
-    supports_effort = not ANTHROPIC_MODEL.startswith("claude-haiku")
+    supports_effort = not model.startswith("claude-haiku")
     output_config = (
         {"effort": ANTHROPIC_EFFORT} if (ANTHROPIC_EFFORT and supports_effort) else {}
     )
@@ -4825,6 +4857,8 @@ def review_and_filter_jobs(user_profile, automation, cv_text, persona, jobs, job
         # Tier A exact_match, Tier B strong_adjacent, Tier C safe_fallback post normally.
         # Tier D discovery_pending posts only for manual-review style users as status=pending_review.
         normal_post_decisions = {"exact_match", "strong_adjacent", "safe_fallback", "good_match"}
+        if STRICT_QUALITY:
+            normal_post_decisions = normal_post_decisions - {"safe_fallback"}
         manual_review_statuses = {STARTER_MAX_STATUS, DEFAULT_STATUS, DISCOVERY_PENDING_STATUS, "waiting_approval"}
 
         # ATS-direct sources (Jobo, HC, resolver) are already
@@ -7865,10 +7899,11 @@ def find_jobs_for_user(
     print("============================================================")
 
     _cost_breakdown = {
-        "openai_search":   round(round_metrics["openai_search_calls"]       * COST_PER_OPENAI_SEARCH_CALL,   4),
-        "openai_review":   round(round_metrics["openai_review_calls"]        * COST_PER_OPENAI_REVIEW_CALL,   4),
-        "openai_resolver": round(round_metrics["direct_resolution_attempts"] * COST_PER_OPENAI_RESOLVER_CALL, 4),
-        "openai_pivot":    round(round_metrics["openai_pivot_calls"]         * COST_PER_OPENAI_PIVOT_CALL,    4),
+        "openai_search":   round(round_metrics["openai_search_calls"]       * COST_PER_OPENAI_SEARCH_CALL   * llm_cost_factor(active_model(SEARCH_MODEL)),     4),
+        "openai_review":   round(round_metrics["openai_review_calls"]        * COST_PER_OPENAI_REVIEW_CALL   * llm_cost_factor(active_model(REVIEW_MODEL)),     4),
+        "openai_resolver": round(round_metrics["direct_resolution_attempts"] * COST_PER_OPENAI_RESOLVER_CALL * llm_cost_factor(active_model(RESOLUTION_MODEL)), 4),
+        "openai_pivot":    round(round_metrics["openai_pivot_calls"]         * COST_PER_OPENAI_PIVOT_CALL    * llm_cost_factor(active_model(SEARCH_MODEL)),     4),
+
         "openai_persona":  round(COST_PER_PERSONA_CREATE  if round_metrics["persona_created_this_run"]  else 0, 4),
         "openai_contract": round(COST_PER_CONTRACT_CREATE if round_metrics["contract_created_this_run"] else 0, 4),
         "apify_hc":        round(round_metrics["hc_raw_results"]      * COST_PER_HC_RESULT,        4),
@@ -9106,6 +9141,9 @@ def main():
         user for user in users
         if latest_results_by_uid.get(user.get("uid"), {}).get("pending_today_after_estimate", 0) < MIN_ACCEPTABLE_JOBS_PER_USER
     ]
+    if STRICT_QUALITY and minimum_viable_users:
+        print(f"\nQuality profile: skipping the minimum viable round for {len(minimum_viable_users)} users.")
+        minimum_viable_users = []
 
     if minimum_viable_users:
         print(f"\nStarting minimum viable round for {len(minimum_viable_users)} users below {MIN_ACCEPTABLE_JOBS_PER_USER} jobs.")
@@ -9230,6 +9268,9 @@ def main():
         "run_date": _run_date,
         "run_timestamp": _run_ts,
         "total_estimated_cost_usd": round(_total_cost, 4),
+        "profile": SEARCH_PROFILE,
+        "models": {"provider": LLM_PROVIDER, "search": active_model(SEARCH_MODEL),
+                   "review": active_model(REVIEW_MODEL), "resolution": active_model(RESOLUTION_MODEL)},
         "source_rates": _r1_source_rates,
         "users": _cost_report_users,
     }

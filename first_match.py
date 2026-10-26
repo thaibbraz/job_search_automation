@@ -34,7 +34,10 @@ import requests
 
 import send_jobbyo as sj
 
-FIRST_MATCH_MODEL = os.getenv("JOBBYO_FIRST_MATCH_MODEL", "gpt-4.1")
+# The first batch decides whether a new user trusts us, so it gets the
+# strongest model. If it fails or keeps nothing, first_match_v1 (the previous
+# version, unchanged) runs the batch instead.
+FIRST_MATCH_CLAUDE_MODEL = os.getenv("JOBBYO_FIRST_MATCH_CLAUDE_MODEL", "claude-opus-5-5")
 MIN_JOBS_TO_EMAIL = 3
 MIN_SCORE = 75
 REVIEW_BATCH_SIZE = 5
@@ -130,6 +133,13 @@ def _fetch_ats(url):
     return "", None
 
 
+def _left_the_posting(asked, landed):
+    def jobbish(u):
+        return bool(re.search(r"job|career|position|opening|vacanc|posting|apply|\d{4,}", u, re.I))
+    a, b = asked.split("#")[0].rstrip("/"), landed.split("#")[0].rstrip("/")
+    return a != b and jobbish(a) and not jobbish(b)
+
+
 def fetch_full_posting(job):
     """(text, status) for one job. status is "open", "closed" or "unknown";
     unknown keeps the pipeline's own description so a slow or odd ATS page
@@ -144,6 +154,10 @@ def fetch_full_posting(job):
             return text[:FULL_TEXT_CHARS], "open"
         r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=20)
         if r.status_code in (404, 410):
+            return "", "closed"
+        # Redirected off the posting (e.g. a made-up careers URL landing on a
+        # product page): no job there.
+        if _left_the_posting(url, r.url):
             return "", "closed"
         page = _clean(r.text)
         if any(mk in page.lower() for mk in _CLOSED_MARKERS):
@@ -184,7 +198,8 @@ def candidate_facts(user_profile, automation):
         for e in (cv.get("experiences") or [])[:6]
     ]
     return {
-        "name": (user_profile or {}).get("displayName") or "",
+        "name": ((user_profile or {}).get("displayName") or cv.get("first name") or cv.get("first_name")
+                 or str((user_profile or {}).get("email") or "").split("@")[0].split(".")[0].title() or ""),
         "headline": cv.get("professional_title") or "",
         "summary": (cv.get("summary") or "")[:700],
         "experience": experiences,
@@ -230,9 +245,11 @@ REVIEW_SCHEMA = {
                     "workplace": {"type": "string"},
                     "pay": {"type": "string"},
                     "fit_line": {"type": "string"},
+                    "angle": {"type": "string"},
+                    "stretch": {"type": "boolean"},
                 },
                 "required": ["id", "keep", "score", "drop_category", "drop_reason",
-                             "company", "workplace", "pay", "fit_line"],
+                             "company", "workplace", "pay", "fit_line", "angle", "stretch"],
                 "additionalProperties": False,
             },
         }
@@ -272,7 +289,12 @@ RULES (drop on any of these, pick the closest drop_category)
   If you can't tell whether they're eligible to work from where they live, drop it.
 {pay_rule}
 - Seniority: drop roles mainly about managing a team (Head of / VP / Director) unless their CV shows they
-  have managed people at that level; drop roles clearly below their experience.
+  have managed people at that level; drop roles clearly below their experience. For entry-level or
+  junior candidates (students, recent graduates, under ~2 years), ALWAYS drop Senior / Staff / Lead /
+  Principal titles and anything asking for 3+ years.
+- Legitimacy: drop anything that doesn't look like a real job at a real employer (vague posting, no
+  real company named, staffing-agency bait, "too good to be true" pay, or a page that isn't a job
+  posting). Use drop_category "other" with drop_reason "doesn't look like a real job".
 - Function/industry: drop roles whose day-to-day work isn't what they do or target.
 - Shortlist test: would a recruiter at this company realistically shortlist this person from their CV?
   Shared title words are not enough (a childcare center Director is not a Director of Product
@@ -289,19 +311,25 @@ FOR EACH JOB return:
   concrete from their background, e.g. "Network security, your home turf from Lumen and AT&T."
   Plain, warm, no hype, no numbers that aren't in the posting or CV. About why the WORK fits them --
   never restate location, pay or eligibility (those are shown separately). "" for dropped jobs.
+- angle: for kept jobs, what to LEAD WITH when applying, max 14 words, one concrete thing from their CV
+  this posting cares about, e.g. "your $250M+ hyperscaler deal and Fortune 50 account ownership".
+  "" for dropped jobs.
+- stretch: true only for a kept job that is a real step up (clearly higher pay or scope) but still a
+  realistic shortlist. Most kept jobs are false.
 
 {jobs_txt}
 """
 
 
+def _llm_json(prompt, schema, name):
+    """Claude (FIRST_MATCH_CLAUDE_MODEL). Errors propagate: curate() then hands
+    the batch to first_match_v1 so the user gets exactly the previous result."""
+    resp = sj._anthropic_create(prompt, schema, False, model=FIRST_MATCH_CLAUDE_MODEL)
+    return sj.parse_json_output(resp.output_text) or {}
+
+
 def review_batch(facts, batch):
-    resp = sj.responses_create(
-        model=FIRST_MATCH_MODEL,
-        input=_review_prompt(facts, batch),
-        text={"format": {"type": "json_schema", "name": "first_match_review",
-                         "schema": REVIEW_SCHEMA, "strict": True}},
-    )
-    out = sj.parse_json_output(resp.output_text) or {}
+    out = _llm_json(_review_prompt(facts, batch), REVIEW_SCHEMA, "first_match_review")
     return {str(r.get("id")): r for r in out.get("jobs") or []}
 
 
@@ -421,13 +449,7 @@ WRITE
 - tips: {"Phrase 1-2 of the settings changes listed above (pick the strongest; none of your own). When a change is about titles, name 2 real titles that fit their CV (e.g. Technical Assistance Specialist, Training Manager). Start each with the change in bold markdown, then one short reason, e.g. '**Add hybrid near Dumfries.** It opens up center and program roles across Northern Virginia and DC.' Max 25 words each. Empty list if none are listed." if show_more and levers else "empty list."}
 """
     try:
-        resp = sj.responses_create(
-            model=FIRST_MATCH_MODEL,
-            input=prompt,
-            text={"format": {"type": "json_schema", "name": "first_match_copy",
-                             "schema": COPY_SCHEMA, "strict": True}},
-        )
-        copy = sj.parse_json_output(resp.output_text) or {}
+        copy = _llm_json(prompt, COPY_SCHEMA, "first_match_copy")
     except Exception as e:
         print(f"first_match: copy generation failed ({e}) — using plain fallback")
         copy = {}
@@ -447,6 +469,47 @@ WRITE
 # ---------------------------------------------------------------------------
 # Curation
 # ---------------------------------------------------------------------------
+
+def _review_and_split(facts, open_jobs):
+    """One Claude review pass over the open jobs -> (kept, dropped). Raises if
+    any batch fails, so curate() can fall back to first_match_v1 as a whole."""
+    reviews = {}
+    for i in range(0, len(open_jobs), REVIEW_BATCH_SIZE):
+        reviews.update(review_batch(facts, open_jobs[i:i + REVIEW_BATCH_SIZE]))
+    kept, dropped = [], []
+    for j in open_jobs:
+        rv = reviews.get(j["_id"]) or {}
+        merged = {**j, **{k: rv.get(k) for k in ("score", "drop_category", "drop_reason", "workplace", "pay", "fit_line", "angle", "stretch")}}
+        if rv.get("company"):
+            merged["company"] = rv["company"]
+        if rv.get("keep") and (rv.get("score") or 0) >= MIN_SCORE and rv.get("fit_line"):
+            kept.append(merged)
+        else:
+            dropped.append(merged)
+    return kept, dropped
+
+
+def estimate_cost(model, n_jobs):
+    """Rough AI cost of one curation: review batches (~12.5k tokens in / 1.2k out
+    each, mostly full postings) plus the email-copy call."""
+    price = sj.LLM_PRICES.get(model) or sj.LLM_PRICES["gpt-4.1"]
+    batches = -(-n_jobs // REVIEW_BATCH_SIZE) if n_jobs else 0
+    tokens_in, tokens_out = batches * 12500 + 2000, batches * 1200 + 300
+    return round((tokens_in * price[0] + tokens_out * price[1]) / 1e6, 4)
+
+
+def _previous_version(uid, run_entries, user_profile, automation, why, claude_jobs=0):
+    """Exactly the previous first match (first_match_v1), untouched."""
+    import first_match_v1
+    print(f"first_match: {why} — using the previous version (first_match_v1)")
+    report = first_match_v1.curate(uid, run_entries, user_profile, automation)
+    report["method"] = f"previous version ({why})"
+    report["estimated_cost_usd"] = round(
+        estimate_cost(FIRST_MATCH_CLAUDE_MODEL, claude_jobs)
+        + estimate_cost(first_match_v1.FIRST_MATCH_MODEL, report.get("stats", {}).get("candidates") or 0), 4)
+    (RUN_LOG_DIR / f"first_match_{uid}.json").write_text(json.dumps(report, indent=2, default=str))
+    return report
+
 
 def curate(uid, run_entries, user_profile=None, automation=None):
     """run_entries: this user's entries from the signup run's job_run_*.json
@@ -487,37 +550,22 @@ def curate(uid, run_entries, user_profile=None, automation=None):
             j["_full_text"] = text
             open_jobs.append(j)
 
-    reviews = {}
-    for i in range(0, len(open_jobs), REVIEW_BATCH_SIZE):
-        batch = open_jobs[i:i + REVIEW_BATCH_SIZE]
-        try:
-            reviews.update(review_batch(facts, batch))
-        except Exception as e:
-            # Never leave a new user with nothing because one review call
-            # failed: fall back to the pipeline's own verdict for this batch.
-            print(f"first_match: review batch failed ({e}) — using pipeline verdicts")
-            for j in batch:
-                ok = j.get("match_tier") != "safe_fallback" and (j.get("grade") or 0) >= MIN_SCORE
-                reviews[j["_id"]] = {
-                    "keep": ok, "score": int(j.get("grade") or 0),
-                    "drop_category": "none" if ok else "other", "drop_reason": "" if ok else "weak fit",
-                    "company": j.get("company") or "", "workplace": "", "pay": "",
-                    "fit_line": j.get("review_reason") or "",
-                }
-
-    kept = []
-    for j in open_jobs:
-        rv = reviews.get(j["_id"]) or {}
-        merged = {**j, **{k: rv.get(k) for k in ("score", "drop_category", "drop_reason", "workplace", "pay", "fit_line")}}
-        if rv.get("company"):
-            merged["company"] = rv["company"]
-        if rv.get("keep") and (rv.get("score") or 0) >= MIN_SCORE and rv.get("fit_line"):
-            kept.append(merged)
-        else:
-            dropped.append(merged)
+    # Claude first. If it fails or keeps nothing, the previous version runs
+    # the whole batch instead, so the user gets exactly what they used to.
+    method = f"claude ({FIRST_MATCH_CLAUDE_MODEL})"
+    try:
+        kept, reviewed_out = _review_and_split(facts, open_jobs)
+    except Exception as e:
+        return _previous_version(uid, run_entries, user_profile, automation, f"Claude failed: {str(e)[:80]}")
+    if not kept:
+        return _previous_version(uid, run_entries, user_profile, automation, "Claude kept 0", len(open_jobs))
+    dropped += reviewed_out
 
     kept.sort(key=lambda j: j.get("score") or 0, reverse=True)
-    kept = kept[: facts["daily_limit"]]
+    # Safe bets first, then at most one clearly labelled stretch.
+    stretches = [j for j in kept if j.get("stretch")]
+    kept = [j for j in kept if not j.get("stretch")]
+    kept = kept[: facts["daily_limit"] - (1 if stretches else 0)] + stretches[:1]
     for j in kept:
         j["pay"] = compact_pay(j.get("pay"))
         j["workplace"] = re.sub(r"\s*\(.*?\)", "", str(j.get("workplace") or "")).strip()
@@ -531,13 +579,15 @@ def curate(uid, run_entries, user_profile=None, automation=None):
         "email": user_profile.get("email"),
         "facts": facts,
         "stats": stats,
+        "method": method,
+        "estimated_cost_usd": estimate_cost(FIRST_MATCH_CLAUDE_MODEL, len(open_jobs)),
         "kept": [clean(j) for j in kept],
-        "dropped": [{k: j.get(k) for k in ("title", "company", "job_url", "drop_category", "drop_reason")} for j in dropped],
+        "dropped": [{k: j.get(k) for k in ("title", "company", "job_url", "score", "drop_category", "drop_reason")} for j in dropped],
         "copy": copy,
     }
     RUN_LOG_DIR.mkdir(exist_ok=True)
     (RUN_LOG_DIR / f"first_match_{uid}.json").write_text(json.dumps(report, indent=2, default=str))
-    print(f"first_match: kept {len(kept)}, dropped {len(dropped)} "
+    print(f"first_match: [{method}] kept {len(kept)}, dropped {len(dropped)} "
           f"({dict(Counter(d.get('drop_category') for d in dropped))})")
     return report
 
@@ -560,8 +610,12 @@ def render_body_html(report, first_name):
         title = html.escape(j.get("title") or "")
         url = j.get("job_url") or ""
         title_html = f'<a href="{html.escape(url)}" style="color:#3A56E2;">{title}</a>' if url else title
-        items += (f'<li style="margin-bottom:8px;"><strong>{html.escape(j.get("company") or "")}</strong>, '
-                  f'{title_html}{" · " + html.escape(meta) if meta else ""}. {html.escape(j.get("fit_line") or "")}</li>')
+        stretch = ' <em style="color:#6b7280;">(a stretch)</em>' if j.get("stretch") else ""
+        angle = (f'<br><span style="color:#4b5563;">Lead with {html.escape(j["angle"])}.</span>'
+                 if j.get("angle") else "")
+        items += (f'<li style="margin-bottom:10px;"><strong>{html.escape(j.get("company") or "")}</strong>, '
+                  f'{title_html}{" · " + html.escape(meta) if meta else ""}{stretch}. '
+                  f'{html.escape(j.get("fit_line") or "")}{angle}</li>')
     parts.append(f'<ul style="margin:0 0 14px 0;padding-left:20px;">{items}</ul>')
     if copy.get("left_out"):
         parts.append(f"<p {p}>{_md_bold(copy['left_out'])}</p>")
@@ -580,7 +634,10 @@ def render_body_text(report, first_name):
     lines = [f"Hi {first_name},", "", c["intro"], ""]
     for j in report["kept"]:
         meta = " · ".join(x for x in (j.get("workplace"), j.get("pay")) if x)
-        lines.append(f"- {j.get('company')}, {j.get('title')}{' · ' + meta if meta else ''}. {j.get('fit_line')}")
+        stretch = " (a stretch)" if j.get("stretch") else ""
+        lines.append(f"- {j.get('company')}, {j.get('title')}{' · ' + meta if meta else ''}{stretch}. {j.get('fit_line')}")
+        if j.get("angle"):
+            lines.append(f"    Lead with {j['angle']}.")
     for key in ("left_out", "why_only"):
         if c.get(key):
             lines += ["", c[key]]
@@ -607,6 +664,9 @@ def post_kept(report, job_status):
 
 def send_first_match_email(report, recipient=None):
     """The welcome email with the curated body, plus the strategy PDF."""
+    if str(report.get("method", "")).startswith("previous version"):
+        import first_match_v1
+        return first_match_v1.send_first_match_email(report, recipient)
     import outreach
     context = outreach.build_context(report["uid"])
     context["sample_jobs"] = report["kept"]
@@ -615,7 +675,8 @@ def send_first_match_email(report, recipient=None):
     except Exception as e:
         print(f"first_match: PDF generation failed (sends without it): {e}")
         pdf_bytes = None
-    first = context["first_name"]
+    first = (report["facts"].get("name") or context["first_name"] or "there").split()[0]
+    context["first_name"] = first
     n = len(report["kept"])
     return bool(outreach.send_paid_welcome_email(
         context, "", pdf_bytes, recipient or report["email"],

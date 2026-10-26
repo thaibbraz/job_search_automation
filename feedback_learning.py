@@ -106,7 +106,15 @@ REJECTED JOBS (oldest first):
 
     try:
         NOTES_DIR.mkdir(exist_ok=True)
-        path.write_text(json.dumps({"key": key, "built_at": datetime.now(timezone.utc).isoformat(), "notes": notes}))
+        now = datetime.now(timezone.utc).isoformat()
+        # Keep a dated history of what was learned (shown in the admin's Job
+        # Search page), one entry per rebuild, newest last.
+        try:
+            history = json.loads(path.read_text()).get("history") or []
+        except (OSError, ValueError):
+            history = []
+        history = (history + [{"built_at": now, "rejected_count": len(compact), "notes": notes}])[-60:]
+        path.write_text(json.dumps({"key": key, "built_at": now, "notes": notes, "history": history}))
     except OSError:
         pass
     return notes

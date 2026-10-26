@@ -165,8 +165,88 @@ class StatusResponse(BaseModel):
 # Subprocess helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Search settings (admin Job Search page): which AI model the search uses and
+# the quality/volume profile. Saved in run_logs/ (a persistent volume) and
+# applied to every run, scheduled or manual, unless a run overrides them.
+# ---------------------------------------------------------------------------
+
+SEARCH_SETTINGS_PATH = RUN_LOG_DIR / "search_settings.json"
+
+SEARCH_MODELS = [
+    {"id": "gpt-4.1-mini", "label": "GPT-4.1 mini", "provider": "openai", "price": [0.40, 1.60], "note": "Current default. Cheap, good enough for most users."},
+    {"id": "gpt-4.1", "label": "GPT-4.1", "provider": "openai", "price": [2.00, 8.00], "note": "Stronger reviews, ~5x the AI cost."},
+    {"id": "gpt-4.1-nano", "label": "GPT-4.1 nano", "provider": "openai", "price": [0.10, 0.40], "note": "Cheapest. Reviews get noticeably looser. Web search stays on GPT-4.1 mini."},
+    {"id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "provider": "anthropic", "price": [0.10, 0.50], "note": "Very cheap Claude option."},
+    {"id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "provider": "anthropic", "price": [2.00, 10.00], "note": "Strong reviews at a mid price."},
+    {"id": "claude-opus-5-5", "label": "Claude Opus 5.5", "provider": "anthropic", "price": [4.00, 20.00], "note": "Best quality, slowest and most expensive."},
+]
+FIRST_MATCH_MODELS = [m for m in SEARCH_MODELS if m["provider"] == "anthropic"]
+
+SEARCH_PROFILES = [
+    {"id": "quality", "label": "Better batches, fewer jobs",
+     "note": "Only strong matches (Tier A/B). Skips the loosened last round, so some users end the day under 10."},
+    {"id": "balanced", "label": "Balanced", "note": "Today's behaviour: strong matches first, safe fallbacks to reach the daily target."},
+    {"id": "volume", "label": "More jobs, looser",
+     "note": "Bigger pools from Hiring Cafe/Jobo and an extra AI search batch. Fills more queues; more weak matches."},
+]
+_PROFILE_ENV = {
+    "quality": {"JOBBYO_PROFILE": "quality"},
+    "balanced": {"JOBBYO_PROFILE": "balanced"},
+    "volume": {"JOBBYO_PROFILE": "volume", "JOBBYO_HC_MAX_ITEMS": "160", "JOBBYO_JOBO_MAX_ITEMS": "140",
+               "JOBBYO_JFE_MAX_ITEMS": "50", "JOBBYO_OPENAI_MAX_BATCHES_PER_USER": "2"},
+}
+_SETTINGS_DEFAULTS = {"model": "gpt-4.1-mini", "profile": "balanced", "first_match_model": "claude-opus-5-5"}
+
+
+def _load_search_settings() -> dict:
+    try:
+        saved = json.loads(SEARCH_SETTINGS_PATH.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    return {**_SETTINGS_DEFAULTS, **{k: v for k, v in saved.items() if v}}
+
+
+def _search_env(model: Optional[str] = None, profile: Optional[str] = None) -> dict:
+    """Env for a send_jobbyo.py run: saved settings, overridden per run."""
+    settings = _load_search_settings()
+    model = model or settings["model"]
+    profile = profile or settings["profile"]
+    env = dict(_PROFILE_ENV.get(profile, _PROFILE_ENV["balanced"]))
+    meta = next((m for m in SEARCH_MODELS if m["id"] == model), SEARCH_MODELS[0])
+    if meta["provider"] == "anthropic":
+        env.update({"JOBBYO_LLM_PROVIDER": "anthropic", "JOBBYO_LLM_FALLBACK_PROVIDER": "openai",
+                    "JOBBYO_ANTHROPIC_MODEL": meta["id"]})
+    else:
+        # nano has no web search tool: keep search on mini, use nano for the rest.
+        search_model = "gpt-4.1-mini" if meta["id"] == "gpt-4.1-nano" else meta["id"]
+        env.update({"JOBBYO_LLM_PROVIDER": "openai", "JOBBYO_LLM_FALLBACK_PROVIDER": "anthropic",
+                    "JOBBYO_SEARCH_MODEL": search_model, "JOBBYO_REVIEW_MODEL": meta["id"],
+                    "JOBBYO_RESOLUTION_MODEL": search_model})
+    return env
+
+
+# Live view for the admin's Job Search page: the last lines of every run this
+# process started (scheduled runs come through /run/all too), in memory only.
+_LIVE_RUNS: dict = {}
+_LIVE_MAX_LINES = 1500
+_LIVE_KEEP_FINISHED = 25
+
+
+def _live_start(label: str, cmd: list[str]) -> dict:
+    from collections import deque
+    run = {"label": label, "cmd": " ".join(cmd[1:]), "started_at": datetime.now(timezone.utc).isoformat(),
+           "finished_at": None, "exit_code": None, "lines": deque(maxlen=_LIVE_MAX_LINES), "line_count": 0}
+    _LIVE_RUNS[f"{label}@{run['started_at']}"] = run
+    finished = sorted((k for k, r in _LIVE_RUNS.items() if r["finished_at"]), key=lambda k: _LIVE_RUNS[k]["finished_at"])
+    for k in finished[:-_LIVE_KEEP_FINISHED]:
+        _LIVE_RUNS.pop(k, None)
+    return run
+
+
 async def _run_subprocess(cmd: list[str], label: str, env: Optional[dict] = None) -> int:
     print(f"[{label}] Starting: {' '.join(cmd)}")
+    live = _live_start(label, cmd)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=str(SCRIPT_DIR),
@@ -176,20 +256,25 @@ async def _run_subprocess(cmd: list[str], label: str, env: Optional[dict] = None
     )
     assert proc.stdout is not None
     async for line in proc.stdout:
-        print(f"[{label}] {line.decode(errors='replace').rstrip()}")
+        text = line.decode(errors='replace').rstrip()
+        print(f"[{label}] {text}")
+        live["lines"].append(text)
+        live["line_count"] += 1
     await proc.wait()
     code = proc.returncode or 0
     print(f"[{label}] Finished — exit code {code}")
+    live["finished_at"] = datetime.now(timezone.utc).isoformat()
+    live["exit_code"] = code
     return code
 
 
-async def _full_run(script: str, args: list[str], label: str):
+async def _full_run(script: str, args: list[str], label: str, env: Optional[dict] = None):
     """Background task for full (all-user) runs. Sets _state flags."""
     _state.full_run_active = True
     _state.full_run_started_at = datetime.now(timezone.utc)
     _state.full_run_script = script
     try:
-        code = await _run_subprocess([PYTHON, script, *args], label)
+        code = await _run_subprocess([PYTHON, script, *args], label, env=env)
         _state.last_full_run_result = "success" if code == 0 else "error"
         _state.last_full_run_exit_code = code
     except Exception as exc:
@@ -202,10 +287,10 @@ async def _full_run(script: str, args: list[str], label: str):
         _state.full_run_script = None
 
 
-async def _single_run(script: str, args: list[str], label: str):
+async def _single_run(script: str, args: list[str], label: str, env: Optional[dict] = None):
     """Background task for single-user runs. Does NOT lock full-run state."""
     try:
-        await _run_subprocess([PYTHON, script, *args], label)
+        await _run_subprocess([PYTHON, script, *args], label, env=env)
     except Exception as exc:
         print(f"[{label}] Exception: {exc}")
 
@@ -282,7 +367,7 @@ async def run_all(background_tasks: BackgroundTasks):
             status_code=409,
             detail=f"A full run is already active (started {_state.full_run_started_at.isoformat() if _state.full_run_started_at else 'unknown'}). Check /run/status.",
         )
-    background_tasks.add_task(_full_run, "send_jobbyo.py", [], "run:all")
+    background_tasks.add_task(_full_run, "send_jobbyo.py", [], "run:all", _search_env())
     return RunResponse(accepted=True, message="Top-up run started for all users. Check /run/status.")
 
 
@@ -295,7 +380,7 @@ async def run_user(target: UserTarget, background_tasks: BackgroundTasks):
         args, label = ["--uid", target.uid], f"run:user:{target.uid}"
     else:
         args, label = ["--email", target.email], f"run:user:{target.email}"
-    background_tasks.add_task(_single_run, "send_jobbyo.py", args, label)
+    background_tasks.add_task(_single_run, "send_jobbyo.py", args, label, _search_env())
     return RunResponse(accepted=True, message=f"Top-up run started for {target.uid or target.email}.")
 
 
@@ -383,6 +468,7 @@ async def _finish_subscribed_run(
     who = profile.get("displayName") or recipient
     job_status = next((r.get("job_status") for r in user_entries if r.get("job_status")), "waiting_approval")
     report = None
+    first_match.FIRST_MATCH_CLAUDE_MODEL = _load_search_settings()["first_match_model"]
     try:
         report = await asyncio.to_thread(first_match.curate, resolved_uid, user_entries, profile)
     except Exception as exc:
@@ -408,6 +494,7 @@ async def _finish_subscribed_run(
                     emailed = await asyncio.to_thread(first_match.send_first_match_email, report, recipient)
                 except Exception as exc:
                     print(f"[{label}] first-match email failed: {exc}")
+                _mark_first_match_emailed(resolved_uid, emailed)
                 slack_text = (
                     f"First matches for {who}: kept {len(kept)} of {report['stats']['checked']} checked"
                     + (" and sent the welcome email." if emailed else ", but the email failed to send — worth a look.")
@@ -422,6 +509,8 @@ async def _finish_subscribed_run(
                     f"welcome email is held. {tags} can you find a few more by hand? Then send it with "
                     f"`python3 first_match.py --uid {resolved_uid} --send`.".strip()
                 )
+            if str(report.get("method", "")).startswith("previous version"):
+                slack_text += f" — used the {report['method']}"
             await asyncio.to_thread(_send_ops_only_slack_sync, slack_text)
 
         response_jobs = [
@@ -623,6 +712,7 @@ async def run_user_subscribed(target: UserTarget):
     # First match: gather a wider pool and post nothing -- first_match.py
     # curates it in _finish_subscribed_run before anything reaches the user.
     first_match_env = {
+        **_search_env(),
         "JOBBYO_DRY_RUN": "1",
         "JOBBYO_FIRST_MATCH": "1",
         "JOBBYO_TARGET_JOBS": os.getenv("JOBBYO_FIRST_MATCH_POOL", "25"),
@@ -1311,4 +1401,362 @@ async def coverage_complete(send_email: bool = False, warn_stale: bool = False):
         "covered_count": covered_count,
         "missing_count": missing_count,
         "stale_approvals": stale_approvals,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Admin: Job Search page (jobbyo-internal-admin-system /job-search)
+# Read-only views of what the search is doing, plus sending a held first email.
+# ---------------------------------------------------------------------------
+
+def _first_match_path(uid: str) -> Path:
+    return RUN_LOG_DIR / f"first_match_{re.sub(r'[^A-Za-z0-9_-]', '', uid)}.json"
+
+
+def _mark_first_match_emailed(uid: str, emailed: bool) -> None:
+    path = _first_match_path(uid)
+    try:
+        report = json.loads(path.read_text())
+        report["emailed"] = bool(emailed)
+        report["emailed_at"] = datetime.now(timezone.utc).isoformat() if emailed else None
+        path.write_text(json.dumps(report, indent=2, default=str))
+    except (OSError, ValueError) as exc:
+        print(f"[first-match] couldn't mark {uid} emailed: {exc}")
+
+
+def _live_summary(lines: list[str]) -> dict:
+    """What a run is on right now, from its latest log lines."""
+    cur = {"user": None, "round": None, "batch": None, "funnel": None}
+    for text in lines:
+        if text.startswith("USER: "):
+            cur["user"] = text[6:].strip()
+        elif "STARTING ROUND" in text or ("ROUND " in text and "DONE" in text):
+            cur["round"] = text.strip(" =")
+        elif text.startswith("BATCH ") and "·" in text:
+            cur["batch"] = text.strip()
+        elif "FUNNEL:" in text or text.startswith("Funnel:"):
+            cur["funnel"] = text.strip()
+    return cur
+
+
+@app.get("/admin/search/live")
+async def admin_search_live(lines: int = 300):
+    """Runs this API process started (active first), each with its last lines."""
+    runs = []
+    for run in _LIVE_RUNS.values():
+        tail = list(run["lines"])[-max(1, min(lines, _LIVE_MAX_LINES)):]
+        runs.append({
+            "label": run["label"], "cmd": run["cmd"], "started_at": run["started_at"],
+            "finished_at": run["finished_at"], "exit_code": run["exit_code"],
+            "active": run["finished_at"] is None, "line_count": run["line_count"],
+            "current": _live_summary(list(run["lines"])), "lines": tail,
+        })
+    runs.sort(key=lambda r: (not r["active"], r["started_at"]), reverse=False)
+    runs = [r for r in runs if r["active"]] + sorted(
+        (r for r in runs if not r["active"]), key=lambda r: r["finished_at"], reverse=True)
+    return {"full_run_active": _state.full_run_active, "runs": runs}
+
+
+def _today_search_summary(day: str) -> list[dict]:
+    files = sorted(RUN_LOG_DIR.glob(f"job_run_{day.replace('-', '')}_*.json"))
+    latest: dict = {}
+    for f in files:  # later files win: each is cumulative for its own run
+        try:
+            results = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        per_file: dict = {}
+        for r in results if isinstance(results, list) else []:
+            if r.get("uid"):
+                per_file.setdefault(r["uid"], []).append(r)
+        for uid, entries in per_file.items():
+            latest[uid] = (f.name, entries)
+
+    users = []
+    for uid, (fname, entries) in latest.items():
+        m = Counter()
+        reasons = Counter()
+        added, rejected = [], []
+        for r in entries:
+            for k, v in (r.get("round_metrics") or {}).items():
+                if isinstance(v, (int, float)):
+                    m[k] += v
+            for j in r.get("jobs_added") or []:
+                added.append({k: j.get(k) for k in ("title", "company", "location", "job_url", "grade",
+                                                    "match_tier", "source", "review_reason")})
+            for j in (r.get("jobs_rejected_by_review") or []) + (r.get("all_rejected_jobs") or []):
+                reason = str(j.get("review_reason") or "").strip()
+                if reason:
+                    reasons[reason[:90]] += 1
+                    if len(rejected) < 40:
+                        rejected.append({"title": j.get("title"), "company": j.get("company"),
+                                         "location": j.get("location"), "reason": reason[:240]})
+        first = entries[0]
+        users.append({
+            "uid": uid, "email": first.get("email"), "name": first.get("displayName"),
+            "plan": first.get("user_plan"), "run_log": fname,
+            "rounds": [r.get("round_mode") for r in entries],
+            "pending_before": first.get("pending_today_before"),
+            "pending_after": max((r.get("pending_today_after_estimate") or 0) for r in entries),
+            "sources": {"jfe": int(m.get("jfe_raw_results", 0)), "hiring_cafe": int(m.get("hc_raw_results", 0)),
+                        "jobo": int(m.get("jobo_raw_results", 0)), "openai": int(m.get("openai_jobs_returned", 0))},
+            "funnel": {"static_pass": int(m.get("static_pass_count", 0)), "ai_reviewed": int(m.get("ai_reviewed_count", 0)),
+                       "ai_rejected": int(m.get("review_rejected_count", 0)), "approved": int(m.get("approved_count", 0))},
+            "top_reject_reasons": reasons.most_common(6),
+            "jobs_added": added, "rejected_sample": rejected,
+            "first_match": _first_match_path(uid).exists(),
+        })
+    users.sort(key=lambda u: (u["pending_after"] or 0, (u["name"] or u["email"] or "").lower()))
+    return users
+
+
+@app.get("/admin/search/today")
+async def admin_search_today(day: Optional[str] = None):
+    """Per user, from the latest run log of the day: sources, funnel, why jobs
+    were rejected, and the jobs added."""
+    day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    users = await asyncio.to_thread(_today_search_summary, day)
+    return {"day": day, "users": users}
+
+
+@app.get("/admin/search/first-matches")
+async def admin_first_matches(limit: int = 60):
+    """New users' curated first batches, newest first."""
+    out = []
+    for path in sorted(RUN_LOG_DIR.glob("first_match_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
+        try:
+            r = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        out.append({
+            "uid": r.get("uid"), "email": r.get("email"), "name": (r.get("facts") or {}).get("name"),
+            "headline": (r.get("facts") or {}).get("headline"),
+            "created_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+            "method": r.get("method") or "first version",
+            "checked": (r.get("stats") or {}).get("checked"), "candidates": (r.get("stats") or {}).get("candidates"),
+            "kept": len(r.get("kept") or []), "dropped": len(r.get("dropped") or []),
+            "held": len(r.get("kept") or []) < 3, "emailed": r.get("emailed"),
+        })
+    return {"first_matches": out}
+
+
+@app.get("/admin/search/first-matches/{uid}")
+async def admin_first_match(uid: str):
+    path = _first_match_path(uid)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No first-match report for this user.")
+    report = json.loads(path.read_text())
+    import first_match
+    first = ((report.get("facts") or {}).get("name") or "there").split()[0]
+    try:
+        report["email_html"] = first_match.render_body_html(report, first)
+    except Exception as exc:
+        report["email_html"] = f"<p>Couldn't render the email preview: {exc}</p>"
+    return report
+
+
+@app.post("/admin/search/first-matches/{uid}/send")
+async def admin_first_match_send(uid: str):
+    """Send a held first email (fewer than 3 kept at signup) from the saved report."""
+    path = _first_match_path(uid)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="No first-match report for this user.")
+    report = json.loads(path.read_text())
+    if not report.get("kept"):
+        raise HTTPException(status_code=409, detail="This first batch has no jobs to send.")
+    import first_match
+    emailed = await asyncio.to_thread(first_match.send_first_match_email, report, TOP_JOBS_TEST_RECIPIENT or None)
+    _mark_first_match_emailed(uid, emailed)
+    if not emailed:
+        raise HTTPException(status_code=502, detail="The email failed to send.")
+    return {"emailed": True}
+
+
+class SearchSettingsUpdate(BaseModel):
+    model: Optional[str] = None
+    profile: Optional[str] = None
+    first_match_model: Optional[str] = None
+
+
+class SearchRunRequest(BaseModel):
+    scope: str = "user"            # "all" | "user"
+    uid: Optional[str] = None
+    email: Optional[str] = None
+    model: Optional[str] = None    # one of SEARCH_MODELS; default = saved setting
+    profile: Optional[str] = None  # quality | balanced | volume; default = saved setting
+
+
+@app.get("/admin/search/settings")
+async def admin_search_settings():
+    return {"settings": _load_search_settings(), "models": SEARCH_MODELS,
+            "first_match_models": FIRST_MATCH_MODELS, "profiles": SEARCH_PROFILES}
+
+
+@app.put("/admin/search/settings")
+async def admin_search_settings_update(update: SearchSettingsUpdate):
+    settings = _load_search_settings()
+    if update.model is not None:
+        if update.model not in {m["id"] for m in SEARCH_MODELS}:
+            raise HTTPException(status_code=422, detail="Unknown model.")
+        settings["model"] = update.model
+    if update.profile is not None:
+        if update.profile not in _PROFILE_ENV:
+            raise HTTPException(status_code=422, detail="Unknown profile.")
+        settings["profile"] = update.profile
+    if update.first_match_model is not None:
+        if update.first_match_model not in {m["id"] for m in FIRST_MATCH_MODELS}:
+            raise HTTPException(status_code=422, detail="Unknown first-batch model.")
+        settings["first_match_model"] = update.first_match_model
+    settings["updated_at"] = datetime.now(timezone.utc).isoformat()
+    SEARCH_SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    return {"settings": settings}
+
+
+@app.post("/admin/search/run", status_code=202)
+async def admin_search_run(req: SearchRunRequest, background_tasks: BackgroundTasks):
+    """Start a search for everyone or one user, with an optional model/profile
+    for this run only (the saved settings stay as they are)."""
+    if req.model and req.model not in {m["id"] for m in SEARCH_MODELS}:
+        raise HTTPException(status_code=422, detail="Unknown model.")
+    if req.profile and req.profile not in _PROFILE_ENV:
+        raise HTTPException(status_code=422, detail="Unknown profile.")
+    env = _search_env(req.model, req.profile)
+    used = f"{req.model or _load_search_settings()['model']} · {req.profile or _load_search_settings()['profile']}"
+    if req.scope == "all":
+        if _state.full_run_active:
+            raise HTTPException(status_code=409, detail="A full run is already active.")
+        background_tasks.add_task(_full_run, "send_jobbyo.py", [], "run:all", env)
+        return {"accepted": True, "message": f"Search started for all users ({used})."}
+    if not req.uid and not req.email:
+        raise HTTPException(status_code=422, detail="Provide uid or email.")
+    args, label = (["--uid", req.uid], f"run:user:{req.uid}") if req.uid else (["--email", req.email], f"run:user:{req.email}")
+    background_tasks.add_task(_single_run, "send_jobbyo.py", args, label, env)
+    return {"accepted": True, "message": f"Search started for {req.uid or req.email} ({used})."}
+
+
+def _costs_summary(days: int) -> dict:
+    since = (datetime.now(timezone.utc) - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    by_day: dict = {}
+    by_user: dict = {}
+    by_model: dict = {}
+    for path in sorted(RUN_LOG_DIR.glob("run_costs_*.json")):
+        try:
+            report = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        day = report.get("run_date") or ""
+        if day < since:
+            continue
+        model = (report.get("models") or {}).get("review") or "gpt-4.1-mini (assumed)"
+        d = by_day.setdefault(day, {"day": day, "cost": 0.0, "jobs": 0, "runs": 0, "first_match_cost": 0.0, "first_matches": 0})
+        d["runs"] += 1
+        for u in report.get("users") or []:
+            cost, jobs = float(u.get("estimated_cost_usd") or 0), int(u.get("jobs_added") or 0)
+            d["cost"] += cost
+            d["jobs"] += jobs
+            m = by_model.setdefault(model, {"model": model, "cost": 0.0, "jobs": 0})
+            m["cost"] += cost
+            m["jobs"] += jobs
+            uu = by_user.setdefault(u.get("uid"), {"uid": u.get("uid"), "name": u.get("name"), "email": u.get("email"), "cost": 0.0, "jobs": 0})
+            uu["cost"] += cost
+            uu["jobs"] += jobs
+    for path in RUN_LOG_DIR.glob("first_match_*.json"):
+        day = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%d")
+        if day < since:
+            continue
+        try:
+            cost = float(json.loads(path.read_text()).get("estimated_cost_usd") or 0)
+        except (OSError, ValueError):
+            continue
+        d = by_day.setdefault(day, {"day": day, "cost": 0.0, "jobs": 0, "runs": 0, "first_match_cost": 0.0, "first_matches": 0})
+        d["first_match_cost"] += cost
+        d["first_matches"] += 1
+
+    per_job = lambda c, j: round(c / j, 4) if j else None
+    days_out = []
+    for d in sorted(by_day.values(), key=lambda x: x["day"], reverse=True):
+        total = d["cost"] + d["first_match_cost"]
+        days_out.append({**d, "cost": round(d["cost"], 4), "first_match_cost": round(d["first_match_cost"], 4),
+                         "total": round(total, 4), "cost_per_job": per_job(total, d["jobs"])})
+    total_cost = sum(d["total"] for d in days_out)
+    total_jobs = sum(d["jobs"] for d in days_out)
+    return {
+        "days": days_out,
+        "avg_cost_per_day": round(total_cost / len(days_out), 4) if days_out else 0,
+        "avg_cost_per_job": per_job(total_cost, total_jobs),
+        "total_cost": round(total_cost, 4), "total_jobs": total_jobs,
+        "by_model": [{**m, "cost": round(m["cost"], 4), "cost_per_job": per_job(m["cost"], m["jobs"])} for m in by_model.values()],
+        "by_user": sorted(({**u, "cost": round(u["cost"], 4), "cost_per_job": per_job(u["cost"], u["jobs"])} for u in by_user.values()),
+                          key=lambda u: u["cost"], reverse=True),
+        "note": "Estimates: per-call averages scaled by model price, plus Hiring Cafe/Jobo per-result rates. "
+                "Calls retried on the fallback provider aren't counted.",
+    }
+
+
+@app.get("/admin/search/costs")
+async def admin_search_costs(days: int = 14):
+    return await asyncio.to_thread(_costs_summary, max(1, min(days, 90)))
+
+
+def _safe_uid(uid: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", uid or "")
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+@app.get("/admin/search/users")
+async def admin_search_users():
+    """Everyone the search has documents for, with what exists for each."""
+    def build():
+        personas = Path(SCRIPT_DIR / "personas")
+        contracts = Path(SCRIPT_DIR / "search_contracts")
+        reports = Path(SCRIPT_DIR / "strategy_reports")
+        uids = {p.name.split(".")[0] for p in personas.glob("*.json")} | {p.stem for p in contracts.glob("*.json")}
+        names = {}
+        try:
+            for u in requests.get(f"{BACKEND_BASE}/users/paid", timeout=30).json() or []:
+                names[u.get("uid") or u.get("id")] = (u.get("displayName"), u.get("email"))
+        except Exception:
+            pass
+        out = []
+        for uid in uids:
+            feedback = _read_json(personas / f"{uid}.feedback.json") or {}
+            out.append({
+                "uid": uid, "name": (names.get(uid) or (None, None))[0], "email": (names.get(uid) or (None, None))[1],
+                "paid": uid in names,
+                "persona": (personas / f"{uid}.json").exists(), "contract": (contracts / f"{uid}.json").exists(),
+                "feedback_rules": len((feedback.get("notes") or {}).get("rules") or []),
+                "feedback_updated": feedback.get("built_at"),
+                "adaptations": len(list(reports.glob(f"adaptation_{uid}_*.json"))),
+                "first_match": _first_match_path(uid).exists(),
+            })
+        out.sort(key=lambda u: (not u["paid"], (u["name"] or u["email"] or u["uid"]).lower()))
+        return out
+    return {"users": await asyncio.to_thread(build)}
+
+
+@app.get("/admin/search/users/{uid}/docs")
+async def admin_search_user_docs(uid: str):
+    """Every document the search keeps for one user, plus their notes history."""
+    uid = _safe_uid(uid)
+    if not uid:
+        raise HTTPException(status_code=422, detail="Bad uid.")
+    personas = SCRIPT_DIR / "personas"
+    reports = SCRIPT_DIR / "strategy_reports"
+    adaptations = []
+    for path in sorted(reports.glob(f"adaptation_{uid}_*.json"), reverse=True)[:15]:
+        adaptations.append({"file": path.name, "content": _read_json(path)})
+    fm = _read_json(_first_match_path(uid))
+    return {
+        "uid": uid,
+        "persona": _read_json(personas / f"{uid}.json"),
+        "search_contract": _read_json(SCRIPT_DIR / "search_contracts" / f"{uid}.json"),
+        "feedback": _read_json(personas / f"{uid}.feedback.json"),
+        "adaptations": adaptations,
+        "first_match": {k: fm.get(k) for k in ("method", "stats", "copy", "emailed", "estimated_cost_usd")} if fm else None,
     }
