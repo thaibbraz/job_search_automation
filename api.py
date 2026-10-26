@@ -1460,15 +1460,35 @@ async def admin_search_live(lines: int = 300):
 def _today_search_summary(day: str) -> list[dict]:
     files = sorted(RUN_LOG_DIR.glob(f"job_run_{day.replace('-', '')}_*.json"))
     latest: dict = {}
-    for f in files:  # later files win: each is cumulative for its own run
+    # Across all of the day's runs: the most jobs they reached and every job
+    # added. (The newest file alone is the run in progress -- it says 0/10
+    # for users it hasn't reached yet.)
+    best_pending: dict = {}
+    day_added: dict = {}
+    # A sign-up's first-match search only gathers a pool (nothing is posted
+    # until first_match.py curates it): skip it, its jobs never reach them.
+    first_match_at = {p.stem[len("first_match_"):]: p.stat().st_mtime for p in RUN_LOG_DIR.glob("first_match_*.json")}
+
+    def is_signup_pool(uid, fname):
+        try:
+            t = datetime.strptime(fname[len("job_run_"):-len(".json")], "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return False
+        fm = first_match_at.get(uid)
+        return fm is not None and fm - 3 * 3600 <= t <= fm + 60
+
+    for f in files:  # later files win for funnel/sources: each is cumulative for its own run
         try:
             results = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
         per_file: dict = {}
         for r in results if isinstance(results, list) else []:
-            if r.get("uid"):
+            if r.get("uid") and not is_signup_pool(r["uid"], f.name):
                 per_file.setdefault(r["uid"], []).append(r)
+                best_pending[r["uid"]] = max(best_pending.get(r["uid"], 0), r.get("pending_today_after_estimate") or 0)
+                for j in r.get("jobs_added") or []:
+                    day_added.setdefault(r["uid"], {})[j.get("job_url")] = j
         for uid, entries in per_file.items():
             latest[uid] = (f.name, entries)
 
@@ -1481,9 +1501,7 @@ def _today_search_summary(day: str) -> list[dict]:
             for k, v in (r.get("round_metrics") or {}).items():
                 if isinstance(v, (int, float)):
                     m[k] += v
-            for j in r.get("jobs_added") or []:
-                added.append({k: j.get(k) for k in ("title", "company", "location", "job_url", "grade",
-                                                    "match_tier", "source", "review_reason")})
+
             for j in (r.get("jobs_rejected_by_review") or []) + (r.get("all_rejected_jobs") or []):
                 reason = str(j.get("review_reason") or "").strip()
                 if reason:
@@ -1491,13 +1509,15 @@ def _today_search_summary(day: str) -> list[dict]:
                     if len(rejected) < 40:
                         rejected.append({"title": j.get("title"), "company": j.get("company"),
                                          "location": j.get("location"), "reason": reason[:240]})
+        added = [{k: j.get(k) for k in ("title", "company", "location", "job_url", "grade", "match_tier", "source", "review_reason")}
+                 for j in (day_added.get(uid) or {}).values()]
         first = entries[0]
         users.append({
             "uid": uid, "email": first.get("email"), "name": first.get("displayName"),
             "plan": first.get("user_plan"), "run_log": fname,
             "rounds": [r.get("round_mode") for r in entries],
             "pending_before": first.get("pending_today_before"),
-            "pending_after": max((r.get("pending_today_after_estimate") or 0) for r in entries),
+            "pending_after": best_pending.get(uid, 0),
             "sources": {"jfe": int(m.get("jfe_raw_results", 0)), "hiring_cafe": int(m.get("hc_raw_results", 0)),
                         "jobo": int(m.get("jobo_raw_results", 0)), "openai": int(m.get("openai_jobs_returned", 0))},
             "funnel": {"static_pass": int(m.get("static_pass_count", 0)), "ai_reviewed": int(m.get("ai_reviewed_count", 0)),
