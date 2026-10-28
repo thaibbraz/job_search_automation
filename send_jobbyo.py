@@ -16,6 +16,7 @@ import requests
 from date_utils import parse_utc_timestamp
 import fit_ranker
 import feedback_learning
+import team_corrections
 
 try:
     from openai import OpenAI
@@ -138,6 +139,9 @@ FORCE_USER_EMAILS = {
 
 # Target new-match jobs per user per day.
 TARGET_JOBS_PER_USER = env_int("JOBBYO_TARGET_JOBS", 10)
+# Admin "find N more" for one user (Job Search page): the target becomes what
+# they already have today plus N, whatever the daily target is.
+FIND_EXTRA_JOBS = env_int("JOBBYO_FIND_JOBS", 0)
 
 # The second overnight round only runs for users still below this count after
 # the first round AND only when Round 1 had enough live/direct-source signal.
@@ -708,8 +712,8 @@ def _verify_jobs_persisted(uid, email, posted_jobs, default_status, max_attempts
           f"attempts. Backend may have reset selectedJobs after the write — check manually.")
 
 
-def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS, uid=None):
-    added_at = _jobs_added_at_timestamp()
+def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS, uid=None, added_at=None):
+    added_at = added_at or _jobs_added_at_timestamp()
     for j in jobs:
         j["addedAt"] = added_at
 
@@ -6920,6 +6924,9 @@ def find_jobs_for_user(
         else []
     )
     pending_today_before = count_jobs_today(existing_jobs, job_status)
+    if FIND_EXTRA_JOBS > 0:
+        global TARGET_JOBS_PER_USER
+        TARGET_JOBS_PER_USER = pending_today_before + FIND_EXTRA_JOBS
 
     # Nightly learning from the user's rejections (feedback_learning.py):
     # hard rules for the fit stage + context for every AI review of this user.
@@ -6928,6 +6935,7 @@ def find_jobs_for_user(
     )
     _LEARNED_REVIEW_CONTEXT[user_profile.get("uid")] = "\n\n".join(p for p in [
         feedback_learning.review_context(learned_notes, rejected_jobs_from_automation),
+        team_corrections.review_context(user_profile.get("uid") or ""),
         calibration_preference_context(automation),
     ] if p)
     if learned_notes.get("rules") or learned_notes.get("blocked_companies"):

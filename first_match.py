@@ -27,6 +27,7 @@ import os
 import re
 import sys
 from collections import Counter
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -659,7 +660,9 @@ def post_kept(report, job_status):
     jobs = [{**{k: j.get(k) for k in _QUEUE_FIELDS}, "status": job_status} for j in report["kept"]]
     if not jobs:
         return None
-    return sj.api_post_jobs(report["email"], jobs, default_status=job_status, uid=report["uid"])
+    # dated now: a first batch is for today, not the next morning like the evening search
+    return sj.api_post_jobs(report["email"], jobs, default_status=job_status, uid=report["uid"],
+                            added_at=datetime.now(timezone.utc).isoformat())
 
 
 def send_first_match_email(report, recipient=None):

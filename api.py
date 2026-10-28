@@ -46,6 +46,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,6 +61,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from date_utils import parse_utc_timestamp
+import team_corrections
 
 load_dotenv()
 
@@ -308,7 +310,7 @@ app = FastAPI(title="Jobbyo Runner API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -1508,7 +1510,8 @@ def _today_search_summary(day: str) -> list[dict]:
                     reasons[reason[:90]] += 1
                     if len(rejected) < 40:
                         rejected.append({"title": j.get("title"), "company": j.get("company"),
-                                         "location": j.get("location"), "reason": reason[:240]})
+                                         "location": j.get("location"), "job_url": j.get("job_url") or j.get("url"),
+                                         "reason": reason[:240]})
         added = [{k: j.get(k) for k in ("title", "company", "location", "job_url", "grade", "match_tier", "source", "review_reason")}
                  for j in (day_added.get(uid) or {}).values()]
         first = entries[0]
@@ -1604,6 +1607,7 @@ class SearchRunRequest(BaseModel):
     email: Optional[str] = None
     model: Optional[str] = None    # one of SEARCH_MODELS; default = saved setting
     profile: Optional[str] = None  # quality | balanced | volume; default = saved setting
+    count: Optional[int] = None    # one user: find this many more jobs today (default: up to the daily target)
 
 
 @app.get("/admin/search/settings")
@@ -1642,6 +1646,9 @@ async def admin_search_run(req: SearchRunRequest, background_tasks: BackgroundTa
         raise HTTPException(status_code=422, detail="Unknown profile.")
     env = _search_env(req.model, req.profile)
     used = f"{req.model or _load_search_settings()['model']} · {req.profile or _load_search_settings()['profile']}"
+    if req.count and req.scope != "all":
+        env["JOBBYO_FIND_JOBS"] = str(max(1, min(int(req.count), 20)))
+        used += f" · {env['JOBBYO_FIND_JOBS']} more job(s)"
     if req.scope == "all":
         if _state.full_run_active:
             raise HTTPException(status_code=409, detail="A full run is already active.")
@@ -1780,3 +1787,265 @@ async def admin_search_user_docs(uid: str):
         "adaptations": adaptations,
         "first_match": {k: fm.get(k) for k in ("method", "stats", "copy", "emailed", "estimated_cost_usd")} if fm else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Admin: the day per user - how many jobs each has (by the automation / added
+# by hand), their feedback, what the filter turned down, and the filter itself.
+# ---------------------------------------------------------------------------
+
+DAILY_TARGET = int(os.getenv("JOBBYO_TARGET_JOBS", "10"))
+# the search plan fields a person may edit from the admin
+EDITABLE_FILTER_FIELDS = ("allowed_titles", "forbidden_titles", "location_hard_rule", "salary_hard_rule",
+                          "seniority_rules", "hard_reject_rules")
+
+
+def _url_key(url) -> str:
+    return re.sub(r"[?#].*$", "", str(url or "")).rstrip("/").lower()
+
+
+def _selected_jobs(automation: dict) -> list[dict]:
+    return automation.get("selectedJobs") or (automation.get("automation_data") or {}).get("selectedJobs") or []
+
+
+def _automation_urls(day: str) -> set:
+    """Every job the search posted in the run logs around this day (scheduled
+    evening runs post tomorrow's jobs, so the day before counts too)."""
+    d = datetime.strptime(day, "%Y-%m-%d")
+    urls = set()
+    for offset in (-1, 0):
+        stamp = (d + timedelta(days=offset)).strftime("%Y%m%d")
+        for f in RUN_LOG_DIR.glob(f"job_run_{stamp}_*.json"):
+            results = _read_json(f)
+            for r in results if isinstance(results, list) else []:
+                for j in r.get("jobs_added") or []:
+                    urls.add(_url_key(j.get("job_url")))
+    # a new user's first batch is posted by the search too
+    for f in RUN_LOG_DIR.glob("first_match_*.json"):
+        for j in (_read_json(f) or {}).get("kept") or []:
+            urls.add(_url_key(j.get("job_url")))
+    return urls
+
+
+# everything delivered for the day except what the user turned down - approved
+# ones ("needs_review": waiting to be applied) count too
+_DAY_STATUSES = _TODAY_STATUSES | {"needs_review", "review", "in_review"}
+
+
+def _day_jobs(jobs: list[dict], day: str, automated_urls: set) -> list[dict]:
+    """The user's jobs for this day (the day they're dated for), each marked
+    as found by the search or added by hand."""
+    out = []
+    for j in jobs:
+        added = _parse_job_date(j.get("addedAt") or j.get("createdAt") or "")
+        if not added or added.strftime("%Y-%m-%d") != day or str(j.get("status", "")).lower() not in _DAY_STATUSES:
+            continue
+        out.append({"title": j.get("title"), "company": j.get("company"), "job_url": j.get("job_url"),
+                    "status": j.get("status"), "by_search": _url_key(j.get("job_url")) in automated_urls})
+    return out
+
+
+def _day_counts(jobs: list[dict], day: str, automated_urls: set) -> dict:
+    day_jobs = _day_jobs(jobs, day, automated_urls)
+    total, automated = len(day_jobs), sum(j["by_search"] for j in day_jobs)
+    return {"total": total, "automated": automated, "manual": total - automated,
+            "target": DAILY_TARGET, "missing": max(0, DAILY_TARGET - total)}
+
+
+def _feedback(jobs: list[dict], days: int = 14) -> list[dict]:
+    """Jobs the user turned down (newest first), with what they said."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out = []
+    for j in jobs:
+        if str(j.get("status", "")).lower() != "rejected":
+            continue
+        at = _parse_job_date(j.get("rejectedAt") or j.get("addedAt") or "")
+        if at and at >= cutoff:
+            out.append({"title": j.get("title"), "company": j.get("company"), "job_url": j.get("job_url"),
+                        "feedback": (j.get("feedback") or "").strip(), "at": at.isoformat()})
+    return sorted(out, key=lambda x: x["at"], reverse=True)
+
+
+@app.get("/admin/search/daily")
+async def admin_search_daily(day: Optional[str] = None):
+    """Every paying user's jobs for the day: total, by the automation, added by
+    hand, how many short of the target, and how much feedback they left."""
+    day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def build():
+        automated_urls = _automation_urls(day)
+        out = []
+        for user in _fetch_paid_users_sync():
+            uid = _uid_of(user)
+            if not uid:
+                continue
+            try:
+                jobs = _selected_jobs(_fetch_user_automation_sync(uid))
+            except Exception as exc:
+                print(f"[admin/daily] automation for {uid}: {exc}")
+                continue
+            feedback = _feedback(jobs)
+            out.append({
+                "uid": uid, "name": user.get("displayName") or user.get("name") or "", "email": user.get("email", ""),
+                **_day_counts(jobs, day, automated_urls),
+                "feedback_count": len(feedback), "feedback_with_text": sum(1 for f in feedback if f["feedback"]),
+            })
+        out.sort(key=lambda u: (-u["missing"], (u["name"] or u["email"]).lower()))
+        return out
+
+    users = await asyncio.to_thread(build)
+    return {"day": day, "target": DAILY_TARGET, "users": users}
+
+
+@app.get("/admin/search/users/{uid}/day")
+async def admin_search_user_day(uid: str, day: Optional[str] = None):
+    """One user's day in one place: counts, their feedback, the jobs the
+    filter turned down (with links), what it learned and the editable filter."""
+    uid = _safe_uid(uid)
+    if not uid:
+        raise HTTPException(status_code=422, detail="Bad uid.")
+    day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def build():
+        jobs = _selected_jobs(_fetch_user_automation_sync(uid))
+        summary = next((u for u in _today_search_summary(day) if u["uid"] == uid), None) or {}
+        contract = _read_json(SCRIPT_DIR / "search_contracts" / f"{uid}.json") or {}
+        notes = (_read_json(SCRIPT_DIR / "personas" / f"{uid}.feedback.json") or {}).get("notes") or {}
+        automated_urls = _automation_urls(day)
+        return {
+            "uid": uid, "day": day, **_day_counts(jobs, day, automated_urls),
+            "jobs": _day_jobs(jobs, day, automated_urls),
+            "feedback": _feedback(jobs),
+            "not_passed": summary.get("rejected_sample") or [],
+            "added_by_search": summary.get("jobs_added") or [],
+            "search": {k: summary.get(k) for k in ("sources", "funnel", "top_reject_reasons")} if summary else None,
+            "corrections": list(reversed(team_corrections.load(uid))),
+            "learned": {"rules": notes.get("rules") or [], "blocked_companies": notes.get("blocked_companies") or [],
+                        "min_salary_usd": notes.get("min_salary_usd")},
+            "filter": {k: contract.get(k) for k in EDITABLE_FILTER_FIELDS} if contract else None,
+        }
+
+    return await asyncio.to_thread(build)
+
+
+class FilterUpdate(BaseModel):
+    allowed_titles: Optional[list[str]] = None
+    forbidden_titles: Optional[list[str]] = None
+    location_hard_rule: Optional[str] = None
+    salary_hard_rule: Optional[str] = None
+    seniority_rules: Optional[str] = None
+    hard_reject_rules: Optional[list[str]] = None
+
+
+@app.put("/admin/search/users/{uid}/filter")
+async def admin_search_user_filter(uid: str, update: FilterUpdate):
+    """Edits a user's search plan by hand (titles to find or skip, location,
+    salary, seniority, hard rules). The next search uses it; the old version is
+    kept next to it."""
+    uid = _safe_uid(uid)
+    path = SCRIPT_DIR / "search_contracts" / f"{uid}.json"
+    contract = _read_json(path)
+    if not uid or contract is None:
+        raise HTTPException(status_code=404, detail="This user has no search plan yet - run a search for them first.")
+    changes = {k: v for k, v in (update.model_dump() if hasattr(update, "model_dump") else update.dict()).items() if v is not None}
+    for k, v in changes.items():
+        if isinstance(v, list):
+            changes[k] = [x.strip() for x in v if x and x.strip()]
+        elif isinstance(v, str):
+            changes[k] = v.strip()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    history = path.parent / "history"
+    history.mkdir(exist_ok=True)
+    (history / f"{uid}_{stamp}.json").write_text(json.dumps(contract, indent=2))
+    contract.update(changes)
+    contract["edited_by_admin_at"] = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps(contract, indent=2))
+    return {"filter": {k: contract.get(k) for k in EDITABLE_FILTER_FIELDS}}
+
+
+@app.post("/admin/search/fill-short", status_code=202)
+async def admin_search_fill_short(req: SearchRunRequest, background_tasks: BackgroundTasks):
+    """One search for every paying user short of the daily target today: each
+    is topped up to the target (one run, users one after another)."""
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = await admin_search_daily(day)
+    emails = [u["email"] for u in daily["users"] if u["missing"] > 0 and u["email"]]
+    if not emails:
+        return {"accepted": False, "message": "Everyone already has their jobs today."}
+    env = _search_env(req.model, req.profile)
+    background_tasks.add_task(_single_run, "send_jobbyo.py", ["--emails", ",".join(emails)], f"run:fill:{len(emails)}", env)
+    return {"accepted": True, "message": f"Filling {len(emails)} user(s) short of {DAILY_TARGET} today.", "emails": emails}
+
+
+class AddAnyway(BaseModel):
+    title: str = ""
+    company: str = ""
+    job_url: str
+    location: str = ""
+    reason: str = ""  # why the filter turned it down
+
+
+@app.post("/admin/search/users/{uid}/add-job")
+async def admin_search_add_anyway(uid: str, job: AddAnyway):
+    """A job the filter turned down that a person wants: it goes to the user's
+    list, and the search learns not to turn down jobs like it again."""
+    uid = _safe_uid(uid)
+    if not uid or not job.job_url.strip():
+        raise HTTPException(status_code=422, detail="Need a user and the job's link.")
+
+    def post():
+        resp = requests.post(f"{BACKEND_BASE}/automations/users/{uid}/selected-jobs", json={
+            "job_id": f"admin_{uuid.uuid4().hex[:12]}", "job_url": job.job_url.strip(), "title": job.title,
+            "company": job.company, "description": job.location, "grade": 0,
+        }, timeout=30)
+        resp.raise_for_status()
+
+    try:
+        await asyncio.to_thread(post)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Couldn't add it to their list: {exc}")
+    entry = team_corrections.add(uid, job.title, job.company, job.reason, job.job_url)
+    return {"added": True, "correction": entry}
+
+
+@app.delete("/admin/search/users/{uid}/corrections/{correction_id}")
+async def admin_search_remove_correction(uid: str, correction_id: str):
+    """Forgets one of the team's lessons for this user."""
+    if not team_corrections.remove(_safe_uid(uid), re.sub(r"[^a-f0-9]", "", correction_id)):
+        raise HTTPException(status_code=404, detail="Not found.")
+    return {"removed": True}
+
+
+def _paid_uids_sync() -> set:
+    return {_uid_of(u) for u in _fetch_paid_users_sync() if _uid_of(u)}
+
+
+def _doc_files(uid: str) -> list[Path]:
+    """Everything the search keeps for one user (persona, notes, lessons,
+    search plan and its history, strategy reports)."""
+    personas, contracts, reports = SCRIPT_DIR / "personas", SCRIPT_DIR / "search_contracts", SCRIPT_DIR / "strategy_reports"
+    return ([p for p in personas.glob(f"{uid}.*") if p.is_file()]
+            + [p for p in [contracts / f"{uid}.json"] if p.exists()]
+            + list((contracts / "history").glob(f"{uid}_*.json"))
+            + list(reports.glob(f"strategy_{uid}_*.json")) + list(reports.glob(f"adaptation_{uid}_*.json")))
+
+
+@app.post("/admin/search/users/delete-unpaid")
+async def admin_search_delete_unpaid(dry_run: bool = False):
+    """Deletes the docs of everyone who no longer pays (persona, notes, search
+    plan, strategy reports). If they pay again, their first search rebuilds them."""
+    def run():
+        paid = _paid_uids_sync()
+        if len(paid) < 5:  # the paying list didn't load properly - never treat everyone as unpaid
+            raise HTTPException(status_code=503, detail="Couldn't load the paying users - nothing was deleted.")
+        personas, contracts = SCRIPT_DIR / "personas", SCRIPT_DIR / "search_contracts"
+        uids = {p.name.split(".")[0] for p in personas.glob("*.json")} | {p.stem for p in contracts.glob("*.json")}
+        unpaid = sorted(u for u in uids if u and u not in paid)
+        moved = 0
+        for uid in unpaid:
+            for path in _doc_files(uid):
+                moved += 1
+                if not dry_run:
+                    path.unlink(missing_ok=True)
+        return {"users": len(unpaid), "files": moved, "dry_run": dry_run}
+    return await asyncio.to_thread(run)
