@@ -118,7 +118,7 @@ jobs:
               fi
 
               echo "Installing systemd units..."
-              for unit in jobbyo-search.service jobbyo-search-run.service jobbyo-search-run.timer jobbyo-search-run-final.service jobbyo-search-run-final.timer jobbyo-search-daily-report.service jobbyo-search-daily-report.timer jobbyo-search-nudge.service jobbyo-search-nudge.timer jobbyo-boardlinks-topup.service; do
+              for unit in jobbyo-search.service jobbyo-search-run.service jobbyo-search-run.timer jobbyo-search-run-final.service jobbyo-search-run-final.timer jobbyo-search-daily-report.service jobbyo-search-daily-report.timer jobbyo-boardlinks-topup.service; do
                 if [ -f "$APP_DIR/systemd/$unit" ]; then
                   sudo cp "$APP_DIR/systemd/$unit" "/etc/systemd/system/$unit"
                 fi
@@ -128,7 +128,6 @@ jobs:
               sudo systemctl enable --now jobbyo-search-run.timer
               sudo systemctl enable --now jobbyo-search-run-final.timer
               sudo systemctl enable --now jobbyo-search-daily-report.timer
-              sudo systemctl enable --now jobbyo-search-nudge.timer
 
               cd "$APP_DIR"
               echo "Building image..."

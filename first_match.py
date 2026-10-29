@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,10 @@ import send_jobbyo as sj
 FIRST_MATCH_CLAUDE_MODEL = os.getenv("JOBBYO_FIRST_MATCH_CLAUDE_MODEL", "claude-opus-5-5")
 MIN_JOBS_TO_EMAIL = 3
 MIN_SCORE = 75
+# how long the first batch waits for the setup calibration to finish
+CALIBRATION_WAIT_S = int(os.getenv("JOBBYO_FIRST_MATCH_CALIBRATION_WAIT_S", "300"))
+# a small nudge for jobs on sites we apply on by ourselves (they go out fast, with proof)
+ASSISTED_SITE_BONUS = 4
 REVIEW_BATCH_SIZE = 5
 FULL_TEXT_CHARS = 8000
 # Above this, a role paying well under what they earn now does more harm in
@@ -217,7 +222,46 @@ def candidate_facts(user_profile, automation):
         "high_earner": high_earner,
         "daily_limit": _to_int(prefs.get("dailyLimit")) or 10,
         "excluded_companies": ((prefs.get("companyPreferences") or {}).get("excludedCompanies")) or [],
+        "taste": calibration_taste(automation),
     }
+
+
+def _tags(item):
+    tags = item.get("tags") if isinstance(item.get("tags"), dict) else {}
+    return ", ".join(str(tags[k]) for k in ("size", "industry", "culture", "workplace") if tags.get(k))
+
+
+def calibration_taste(automation):
+    """What they told us while rating example roles at setup: the roles they'd
+    apply to, the ones they skipped, and the read on them - the strongest
+    signal of what impresses THIS person."""
+    items = [i for i in (automation or {}).get("calibration") or [] if isinstance(i, dict)]
+    profile = (automation or {}).get("calibrationProfile") or {}
+    line = lambda i: f"{str(i.get('title') or '')[:80]} ({_tags(i)[:120]})"
+    return {
+        "summary": str(profile.get("summary") or "")[:600],
+        "culture": profile.get("culture") or [],
+        "would_apply": [line(i) for i in items if i.get("liked") is True][:8],
+        "not_for_me": [line(i) for i in items if i.get("liked") is False][:8],
+    }
+
+
+def calibration_done(automation):
+    """Setup calibration finished (its summary is saved with the last rating)."""
+    return bool(((automation or {}).get("calibrationProfile") or {}).get("summary"))
+
+
+def wait_for_calibration(uid, max_wait_s=CALIBRATION_WAIT_S, every_s=15):
+    """The first search starts at payment, often while they're still rating
+    example roles - wait (up to max_wait_s) so the first batch uses them.
+    Returns the freshest automation."""
+    deadline = time.monotonic() + max_wait_s
+    automation = sj.get_user_automation(uid) or {}
+    while not calibration_done(automation) and time.monotonic() < deadline:
+        time.sleep(every_s)
+        automation = sj.get_user_automation(uid) or {}
+    print(f"first_match: calibration {'ready' if calibration_done(automation) else 'not finished - going without it'}")
+    return automation
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +345,10 @@ RULES (drop on any of these, pick the closest drop_category)
   Shared title words are not enough (a childcare center Director is not a Director of Product
   Management; a CSM is not a Head of CS). If not, drop it (wrong_function or too_senior_or_people_manager).
 - If the posting looks closed/expired, drop it (closed).
+- THEIR TASTE (candidate.taste, from rating example roles at setup) is the strongest signal after
+  the rules above. Score up jobs like the ones in would_apply (same kind of company, industry,
+  culture, workplace); drop jobs clearly like the ones in not_for_me (drop_category "other",
+  drop_reason e.g. "like the agency roles you skipped"). Use taste.summary as the read on them.
 
 FOR EACH JOB return:
 - keep, score 0-100 (how strongly you'd recommend it; 85+ = obvious fit), drop_category ("none" if kept),
@@ -311,7 +359,9 @@ FOR EACH JOB return:
 - fit_line: for kept jobs, ONE short line (max 14 words) on why it fits THIS person, naming something
   concrete from their background, e.g. "Network security, your home turf from Lumen and AT&T."
   Plain, warm, no hype, no numbers that aren't in the posting or CV. About why the WORK fits them --
-  never restate location, pay or eligibility (those are shown separately). "" for dropped jobs.
+  never restate location, pay or eligibility (those are shown separately). When it's the reason,
+  tie it to their taste, e.g. "A product-led Series B, like the ones you said you'd apply to."
+  "" for dropped jobs.
 - angle: for kept jobs, what to LEAD WITH when applying, max 14 words, one concrete thing from their CV
   this posting cares about, e.g. "your $250M+ hyperscaler deal and Fortune 50 account ownership".
   "" for dropped jobs.
@@ -516,7 +566,8 @@ def curate(uid, run_entries, user_profile=None, automation=None):
     """run_entries: this user's entries from the signup run's job_run_*.json
     (one per round). Returns a report dict; posts and sends nothing."""
     user_profile = user_profile or sj.get_user_profile(uid) or {}
-    automation = automation or sj.get_user_automation(uid) or {}
+    # always the freshest list: their calibration may have finished during the search
+    automation = automation if calibration_done(automation) else wait_for_calibration(uid)
     facts = candidate_facts(user_profile, automation)
 
     seen, candidates, metrics, pipeline_drops = set(), [], Counter(), Counter()
@@ -562,7 +613,7 @@ def curate(uid, run_entries, user_profile=None, automation=None):
         return _previous_version(uid, run_entries, user_profile, automation, "Claude kept 0", len(open_jobs))
     dropped += reviewed_out
 
-    kept.sort(key=lambda j: j.get("score") or 0, reverse=True)
+    kept.sort(key=lambda j: (j.get("score") or 0) + (ASSISTED_SITE_BONUS if sj.on_assisted_site(j) else 0), reverse=True)
     # Safe bets first, then at most one clearly labelled stretch.
     stretches = [j for j in kept if j.get("stretch")]
     kept = [j for j in kept if not j.get("stretch")]

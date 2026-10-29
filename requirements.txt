@@ -1,5 +1,6 @@
 requests
 openai
+anthropic
 python-dotenv
 fastapi
 uvicorn[standard]

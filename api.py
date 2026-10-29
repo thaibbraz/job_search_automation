@@ -25,6 +25,12 @@ POST /approve/user            Alias for /email/user
 GET  /coverage/today          Per-user job counts today + coverage %  (query: ?send_slack=true)
 GET  /coverage/missing        Paid users not yet emailed today (per approve_jobs.py's send log)
 POST /email/missing           Force-send the daily report to everyone not yet emailed today
+                               (skips anyone whose email is paused)
+
+GET  /admin/emails/daily       Admin Emails tab: every paid user's daily email today -- sent,
+                               ready, short, no jobs or paused
+POST /admin/emails/daily/send  Send it now (body: {emails?}; none = everyone not sent yet)
+PUT  /admin/emails/pauses      Pause / resume one person's daily email (body: {email, paused, reason?})
 
 POST /leads/hot                Score a just-created automation's salary/location; if it clears
                                the hot-lead bar (see lead_scoring.py), record it.
@@ -61,6 +67,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from date_utils import parse_utc_timestamp
+import approve_jobs
+import email_pauses
 import team_corrections
 
 load_dotenv()
@@ -711,6 +719,14 @@ async def run_user_subscribed(target: UserTarget):
     existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
     started_at = asyncio.get_event_loop().time()
 
+    # Payment usually lands while they're still rating example roles: give the
+    # calibration a few minutes so the search itself is shaped by it (the
+    # review reads it as soft preferences), not just the final pick.
+    if target.uid:
+        import first_match
+        await asyncio.to_thread(first_match.wait_for_calibration, target.uid,
+                                int(os.getenv("JOBBYO_FIRST_SEARCH_CALIBRATION_WAIT_S", "240")))
+
     # First match: gather a wider pool and post nothing -- first_match.py
     # curates it in _finish_subscribed_run before anything reaches the user.
     first_match_env = {
@@ -1230,7 +1246,11 @@ async def email_missing(background_tasks: BackgroundTasks):
         )
     report = await _compute_coverage_today()
     emailed_uids = await asyncio.to_thread(_emailed_today_uids_sync)
-    missing_emails = [u["email"] for u in report["users"] if u.get("uid") not in emailed_uids and u["email"]]
+    paused = email_pauses.load()
+    missing_emails = [
+        u["email"] for u in report["users"]
+        if u.get("uid") not in emailed_uids and u["email"] and u["email"].lower() not in paused
+    ]
     for email in missing_emails:
         background_tasks.add_task(
             _single_run, "approve_jobs.py", ["--email", email, "--force"], f"email:missing:{email}"
@@ -1889,6 +1909,7 @@ async def admin_search_daily(day: Optional[str] = None):
                 "uid": uid, "name": user.get("displayName") or user.get("name") or "", "email": user.get("email", ""),
                 **_day_counts(jobs, day, automated_urls),
                 "feedback_count": len(feedback), "feedback_with_text": sum(1 for f in feedback if f["feedback"]),
+                "automation_paused": user.get("automationPaused") or None,
             })
         out.sort(key=lambda u: (-u["missing"], (u["name"] or u["email"]).lower()))
         return out
@@ -1969,7 +1990,7 @@ async def admin_search_fill_short(req: SearchRunRequest, background_tasks: Backg
     is topped up to the target (one run, users one after another)."""
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = await admin_search_daily(day)
-    emails = [u["email"] for u in daily["users"] if u["missing"] > 0 and u["email"]]
+    emails = [u["email"] for u in daily["users"] if u["missing"] > 0 and u["email"] and not u.get("automation_paused")]
     if not emails:
         return {"accepted": False, "message": "Everyone already has their jobs today."}
     env = _search_env(req.model, req.profile)
@@ -2049,3 +2070,143 @@ async def admin_search_delete_unpaid(dry_run: bool = False):
                     path.unlink(missing_ok=True)
         return {"users": len(unpaid), "files": moved, "dry_run": dry_run}
     return await asyncio.to_thread(run)
+
+
+# ---------------------------------------------------------------------------
+# Admin: daily report emails (Job Search page, Emails tab)
+# ---------------------------------------------------------------------------
+
+def _emailed_today_log() -> dict:
+    """approve_jobs.py's send log for today: uid -> sent_at (None for sends
+    logged before it kept times)."""
+    try:
+        log = json.loads(approve_jobs._emailed_today_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    sent_at = log.get("sent_at") or {}
+    return {uid: sent_at.get(uid) for uid in log.get("uids", [])}
+
+
+def _daily_email_row(user: dict, emailed: dict, pauses: dict) -> Optional[dict]:
+    uid = _uid_of(user)
+    email = (user.get("email") or "").strip()
+    if not uid or not email:
+        return None
+    try:
+        jobs = _fetch_user_automation_sync(uid).get("selectedJobs") or []
+    except Exception as exc:
+        print(f"[admin/emails] automation for {uid}: {exc}")
+        jobs = None
+    today = [j for j in jobs or [] if isinstance(j, dict) and approve_jobs._is_today(j)]
+    status_of = lambda j: str(j.get("status", "")).lower()  # noqa: E731
+    count = sum(1 for j in today if status_of(j) in approve_jobs.STATUSES_TO_COUNT)
+    emailable = sum(1 for j in today if status_of(j) in approve_jobs.STATUSES_TO_EMAIL)
+    pause = pauses.get(email.lower())
+    if user.get("automationPaused") and not pause:
+        pause = {**user["automationPaused"], "reason": "Whole automation paused"}
+    # Same order approve_jobs.py decides in.
+    if uid in emailed:
+        status = "sent"
+    elif pause:
+        status = "paused"
+    elif jobs is None:
+        status = "error"
+    elif not emailable:
+        status = "no_jobs"
+    elif count >= approve_jobs.MIN_JOBS_TO_EMAIL:
+        status = "ready"
+    else:
+        status = "short"
+    return {
+        "uid": uid, "name": user.get("displayName") or user.get("name") or "", "email": email,
+        "jobs_today": count, "emailable": emailable, "status": status, "sent_at": emailed.get(uid),
+        "paused": bool(pause), "paused_at": (pause or {}).get("paused_at"), "pause_reason": (pause or {}).get("reason") or "",
+        "automation_paused": bool(user.get("automationPaused")),
+    }
+
+
+@app.get("/admin/emails/daily")
+async def admin_emails_daily():
+    """Every paid user's daily report today. status: sent | ready (enough
+    jobs, goes out on the next send) | short (under MIN_JOBS_TO_EMAIL, goes
+    out only if sent by hand) | no_jobs (nothing to send) | paused | error."""
+    def build():
+        from concurrent.futures import ThreadPoolExecutor
+        emailed, pauses = _emailed_today_log(), email_pauses.load()
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            rows = [r for r in pool.map(lambda u: _daily_email_row(u, emailed, pauses), _fetch_paid_users_sync()) if r]
+        order = {"ready": 0, "short": 1, "error": 2, "no_jobs": 3, "paused": 4, "sent": 5}
+        rows.sort(key=lambda r: (order[r["status"]], (r["name"] or r["email"]).lower()))
+        return rows
+
+    users = await asyncio.to_thread(build)
+    return {
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "min_jobs": approve_jobs.MIN_JOBS_TO_EMAIL,
+        "send_time": "10:00 Europe/Madrid",
+        "full_run_active": _state.full_run_active,
+        "users": users,
+    }
+
+
+class DailyEmailSend(BaseModel):
+    emails: Optional[list[str]] = None  # none = everyone not sent yet with something to send
+
+
+@app.post("/admin/emails/daily/send", status_code=202)
+async def admin_emails_daily_send(req: DailyEmailSend, background_tasks: BackgroundTasks):
+    """Send the daily report now, under MIN_JOBS_TO_EMAIL too (--force).
+    Naming someone already sent re-sends it; paused people are never sent."""
+    if _state.full_run_active:
+        raise HTTPException(status_code=409, detail="A full run is in progress — send once it finishes.")
+    pauses = email_pauses.load()
+    if req.emails:
+        targets = [e.strip() for e in req.emails if e and e.strip()]
+    else:
+        emailed = await asyncio.to_thread(_emailed_today_log)
+        users = await asyncio.to_thread(_fetch_paid_users_sync)
+        targets = [u["email"] for u in users if u.get("email") and _uid_of(u) not in emailed]
+    skipped = [e for e in targets if e.lower() in pauses]
+    targets = [e for e in targets if e.lower() not in pauses]
+    for email in targets:
+        background_tasks.add_task(_single_run, "approve_jobs.py", ["--email", email, "--force"], f"email:daily:{email}")
+    message = f"Sending to {len(targets)} user{'s' if len(targets) != 1 else ''}."
+    if skipped:
+        message += f" {len(skipped)} paused, not sent."
+    return {"accepted": True, "count": len(targets), "skipped_paused": skipped, "message": message}
+
+
+class EmailPause(BaseModel):
+    email: str
+    paused: bool
+    reason: str = ""
+
+
+@app.put("/admin/emails/pauses")
+async def admin_emails_pause(req: EmailPause):
+    if "@" not in req.email:
+        raise HTTPException(status_code=422, detail="Not an email address.")
+    pauses = await asyncio.to_thread(email_pauses.set_paused, req.email, req.paused, req.reason)
+    return {"email": req.email.strip().lower(), "paused": req.paused, "pauses": pauses}
+
+
+class AutomationPause(BaseModel):
+    paused: bool
+    reason: str = ""
+
+
+@app.put("/admin/search/users/{uid}/automation-pause")
+async def admin_automation_pause(uid: str, req: AutomationPause):
+    """Pause / resume someone's whole automation: no searches, no approvals,
+    no daily email. Stored on their user doc (jobbyo-fastapi-server), which
+    every run reads through /users/paid."""
+    def call():
+        return requests.put(
+            f"{BACKEND_BASE}/users/{uid}/automation-pause",
+            json={"paused": req.paused, "reason": req.reason},
+            headers={"X-Admin-Key": ADMIN_API_KEY}, timeout=20,
+        )
+    resp = await asyncio.to_thread(call)
+    if not resp.ok:
+        raise HTTPException(status_code=resp.status_code, detail=f"Backend refused: {resp.text[:200]}")
+    return resp.json()

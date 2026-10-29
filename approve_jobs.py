@@ -5,6 +5,8 @@ Run after send_jobbyo.py has staged jobs as pending_review.
 
 For each paid user:
   - Skip if already emailed today (dedup via run_logs/emailed_YYYY-MM-DD.json)
+  - Skip the email (jobs are still promoted) if it's paused (email_pauses.py)
+  - Skip the user entirely if their whole automation is paused (automationPaused)
   - Fetch their selectedJobs
   - Find pending_review jobs
   - If >= MIN_JOBS_TO_EMAIL: promote to plan-appropriate status and send email
@@ -30,6 +32,8 @@ import requests
 from dotenv import load_dotenv
 
 from date_utils import is_same_utc_date
+import email_pauses
+import feedback_learning
 
 load_dotenv()
 
@@ -138,8 +142,18 @@ def load_emailed_today():
 
 
 def save_emailed_today(uid_set):
+    """Also keeps when each uid was first emailed today (sent_at), for the
+    admin Emails tab."""
     RUN_LOGS_DIR.mkdir(exist_ok=True)
-    _emailed_today_path().write_text(json.dumps({"uids": sorted(uid_set)}, indent=2))
+    path = _emailed_today_path()
+    try:
+        sent_at = json.loads(path.read_text()).get("sent_at") or {}
+    except Exception:
+        sent_at = {}
+    now = datetime.now(timezone.utc).isoformat()
+    for uid in uid_set:
+        sent_at.setdefault(uid, now)
+    path.write_text(json.dumps({"uids": sorted(uid_set), "sent_at": sent_at}, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +502,21 @@ def send_email(user_profile, automation, jobs, override_email=None):
 
     preferences_html = ""
     rejected_with_reason = _rejected_today_with_feedback(automation)
-    if rejected_with_reason:
+    # What the nightly search learned from their rejections (feedback_learning.py)
+    # -- tell them concretely what changed, not just "we've sharpened it".
+    uid = user_profile.get("uid") or automation.get("userId")
+    learned_rules = (feedback_learning.load_notes(uid).get("rules") or [])[:3] if uid else []
+    recent_rejections = feedback_learning.rejected_since(automation.get("selectedJobs") or [], hours=48)
+    if learned_rules and recent_rejections:
+        items = "".join(f'<li style="margin:0 0 4px 0;">{r}</li>' for r in learned_rules)
+        preferences_html = f"""
+    <div style="margin:0 0 28px 0;padding:16px 18px;background:#f0f9ff;border-radius:8px;border-left:3px solid #3A56E2;">
+      <p style="margin:0 0 8px 0;font-size:13px;color:#374151;line-height:1.7;font-family:Arial,sans-serif;">
+        Thanks for your feedback. Here&rsquo;s what I changed in your search:
+      </p>
+      <ul style="margin:0;padding-left:18px;font-size:13px;color:#374151;line-height:1.7;font-family:Arial,sans-serif;">{items}</ul>
+    </div>"""
+    elif rejected_with_reason:
         n = len(rejected_with_reason)
         quotes = "; ".join(
             f'&ldquo;{str(j.get("feedback") or "").strip()[:80]}&rdquo;' for j in rejected_with_reason[:3]
@@ -557,7 +585,7 @@ def send_email(user_profile, automation, jobs, override_email=None):
 
     payload = {
         "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-        "to": [{"email": email, "name": name}, {"email": "hello@jobbyo.ai", "name": "Jobbyo"}],
+        "to": [{"email": email, "name": name}],
         "subject": f"Your job matches for today, {first_name}",
         "htmlContent": html_content,
     }
@@ -605,13 +633,15 @@ def post_slack(text):
 HIGH_REJECTION_THRESHOLD = 5
 
 
-def send_slack_summary(emailed_users, skipped_users, pending_users, high_rejection_users=None):
+def send_slack_summary(emailed_users, skipped_users, pending_users, high_rejection_users=None, paused_users=None):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [f"Laras here with the email send recap ({now}):"]
 
     lines.append(f"✅ {len(emailed_users)} email(s) sent this run." if emailed_users else "No new emails sent this run.")
     if skipped_users:
         lines.append(f"⏭️ {len(skipped_users)} skipped (already sent today).")
+    if paused_users:
+        lines.append(f"⏸️ {len(paused_users)} paused (jobs added, no email): " + ", ".join(u["email"] for u in paused_users))
 
     if pending_users:
         lines.append(f"⚠️ *{len(pending_users)} below threshold ({MIN_JOBS_TO_EMAIL} jobs):*")
@@ -690,16 +720,22 @@ def process_user(user, force=False):
     if to_promote:
         promote_jobs(email, to_promote, new_status)
 
-    emailed = send_email(user_profile, automation, jobs_for_email)
+    # Paused: their jobs still go live in the app, just no email.
+    paused = email_pauses.is_paused(email)
+    if paused:
+        print(f"  {name} ({email}) — daily email paused, not sending")
+    emailed = False if paused else send_email(user_profile, automation, jobs_for_email)
 
     return {
         "name": name,
         "email": email,
         "uid": uid,
+        "pending_count": count,
         "jobs_promoted": len(jobs_for_email),
         "new_status": new_status,
         "rejected_today": rejected_today,
         "emailed": emailed,
+        "paused": paused,
     }
 
 
@@ -747,11 +783,16 @@ def main():
     emailed_users = []
     skipped_users = []
     pending_users = []
+    paused_users = []
 
     for user in paid_users:
         uid = user.get("uid") or user.get("id") or ""
         email = user.get("email") or ""
         name = user.get("displayName") or email.split("@")[0]
+
+        if user.get("automationPaused"):
+            print(f"  {name} ({email}) — automation paused, skipping")
+            continue
 
         if uid and uid in emailed_today_uids and not single_email:
             print(f"  {name} ({email}) — already emailed today, skipping")
@@ -766,6 +807,8 @@ def main():
             emailed_today_uids.add(uid)
             save_emailed_today(emailed_today_uids)
             emailed_users.append(result)
+        elif result.get("paused"):
+            paused_users.append(result)
         else:
             pending_users.append(result)
 
@@ -780,12 +823,16 @@ def main():
         print(f"Already emailed today ({len(skipped_users)}):")
         for u in skipped_users:
             print(f"  ⏭️  {u['name']} ({u['email']})")
+    if paused_users:
+        print(f"Paused — jobs added, no email ({len(paused_users)}):")
+        for u in paused_users:
+            print(f"  ⏸️  {u['name']} ({u['email']})")
     print(f"Still pending ({len(pending_users)}):")
     for u in pending_users:
         print(f"  🔴 {u['name']} ({u['email']})  {u['pending_count']}/{MIN_JOBS_TO_EMAIL} jobs")
 
     high_rejection_users = [
-        u for u in (emailed_users + pending_users)
+        u for u in (emailed_users + pending_users + paused_users)
         if u.get("rejected_today", 0) > HIGH_REJECTION_THRESHOLD
     ]
     if high_rejection_users:
@@ -794,7 +841,7 @@ def main():
             print(f"  🚫 {u['name']} ({u['email']})  {u['rejected_today']} rejected")
 
     if not single_email:
-        send_slack_summary(emailed_users, skipped_users, pending_users, high_rejection_users)
+        send_slack_summary(emailed_users, skipped_users, pending_users, high_rejection_users, paused_users)
 
 
 if __name__ == "__main__":

@@ -83,10 +83,11 @@ def preference_notes(client, uid: str, rejected_jobs: list[dict]) -> dict:
     prompt = f"""A job seeker rejected these jobs we suggested. Some include their reason.
 Turn them into a few short, specific rules for picking their NEXT jobs.
 
-- rules: 0-6 rules, each under 15 words, only patterns supported by the data
-  (a reason given, or the same kind of job rejected repeatedly). e.g.
-  "Avoid AI-first startups", "No contracts shorter than 6 months",
-  "Avoid marketing-tech products". No generic advice.
+- rules: 0-6 rules, each under 12 words, only patterns supported by the data
+  (a reason given, or the same kind of job rejected repeatedly). They are
+  shown to the user in their email, so write them as plain, friendly search
+  changes, e.g. "Fewer AI-first startups", "No contracts shorter than 6 months",
+  "Skipping marketing-tech products". Never mention "the candidate". No generic advice.
 - blocked_companies: only companies they clearly don't want (a reason about
   the company itself, or rejected 3+ times). Not every rejected company.
 - min_salary_usd: only if they said salary was too low AND a number is implied; else null.
@@ -118,6 +119,27 @@ REJECTED JOBS (oldest first):
     except OSError:
         pass
     return notes
+
+
+def load_notes(uid: str) -> dict:
+    """The notes last built for this user (no LLM call) -- for the email."""
+    try:
+        return json.loads((NOTES_DIR / f"{uid}.feedback.json").read_text())["notes"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def rejected_since(selected_jobs: list[dict], hours: int = 24) -> list[dict]:
+    """Jobs the user rejected in the last `hours` (by rejectedAt), newest first."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    out = []
+    for j in selected_jobs:
+        if str(j.get("status", "")).lower() != "rejected" or j.get("removedByOperator"):
+            continue
+        at =_parse_ts(j.get("rejectedAt"))
+        if at and at >= cutoff:
+            out.append(j)
+    return sorted(out, key=lambda j: _parse_ts(j.get("rejectedAt")), reverse=True)
 
 
 # --- 2. inputs for fit_ranker's hard rules --------------------------------
