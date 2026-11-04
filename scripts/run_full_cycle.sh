@@ -22,8 +22,8 @@
 #                    failing the whole pass.
 #
 # Three passes a day, driven by systemd timers:
-#   19:00 Europe/Madrid — plain search, builds up the queue
-#   22:00 Europe/Madrid — --report — top-up search for anyone still short,
+#   01:00 Asia/Jakarta — plain search, builds up the queue
+#   04:00 Asia/Jakarta — --report — top-up search for anyone still short,
 #                         then the Slack coverage number
 #   10:00 Europe/Madrid (next morning) — --email --skip-search — send the
 #                         daily report from what the two passes above found

@@ -26,10 +26,20 @@ from __future__ import annotations
 import math
 import os
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 
 FIT_EMBED_MODEL = os.getenv("JOBBYO_FIT_EMBED_MODEL", "text-embedding-3-small")
 FIT_POOL_KEEP = int(os.getenv("JOBBYO_FIT_POOL_KEEP", "60") or 60)
+# Taste: what the user approved / rejected themselves moves a job up or down
+# next to the CV match. Needs a few signals before it switches on.
+TASTE_MIN_SIGNALS = int(os.getenv("JOBBYO_TASTE_MIN_SIGNALS", "3") or 3)
+TASTE_WEIGHT = float(os.getenv("JOBBYO_TASTE_WEIGHT", "1.5") or 1.5)
+# A job this close to one they rejected (and not closer to one they liked) is a near-copy: dropped.
+TASTE_NEAR_COPY = float(os.getenv("JOBBYO_TASTE_NEAR_COPY", "0.92") or 0.92)
+TASTE_MAX_SIGNALS = 40
+# Fresher postings get answered: jobs older than FRESH_DAYS lose a few fit points.
+FRESH_DAYS = int(os.getenv("JOBBYO_FRESH_DAYS", "14") or 14)
+STALE_PENALTY = int(os.getenv("JOBBYO_STALE_PENALTY", "5") or 5)
 MAX_YEARS_GAP = 2
 
 # Country name/alias -> ISO2. Covers every country seen in user prefs so far
@@ -49,7 +59,11 @@ _COUNTRIES = {
     "korea": "KR", "china": "CN", "hong kong": "HK", "taiwan": "TW", "australia": "AU",
     "new zealand": "NZ", "united arab emirates": "AE", "uae": "AE", "saudi arabia": "SA",
     "qatar": "QA", "israel": "IL", "turkey": "TR", "egypt": "EG", "nigeria": "NG",
-    "ghana": "GH", "kenya": "KE", "south africa": "ZA", "morocco": "MA",
+    "kuwait": "KW", "ghana": "GH", "kenya": "KE", "south africa": "ZA", "morocco": "MA",
+    # Names users type in their own language.
+    "brasil": "BR", "méxico": "MX", "españa": "ES", "deutschland": "DE", "italia": "IT",
+    "nederland": "NL", "schweiz": "CH", "suisse": "CH", "österreich": "AT", "polska": "PL",
+    "türkiye": "TR", "perú": "PE", "belgië": "BE", "belgique": "BE",
 }
 _US_STATES = {
     "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut",
@@ -101,7 +115,7 @@ def _country_of(text: str) -> str | None:
 # --- candidate side --------------------------------------------------------
 
 
-def candidate_profile(user_profile: dict, prefs: dict) -> dict:
+def candidate_profile(user_profile: dict, prefs: dict, home_country: str | None = None) -> dict:
     """What the user actually chose + facts from their CV."""
     loc = prefs.get("location") or {}
     types = {_norm(t).replace("onsite", "on-site") for t in (loc.get("type") or []) if _norm(t)}
@@ -126,6 +140,13 @@ def candidate_profile(user_profile: dict, prefs: dict) -> dict:
             places.setdefault(country, set()).update(local)
 
     cv = (user_profile or {}).get("cv") or {}
+    # Zero or one place we couldn't read ("Hartford, CT"): their home country.
+    # Several unreadable places can span countries (Shanghai + Bangkok): left open.
+    if not places and len([p for p in loc.get("places") or [] if str(p).strip()]) <= 1:
+        home = _country_of(home_country or cv.get("country") or "")
+        if home:
+            places[home] = None
+
     starts = []
     for exp in cv.get("experiences") or []:
         m = re.search(r"(19|20)\d{2}", str((exp or {}).get("startYear") or (exp or {}).get("date") or ""))
@@ -158,7 +179,7 @@ def job_facts(job: dict) -> dict:
     if not wtype and "remote" in _norm(location):
         wtype = "remote"
 
-    countries = set(hc.get("countries") or [])
+    countries = {_country_of(c) or c for c in hc.get("countries") or []}
     if not countries:
         for part in re.split(r"[,;/|]| or ", location):
             c = _country_of(part)
@@ -180,6 +201,8 @@ def job_facts(job: dict) -> dict:
         "min_years": min_years,
         "industries": _norm(" ".join(hc.get("industries") or [])),
         "salary_max": hc.get("salary_max"),
+        "h1b_sponsor": hc.get("h1b_sponsor"),
+        "posted_at": hc.get("posted_at") or "",
     }
 
 
@@ -235,7 +258,18 @@ def hard_reject_reason(job: dict, cand: dict) -> str | None:
 
     if cand["needs_sponsorship"] and _NO_SPONSOR.search(job.get("description") or ""):
         return "no visa sponsorship"
+    if cand["needs_sponsorship"] and f["h1b_sponsor"] is False and "US" in f["countries"]:
+        return "no visa sponsorship"
     return None
+
+
+def _age_days(posted_at) -> float | None:
+    try:
+        ts = datetime.fromisoformat(str(posted_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() / 86400
 
 
 def describe_for_review(job: dict) -> str:
@@ -273,20 +307,66 @@ def _job_text(job: dict) -> str:
     return f"{job.get('title') or ''} at {job.get('company') or ''}\n{(job.get('description') or '')[:2000]}"
 
 
-def rank_by_cv_fit(client, jobs: list[dict], cv_text: str, titles: list[str]) -> list[dict]:
-    """Sets job['fit_score'] (0-100) and returns jobs sorted best first."""
+def taste_signals(selected_jobs: list[dict], automation: dict | None = None) -> dict:
+    """The user's own decisions: jobs they rejected, and jobs they approved
+    themselves. Auto-mode users' jobs are approved automatically, so only
+    their rejections count."""
+    cfg = (automation or {}).get("applyConfig") or ((automation or {}).get("automation_data") or {}).get("applyConfig") or {}
+    auto_mode = cfg.get("reviewBeforeSubmit") is False and cfg.get("requireApproval") is False
+    liked, rejected = [], []
+    for j in reversed(selected_jobs or []):  # newest first
+        status = str(j.get("status") or "").lower()
+        if status == "rejected":
+            rejected.append(j)
+        elif status in ("approved", "applied") and not auto_mode:
+            liked.append(j)
+    return {"liked": liked[:TASTE_MAX_SIGNALS], "rejected": rejected[:TASTE_MAX_SIGNALS]}
+
+
+def _knn(vec, others, k=3) -> float:
+    sims = sorted((_cosine(vec, o) for o in others), reverse=True)[:k]
+    return sum(sims) / len(sims) if sims else 0.0
+
+
+def rank_by_cv_fit(client, jobs: list[dict], cv_text: str, titles: list[str], taste: dict | None = None) -> list[dict]:
+    """Sets job['fit_score'] (0-100) and returns jobs sorted best first.
+    With enough taste signals, the score also moves toward jobs like the ones
+    they approved and away from ones they rejected (job['taste_score'])."""
     profile = cv_text[:8000] + ("\n\nTarget roles: " + ", ".join(titles) if titles else "")
-    vectors = _embed(client, [profile] + [_job_text(j) for j in jobs])
+    liked = (taste or {}).get("liked") or []
+    rejected = (taste or {}).get("rejected") or []
+    use_taste = len(liked) + len(rejected) >= TASTE_MIN_SIGNALS
+    texts = [profile] + [_job_text(j) for j in jobs]
+    if use_taste:
+        texts += [_job_text(j) for j in liked] + [_job_text(j) for j in rejected]
+    vectors = _embed(client, texts)
     cv_vec = vectors[0]
-    for job, vec in zip(jobs, vectors[1:]):
-        job["fit_score"] = round(100 * max(0.0, _cosine(cv_vec, vec)))
+    job_vecs = vectors[1:1 + len(jobs)]
+    liked_vecs = vectors[1 + len(jobs):1 + len(jobs) + len(liked)] if use_taste else []
+    rejected_vecs = vectors[1 + len(jobs) + len(liked):] if use_taste else []
+    for job, vec in zip(jobs, job_vecs):
+        cv_fit = max(0.0, _cosine(cv_vec, vec))
+        job["fit_score"] = round(100 * cv_fit)
+        if use_taste:
+            like = _knn(vec, liked_vecs) if liked_vecs else 0.0
+            dislike = _knn(vec, rejected_vecs) if rejected_vecs else 0.0
+            closest_rejected = max((_cosine(vec, r) for r in rejected_vecs), default=0.0)
+            closest_liked = max((_cosine(vec, l) for l in liked_vecs), default=0.0)
+            job["taste_score"] = round(100 * (like - dislike), 1)
+            job["_near_rejected"] = closest_rejected >= TASTE_NEAR_COPY and closest_rejected > closest_liked
+            job["fit_score"] = round(100 * max(0.0, cv_fit + TASTE_WEIGHT * (like - dislike)))
+        posted = job_facts(job)["posted_at"]
+        age = _age_days(posted) if posted else None
+        if age is not None and age > FRESH_DAYS:
+            job["fit_score"] = max(0, job["fit_score"] - STALE_PENALTY)
     return sorted(jobs, key=lambda j: j["fit_score"], reverse=True)
 
 
 def apply_fit_stage(jobs, user_profile, prefs, cv_text, openai_client=None, keep=FIT_POOL_KEEP,
-                    blocked_companies=None, company_counts=None, company_cap=None, salary_floor=None):
+                    blocked_companies=None, company_counts=None, company_cap=None, salary_floor=None, taste=None,
+                    home_country=None):
     """Hard rules, then CV-fit ranking. Returns (kept_jobs, rejected_with_reasons)."""
-    cand = candidate_profile(user_profile, prefs)
+    cand = candidate_profile(user_profile, prefs, home_country)
     cand.update({
         "blocked_companies": blocked_companies or set(),
         "company_counts": company_counts or {},
@@ -314,7 +394,14 @@ def apply_fit_stage(jobs, user_profile, prefs, cv_text, openai_client=None, keep
 
     if kept and openai_client and cv_text:
         try:
-            kept = rank_by_cv_fit(openai_client, kept, cv_text, cand["titles"])
+            kept = rank_by_cv_fit(openai_client, kept, cv_text, cand["titles"], taste=taste)
+            near = [j for j in kept if j.pop("_near_rejected", False)]
+            if near:
+                kept = [j for j in kept if j not in near]
+                rejected.extend((j, "too similar to a job they rejected") for j in near)
+            if taste and any("taste_score" in j for j in kept + near):
+                print(f"Fit stage: taste from {len(taste.get('liked') or [])} approved / {len(taste.get('rejected') or [])} rejected "
+                      f"jobs; dropped {len(near)} near-copies of rejected jobs")
             dropped = kept[keep:]
             kept = kept[:keep]
             rejected.extend((j, f"low CV fit ({j['fit_score']})") for j in dropped)

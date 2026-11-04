@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import hashlib
 import json
 import os
 import re
@@ -206,7 +207,13 @@ PERMANENTLY_BLOCKED_COMPANIES = {
 # 7 OpenAI search batches, and returns direct ATS URLs (Ashby, Greenhouse, etc.)
 APIFY_API_TOKEN = os.getenv("JOBBYO_APIFY_TOKEN", "")
 APIFY_HIRING_CAFE_ACTOR_ID = "memo23~apify-hiring-cafe-scraper"
-HIRING_CAFE_MAX_ITEMS = env_int("JOBBYO_HC_MAX_ITEMS", 100)   # raw results fetched per user from HC
+HIRING_CAFE_MAX_ITEMS = env_int("JOBBYO_HC_MAX_ITEMS", 60)   # raw results fetched per user from HC (paid per result)
+# Hiring Cafe is the one source paid per result: it runs only when JFE + Jobo
+# (free / flat-rate) left the pool short, i.e. fewer than this many pool jobs
+# per job still needed today.
+HC_SKIP_POOL_FACTOR = env_int("JOBBYO_HC_SKIP_POOL_FACTOR", 6)
+# Titles Hiring Cafe searches per run, rotated through the user's titles day by day.
+HC_TITLES_PER_RUN = env_int("JOBBYO_HC_TITLES_PER_RUN", 2)
 HIRING_CAFE_BATCH_SIZE = 25          # candidates consumed per batch
 # Keyword-overlap floor applied BEFORE AI review. Set to 0 so every fetched job
 # reaches the reviewer: the score is bag-of-words overlap against the profile
@@ -221,9 +228,29 @@ ENABLE_HIRING_CAFE_PREFETCH = bool(APIFY_API_TOKEN)
 # fit_ranker.py: hard rules + CV-embedding ranking on the structured pool.
 ENABLE_FIT_STAGE = env_truthy("JOBBYO_ENABLE_FIT_STAGE", True)
 
+# Two-round filtering: round 1 (hard rules + CV/taste fit) keeps ~3 jobs per
+# job needed (min 20); round 2 is the AI review, reading more of each posting.
+REVIEW_POOL_MIN = int(os.getenv("JOBBYO_REVIEW_POOL_MIN", "20") or 20)
+REVIEW_POOL_PER_NEEDED = int(os.getenv("JOBBYO_REVIEW_POOL_PER_NEEDED", "3") or 3)
+REVIEW_DESC_CHARS = int(os.getenv("JOBBYO_REVIEW_DESC_CHARS", "1600") or 1600)
+PREGRADE_DROP_CONFIDENCE = int(os.getenv("JOBBYO_PREGRADE_DROP_CONFIDENCE", "75") or 75)
+
 JOBO_API_BASE = "https://connect.jobo.world"
 JOBO_API_KEY = os.getenv("JOBO_API_KEY", "")
 JOBO_ATS_MAX_ITEMS = env_int("JOBBYO_JOBO_MAX_ITEMS", 90)  # raw results per call
+# Jobo is a flat monthly plan (Growth, $99/mo): every title gets searched,
+# a few titles per call, up to this many calls per user per round.
+JOBO_TITLES_PER_CALL = env_int("JOBBYO_JOBO_TITLES_PER_CALL", 4)
+JOBO_MAX_CALLS_PER_USER = env_int("JOBBYO_JOBO_MAX_CALLS", 8)
+JOBO_MONTHLY_USD = env_float("JOBBYO_JOBO_MONTHLY_USD", 99.0)
+# Results per user per round, split across that user's calls -- keeps the
+# monthly volume sane even with every title searched.
+JOBO_RESULTS_PER_USER = env_int("JOBBYO_JOBO_RESULTS_PER_USER", 250)
+# Same request within one run (rounds 2 and 3 repeat round 1's) -> same answer.
+_JOBO_CACHE = {}
+# Jobo's salary filter drops every posting without listed pay (most of them);
+# pay is checked later on the posting itself. Opt back in with this env.
+JOBO_SALARY_FILTER = env_truthy("JOBBYO_JOBO_SALARY_FILTER", False)
 JOBO_LOCAL_SCORE_MIN = env_int("JOBBYO_LOCAL_SCORE_MIN", 0)
 ENABLE_JOBO_ATS_PREFETCH = bool(JOBO_API_KEY)
 
@@ -309,7 +336,7 @@ MAX_BATCHES = FIRST_ROUND_BATCHES
 # Hiring.cafe via Apify: $1.25 per 1,000 raw results
 COST_PER_HC_RESULT = 0.00125
 # Jobo ATS: $49.99/month ÷ 100,000 jobs/month
-COST_PER_JOBO_RESULT = 0.0005
+COST_PER_JOBO_RESULT = 0.0  # flat monthly plan (JOBO_MONTHLY_USD), not per result
 # job-fit-engine: self-hosted, querying an already-indexed local Qdrant --
 # no per-call API cost, only the embedding call, negligible at this volume.
 COST_PER_JFE_RESULT = 0.0
@@ -658,6 +685,28 @@ def api_get(url):
 
     res.raise_for_status()
     return res.json()
+
+
+SKIP_EMPTY_RESEARCH = os.getenv("JOBBYO_SKIP_EMPTY_RESEARCH", "1") != "0"
+_EMPTY_TODAY_FILE = Path("run_logs/searched_empty_today.json")
+
+
+def _load_empty_today():
+    try:
+        data = json.loads(_EMPTY_TODAY_FILE.read_text())
+        return data.get("uids") or [] if data.get("date") == datetime.now(timezone.utc).date().isoformat() else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_empty_today(uids):
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+        merged = sorted(set(_load_empty_today()) | set(uids))
+        _EMPTY_TODAY_FILE.parent.mkdir(exist_ok=True)
+        _EMPTY_TODAY_FILE.write_text(json.dumps({"date": today, "uids": merged}))
+    except OSError as e:
+        print(f"Could not save empty-today list (non-fatal): {e}")
 
 
 def _jobs_added_at_timestamp():
@@ -4629,10 +4678,10 @@ def review_jobs_with_ai(user_profile, automation, cv_text, persona, jobs, minimu
     ) if k in prefs and prefs[k] not in (None, [], {}, "")}
     learned_context = _LEARNED_REVIEW_CONTEXT.get(user_profile.get("uid")) or ""
 
-    # Trim job descriptions in the review payload — title/company/location already
-    # carry 80% of the signal; 800 chars of description is enough for the rest.
+    # The pool reaching review is small now (round 1 keeps only the best
+    # fits), so the reviewer can read more of each posting.
     jobs_for_review = [
-        {**j, "description": (j.get("description") or "")[:800]}
+        {**j, "description": (j.get("description") or "")[:REVIEW_DESC_CHARS]}
         for j in jobs
     ]
 
@@ -6271,6 +6320,84 @@ def _parse_hiring_cafe_job(raw_item):
     }
 
 
+# Countries whose job postings are mostly in the local language: their titles
+# are also searched translated (cached per user, see local_language_titles).
+_COUNTRY_LANGUAGE = {
+    "germany": "German", "deutschland": "German", "austria": "German", "switzerland": "German",
+    "spain": "Spanish", "españa": "Spanish", "mexico": "Spanish", "méxico": "Spanish", "argentina": "Spanish",
+    "colombia": "Spanish", "chile": "Spanish", "peru": "Spanish", "perú": "Spanish",
+    "brazil": "Portuguese", "brasil": "Portuguese", "portugal": "Portuguese",
+    "france": "French", "belgium": "French", "italy": "Italian", "italia": "Italian",
+    "netherlands": "Dutch", "poland": "Polish", "sweden": "Swedish", "denmark": "Danish",
+    "norway": "Norwegian", "finland": "Finnish", "japan": "Japanese", "turkey": "Turkish",
+    "china": "Chinese",
+}
+
+
+def user_country(automation):
+    return str((((automation or {}).get("settings") or {}).get("address") or {}).get("country") or "").strip()
+
+
+def local_language_titles(uid, titles, country):
+    """The user's titles in their country's language (one cheap call per user,
+    cached until their titles change). [] for English-speaking countries."""
+    language = _COUNTRY_LANGUAGE.get(country.strip().lower())
+    if not language or not titles or NO_GPT_MODE:
+        return []
+    key = hashlib.sha1(json.dumps([language] + sorted(titles)).encode()).hexdigest()
+    path = Path("personas") / f"{uid}.titles_local.json"
+    try:
+        cached = json.loads(path.read_text())
+        if cached.get("key") == key:
+            return cached.get("titles") or []
+    except (OSError, ValueError):
+        pass
+    try:
+        resp = responses_create(
+            model=SEARCH_MODEL,
+            input=(f"Translate these job titles into how employers in {country} usually write them in {language} job "
+                   f"postings. Keep titles that are normally left in English as they are. One title per input, same order.\n"
+                   + "\n".join(f"- {t}" for t in titles)),
+            text={"format": {"type": "json_schema", "name": "titles", "strict": True, "schema": {
+                "type": "object", "properties": {"titles": {"type": "array", "items": {"type": "string"}}},
+                "required": ["titles"], "additionalProperties": False}}},
+        )
+        local = [t.strip() for t in (parse_json_output(resp.output_text) or {}).get("titles") or [] if str(t).strip()]
+    except Exception as e:
+        print(f"Local-language titles failed (non-fatal): {e}")
+        return []
+    have = {t.lower() for t in titles}
+    local = [t for t in dict.fromkeys(local) if t.lower() not in have]
+    try:
+        path.write_text(json.dumps({"key": key, "language": language, "titles": local}))
+    except OSError:
+        pass
+    return local
+
+
+def all_search_titles(automation, persona=None, user_profile=None):
+    """Every title the user picked (not just the first 3), then a few persona
+    titles, then the same titles in the local language where postings use it."""
+    titles = extract_automation_job_titles(automation, limit=40)
+    if not titles:
+        titles = [str(t).strip() for t in (extract_job_preferences(automation).get("jobTitles") or []) if str(t).strip()]
+    if persona and isinstance(persona, dict):
+        titles += [str(t).strip() for t in (persona.get("target_titles") or []) if str(t).strip()][:3]
+    seen, out = set(), []
+    for t in titles:
+        if t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    uid = (user_profile or {}).get("uid") or (automation or {}).get("userId")
+    if uid:
+        out += local_language_titles(uid, out, user_country(automation))
+    return out
+
+
+def _chunks(items, size):
+    return [items[i:i + size] for i in range(0, len(items), max(1, size))]
+
+
 def _build_hc_query(automation, search_contract, user_profile, persona=None):
     """Extract keyword(s), location, and workplace_type for the Apify HC actor.
 
@@ -6354,9 +6481,11 @@ def fetch_hiring_cafe_for_user(automation, search_contract, user_profile, avoid_
         extra_keywords = extract_automation_job_titles(automation, limit=NOGPT_HIRING_CAFE_KEYWORDS)
         keywords = list(dict.fromkeys([k for k in extra_keywords + keywords if k]))[:NOGPT_HIRING_CAFE_KEYWORDS]
     else:
-        # Cover more of the candidate's target titles. maxItems is split
-        # across keywords, so this widens the search at the same raw cost.
-        keywords = keywords[:3]
+        # Paid per result: a couple of titles per run, rotating through all of
+        # the user's titles day by day so every title gets its turn.
+        _titles = all_search_titles(automation, persona, user_profile) or keywords
+        _start = (datetime.now(timezone.utc).timetuple().tm_yday * HC_TITLES_PER_RUN) % max(1, len(_titles))
+        keywords = (_titles[_start:] + _titles[:_start])[:HC_TITLES_PER_RUN]
     if not keywords:
         print("Hiring.cafe: no keyword extracted — skipping prefetch")
         return [], 0
@@ -6496,6 +6625,19 @@ def _parse_jobo_ats_job(raw_item):
         "grade": 70,
         "_hc_workplace_type": workplace_type,
         "_hc_object_id": raw_item.get("id", ""),
+        # Same structured facts as Hiring Cafe jobs, for fit_ranker's hard rules.
+        "_hc_fit": {
+            "workplace_type": workplace_type,
+            "countries": sorted({l.get("country") for l in locations if l.get("country")}),
+            "states": [l.get("region") for l in locations if l.get("region")],
+            "cities": [l.get("city") for l in locations if l.get("city")],
+            "seniority": raw_item.get("experience_level") or "",
+            "employment_type": raw_item.get("employment_type") or "",
+            "posted_at": raw_item.get("date_posted") or raw_item.get("created_at") or "",
+            "h1b_sponsor": raw_item.get("is_h1b_sponsor"),
+            "clearance_required": raw_item.get("is_clearance_required"),
+            "salary_max": sal_max,
+        },
     }
 
 
@@ -6541,22 +6683,58 @@ def is_us_allowed_candidate(user_profile=None, automation=None, search_contract=
 
 
 def build_jobo_search_bodies(keywords, locations, workplace_type, salary_floor, limit, user_profile, automation, search_contract):
-    posted_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Day-rounded so identical requests in later rounds hit _JOBO_CACHE.
+    posted_after = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
     work_models = ["remote"] if workplace_type == "Remote" else ["remote", "hybrid", "onsite"]
 
     if not NO_GPT_MODE:
-        body = {
-            "queries": keywords,
-            "work_models": work_models,
-            "page_size": limit,
-            "posted_after": posted_after,
-            "include_fields": ["summary", "description"],
-        }
-        if locations:
-            body["locations"] = list(locations)
-        if salary_floor:
-            body["salary_usd"] = {"min": salary_floor}
-        return [body]
+        # Flat-rate plan: every title, a few per call. Hybrid/on-site use all of
+        # the user's places; remote jobs get their own pass over the user's
+        # whole country (a remote job isn't tied to their city).
+        prefs_loc = extract_job_preferences(automation).get("location") or {}
+        country = user_country(automation)
+        places = ([str(p).strip() for p in (prefs_loc.get("places") or []) if str(p).strip()][:8]
+                  or list(locations or []) or ([country] if country else []))
+        types = {str(t).strip().lower().replace("-", "") for t in (prefs_loc.get("type") or []) if str(t).strip()}
+        # Seniority filter at the source: experienced users don't spend their
+        # Jobo results on internships / entry-level roles the fit stage drops anyway.
+        years = fit_ranker.candidate_profile(user_profile, extract_job_preferences(automation))["years"]
+        levels = None
+        if years is not None and years >= 6:
+            levels = ["mid", "senior", "lead", "executive"]
+        elif years is not None and years >= 2:
+            levels = ["entry", "mid", "senior", "lead", "executive"]
+        passes = []
+        if workplace_type == "Remote" or types == {"remote"}:
+            passes.append((["remote"], [country] if country else list(locations or [])))
+        else:
+            passes.append((["remote", "hybrid", "onsite"] if not types else
+                           [m for m in ("remote", "hybrid", "onsite") if m in types] or ["remote", "hybrid", "onsite"], places))
+            if "remote" in types and country and country not in places:
+                passes.append((["remote"], [country]))
+        bodies = []
+        for chunk in _chunks(list(keywords), JOBO_TITLES_PER_CALL):
+            for models, locs in passes:
+                body = {
+                    "queries": chunk,
+                    "work_models": models,
+                    "page_size": limit,
+                    "posted_after": posted_after,
+                    "include_fields": ["summary", "description"],
+                }
+                if locs:
+                    body["locations"] = list(locs)
+                if levels:
+                    body["experience_levels"] = levels
+                    body["employment_types"] = ["full-time", "contract", "part-time", "freelance", "temporary"]
+                if salary_floor and JOBO_SALARY_FILTER:
+                    body["salary_usd"] = {"min": salary_floor}
+                bodies.append(body)
+        bodies = bodies[:JOBO_MAX_CALLS_PER_USER]
+        per_call = max(25, min(limit or JOBO_ATS_MAX_ITEMS, JOBO_RESULTS_PER_USER // max(1, len(bodies))))
+        for body in bodies:
+            body["page_size"] = per_call
+        return bodies
 
     # No-GPT: spend more Jobo calls. One query per title gives better recall and
     # avoids a single broad mixed query crowding out useful roles. For US-allowed
@@ -6655,25 +6833,32 @@ def fetch_jfe_for_user(automation, search_contract, user_profile, avoid_urls, re
         print("job-fit-engine: no keywords extracted — skipping prefetch")
         return [], 0
 
-    query = ", ".join(keywords)
-    if locations:
-        query += " in " + " or ".join(locations)
-    elif workplace_type == "Remote":
-        query += " remote"
-
-    try:
-        resp = requests.post(
-            f"{JFE_API_BASE}/jobs/search",
-            params={"query": query, "search_type": "semantic", "max_results": limit},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        raw_results = resp.json().get("results", [])
-    except Exception as e:
-        print(f"job-fit-engine query failed (non-fatal, falls through to HC/Jobo): {e}")
+    # Free: every title, three per query (a long mixed query blurs the semantic match).
+    titles = all_search_titles(automation, persona, user_profile) or keywords
+    where = (" in " + " or ".join(locations)) if locations else (" remote" if workplace_type == "Remote" else "")
+    raw_results, seen_ids = [], set()
+    for chunk in _chunks(titles, 3)[:5]:
+        query = ", ".join(chunk) + where
+        try:
+            resp = requests.post(
+                f"{JFE_API_BASE}/jobs/search",
+                params={"query": query, "search_type": "semantic", "max_results": limit},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+        except Exception as e:
+            print(f"job-fit-engine query failed (non-fatal, falls through to HC/Jobo): {e}")
+            continue
+        for item in results:
+            key = item.get("id") or (item.get("metadata") or {}).get("job_url")
+            if key not in seen_ids:
+                seen_ids.add(key)
+                raw_results.append(item)
+        print(f"job-fit-engine: query={query!r} -> {len(results)} raw results")
+    if not raw_results:
         return [], 0
-
-    print(f"job-fit-engine: query={query!r} -> {len(raw_results)} raw results")
+    print(f"job-fit-engine: {len(raw_results)} raw results across {min(len(_chunks(titles, 3)), 5)} queries")
 
     avoid_norm = {normalize_url(u) for u in (avoid_urls or set())}
     blocked_cos = {str(c).strip().lower() for c in (rejected_companies or set())}
@@ -6723,9 +6908,11 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
     if not ENABLE_JOBO_ATS_PREFETCH:
         return [], 0
     limit = limit or (NOGPT_JOBO_PAGE_SIZE if NO_GPT_MODE else JOBO_ATS_MAX_ITEMS)
-    keyword_limit = NOGPT_JOBO_KEYWORDS if NO_GPT_MODE else 3
-    # Same keyword source as Hiring.cafe: persona titles first, prefs as fallback.
+    keyword_limit = NOGPT_JOBO_KEYWORDS if NO_GPT_MODE else 40
     keywords, locations, workplace_type = _build_hc_query(automation, search_contract, user_profile, persona)
+    if not NO_GPT_MODE:
+        # Flat-rate plan: search every title (and local-language versions).
+        keywords = all_search_titles(automation, persona, user_profile) or keywords
     keywords = keywords[:keyword_limit] or extract_automation_job_titles(automation, limit=keyword_limit)
     if not keywords:
         print("Jobo ATS: no keywords extracted — skipping prefetch")
@@ -6751,6 +6938,12 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
 
     raw_items_all = []
     for idx, body in enumerate(bodies, start=1):
+        cache_key = json.dumps(body, sort_keys=True)
+        if cache_key in _JOBO_CACHE:
+            raw_items = _JOBO_CACHE[cache_key]
+            raw_items_all.extend(raw_items)
+            print(f"Jobo ATS call {idx}/{len(bodies)}: query={body.get('queries')} (cached) → {len(raw_items)} raw results")
+            continue
         try:
             resp = requests.post(
                 f"{JOBO_API_BASE}/api/jobs/search",
@@ -6760,6 +6953,7 @@ def fetch_jobo_ats_for_user(automation, search_contract, user_profile, avoid_url
             )
             resp.raise_for_status()
             raw_items = resp.json().get("jobs", [])
+            _JOBO_CACHE[cache_key] = raw_items
             raw_items_all.extend(raw_items)
             print(f"Jobo ATS call {idx}/{len(bodies)}: query={body.get('queries')} locations={body.get('locations')} → {len(raw_items)} raw results")
         except Exception as e:
@@ -7169,22 +7363,7 @@ def find_jobs_for_user(
         _hc_override = max(1, round(HIRING_CAFE_MAX_ITEMS * _quota_fraction))
         _jobo_override = max(1, round(JOBO_ATS_MAX_ITEMS * _quota_fraction))
 
-    # 1. Hiring Cafe
-    _hc_limit = _hc_override
-    if ENABLE_HIRING_CAFE_PREFETCH and not _skip_hc_jobo and round_mode in ("first_round", "second_round"):
-        _hc_jobs, _hc_raw = fetch_hiring_cafe_for_user(
-            automation=automation,
-            search_contract=search_contract,
-            user_profile=user_profile,
-            avoid_urls=avoid_urls,
-            rejected_companies=rejected_companies,
-            persona=persona,
-            limit=_hc_limit,
-        )
-        round_metrics["hc_raw_results"] += _hc_raw
-        hc_inventory.extend(_hc_jobs)
-
-    # 2. Jobo ATS
+    # 1. Jobo ATS (flat-rate plan: every title)
     _jobo_limit = _jobo_override
     if ENABLE_JOBO_ATS_PREFETCH and not _skip_hc_jobo and round_mode in ("first_round", "second_round", "minimum_viable"):
         _jobo_jobs, _jobo_raw = fetch_jobo_ats_for_user(
@@ -7198,6 +7377,25 @@ def find_jobs_for_user(
         )
         round_metrics["jobo_raw_results"] += _jobo_raw
         hc_inventory.extend(_jobo_jobs)
+
+    # 2. Hiring Cafe -- paid per result, so only when JFE + Jobo left the pool short.
+    _hc_limit = _hc_override
+    _hc_pool_target = max(1, jobs_needed) * HC_SKIP_POOL_FACTOR
+    _hc_needed = len(hc_inventory) < _hc_pool_target
+    if not _hc_needed:
+        print(f"Hiring.cafe skipped: pool already has {len(hc_inventory)} jobs (target {_hc_pool_target} for {jobs_needed} needed)")
+    if ENABLE_HIRING_CAFE_PREFETCH and _hc_needed and not _skip_hc_jobo and round_mode in ("first_round", "second_round"):
+        _hc_jobs, _hc_raw = fetch_hiring_cafe_for_user(
+            automation=automation,
+            search_contract=search_contract,
+            user_profile=user_profile,
+            avoid_urls=avoid_urls,
+            rejected_companies=rejected_companies,
+            persona=persona,
+            limit=_hc_limit,
+        )
+        round_metrics["hc_raw_results"] += _hc_raw
+        hc_inventory.extend(_hc_jobs)
 
     if hc_inventory:
         _pool_sources = "HC + Jobo ATS"
@@ -7216,6 +7414,9 @@ def find_jobs_for_user(
             company_counts=feedback_learning.recent_company_counts(extract_selected_jobs(automation)),
             company_cap=feedback_learning.COMPANY_CAP,
             salary_floor=feedback_learning.min_salary_usd(prefs, learned_notes),
+            taste=fit_ranker.taste_signals(extract_selected_jobs(automation), automation),
+            keep=min(fit_ranker.FIT_POOL_KEEP, max(REVIEW_POOL_MIN, REVIEW_POOL_PER_NEEDED * max(1, jobs_needed))),
+            home_country=user_country(automation),
         )
         round_metrics["fit_rejected"] = round_metrics.get("fit_rejected", 0) + len(_fit_rejected)
 
@@ -7230,7 +7431,7 @@ def find_jobs_for_user(
             {
                 "job_url": j["job_url"],
                 "title": j.get("title") or "",
-                "description": (j.get("description") or "")[:800],
+                "description": (j.get("description") or "")[:REVIEW_DESC_CHARS],
                 "company": j.get("company") or "",
                 "grade": normalize_grade(j.get("grade") or 70),
                 "location": j.get("location") or "",
@@ -7265,6 +7466,13 @@ def find_jobs_for_user(
                     _pregraded += 1
             round_metrics["openai_review_calls"] += 1
             print(f"Pool pre-grade: {_pregraded}/{len(hc_inventory)} jobs pre-graded with AI grades + reasons")
+            # Clear misses never reach the per-batch review; best grades go first.
+            _sure_miss = [j for j in hc_inventory if j.get("review_decision") == "bad_match"
+                          and j.get("review_confidence", 0) >= PREGRADE_DROP_CONFIDENCE]
+            if _sure_miss:
+                hc_inventory = [j for j in hc_inventory if j not in _sure_miss]
+                print(f"Pool pre-grade: dropped {len(_sure_miss)} clear misses")
+            hc_inventory.sort(key=lambda j: j.get("grade") or 0, reverse=True)
         except Exception as e:
             print(f"Pool pre-grade failed (non-fatal, continuing with local scores): {e}")
 
@@ -9166,6 +9374,16 @@ def main():
     else:
         print("No previous run log found — starting fresh.")
 
+    # A scheduled pass that already searched someone today and found nothing
+    # won't find anything new a few hours later -- skip them (saves the top-up
+    # pass re-buying the same empty results).
+    if not single_user_mode and SKIP_EMPTY_RESEARCH:
+        _empty_today = set(_load_empty_today())
+        if _empty_today:
+            _before = len(users)
+            users = [u for u in users if u.get("uid") not in _empty_today]
+            print(f"Skipping {_before - len(users)} user(s) already searched today with 0 jobs found.")
+
     # Round 1: every eligible user gets quota-mode batches.
     first_round_results = run_round(
         users=users,
@@ -9251,8 +9469,9 @@ def main():
         user for user in users
         if latest_results_by_uid.get(user.get("uid"), {}).get("pending_today_after_estimate", 0) < MIN_ACCEPTABLE_JOBS_PER_USER
     ]
-    if STRICT_QUALITY and minimum_viable_users:
-        print(f"\nQuality profile: skipping the minimum viable round for {len(minimum_viable_users)} users.")
+    # The loosened last round brought in the weakest jobs: volume profile only.
+    if SEARCH_PROFILE != "volume" and minimum_viable_users:
+        print(f"\nSkipping the minimum viable round for {len(minimum_viable_users)} users ({SEARCH_PROFILE} profile).")
         minimum_viable_users = []
 
     if minimum_viable_users:
@@ -9323,6 +9542,9 @@ def main():
                 if _bd:
                     _merged_rm["estimated_cost_usd"] = round(sum(_bd.values()), 4)
                 results_by_uid[uid]["round_metrics"] = _merged_rm
+
+    if not single_user_mode and not DRY_RUN:
+        _save_empty_today([uid for uid, r in results_by_uid.items() if not r.get("jobs_added")])
 
     # Company ingestion runs BEFORE the Slack report now (used to run after) so the
     # report can include how many new companies were added this run.

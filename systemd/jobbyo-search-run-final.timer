@@ -1,9 +1,9 @@
 [Unit]
-Description=Jobbyo job search — evening pass 2/2, 22:00 Europe/Madrid
+Description=Jobbyo job search — pass 2/2, 04:00 Asia/Jakarta
 Requires=jobbyo-search.service
 
 [Timer]
-OnCalendar=*-*-* 22:00:00 Europe/Madrid
+OnCalendar=*-*-* 04:00:00 Asia/Jakarta
 Persistent=true
 Unit=jobbyo-search-run-final.service
 

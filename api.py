@@ -196,9 +196,9 @@ FIRST_MATCH_MODELS = [m for m in SEARCH_MODELS if m["provider"] == "anthropic"]
 SEARCH_PROFILES = [
     {"id": "quality", "label": "Better batches, fewer jobs",
      "note": "Only strong matches (Tier A/B). Skips the loosened last round, so some users end the day under 10."},
-    {"id": "balanced", "label": "Balanced", "note": "Today's behaviour: strong matches first, safe fallbacks to reach the daily target."},
+    {"id": "balanced", "label": "Balanced", "note": "Strong matches first, safe fallbacks to reach the daily target. No loosened last round."},
     {"id": "volume", "label": "More jobs, looser",
-     "note": "Bigger pools from Hiring Cafe/Jobo and an extra AI search batch. Fills more queues; more weak matches."},
+     "note": "Bigger pools from Hiring Cafe/Jobo, an extra AI search batch and the loosened last round. Fills more queues; more weak matches."},
 ]
 _PROFILE_ENV = {
     "quality": {"JOBBYO_PROFILE": "quality"},
@@ -1681,6 +1681,9 @@ async def admin_search_run(req: SearchRunRequest, background_tasks: BackgroundTa
     return {"accepted": True, "message": f"Search started for {req.uid or req.email} ({used})."}
 
 
+JOBO_MONTHLY_USD = float(os.getenv("JOBBYO_JOBO_MONTHLY_USD", "99"))
+
+
 def _costs_summary(days: int) -> dict:
     since = (datetime.now(timezone.utc) - timedelta(days=days - 1)).strftime("%Y-%m-%d")
     by_day: dict = {}
@@ -1698,7 +1701,10 @@ def _costs_summary(days: int) -> dict:
         d = by_day.setdefault(day, {"day": day, "cost": 0.0, "jobs": 0, "runs": 0, "first_match_cost": 0.0, "first_matches": 0})
         d["runs"] += 1
         for u in report.get("users") or []:
-            cost, jobs = float(u.get("estimated_cost_usd") or 0), int(u.get("jobs_added") or 0)
+            # Jobo is a flat monthly plan, added per day below -- older reports
+            # still carry a per-result Jobo estimate, so take it out here.
+            cost = float(u.get("estimated_cost_usd") or 0) - float((u.get("cost_breakdown") or {}).get("jobo") or 0)
+            jobs = int(u.get("jobs_added") or 0)
             d["cost"] += cost
             d["jobs"] += jobs
             m = by_model.setdefault(model, {"model": model, "cost": 0.0, "jobs": 0})
@@ -1720,11 +1726,12 @@ def _costs_summary(days: int) -> dict:
         d["first_matches"] += 1
 
     per_job = lambda c, j: round(c / j, 4) if j else None
+    jobo_per_day = round(JOBO_MONTHLY_USD / 30, 4)
     days_out = []
     for d in sorted(by_day.values(), key=lambda x: x["day"], reverse=True):
-        total = d["cost"] + d["first_match_cost"]
+        total = d["cost"] + d["first_match_cost"] + jobo_per_day
         days_out.append({**d, "cost": round(d["cost"], 4), "first_match_cost": round(d["first_match_cost"], 4),
-                         "total": round(total, 4), "cost_per_job": per_job(total, d["jobs"])})
+                         "jobo_plan": jobo_per_day, "total": round(total, 4), "cost_per_job": per_job(total, d["jobs"])})
     total_cost = sum(d["total"] for d in days_out)
     total_jobs = sum(d["jobs"] for d in days_out)
     return {
@@ -1735,8 +1742,9 @@ def _costs_summary(days: int) -> dict:
         "by_model": [{**m, "cost": round(m["cost"], 4), "cost_per_job": per_job(m["cost"], m["jobs"])} for m in by_model.values()],
         "by_user": sorted(({**u, "cost": round(u["cost"], 4), "cost_per_job": per_job(u["cost"], u["jobs"])} for u in by_user.values()),
                           key=lambda u: u["cost"], reverse=True),
-        "note": "Estimates: per-call averages scaled by model price, plus Hiring Cafe/Jobo per-result rates. "
-                "Calls retried on the fallback provider aren't counted.",
+        "jobo_monthly": JOBO_MONTHLY_USD,
+        "note": "Estimates: AI per-call averages scaled by model price, Hiring Cafe per result, Jobo as its flat "
+                f"${JOBO_MONTHLY_USD:.0f}/month plan. Calls retried on the fallback provider aren't counted.",
     }
 
 
