@@ -52,6 +52,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,7 @@ from pydantic import BaseModel
 
 from date_utils import parse_utc_timestamp
 import approve_jobs
+import daily_targets
 import email_pauses
 import team_corrections
 
@@ -140,6 +142,7 @@ _state = _State()
 class UserTarget(BaseModel):
     uid:   Optional[str] = None
     email: Optional[str] = None
+    replacement: bool = False  # rejected/closed job: find REPLACEMENT_JOBS more, tell Galih
 
 class RunResponse(BaseModel):
     accepted: bool
@@ -390,12 +393,198 @@ async def run_user(target: UserTarget, background_tasks: BackgroundTasks):
         args, label = ["--uid", target.uid], f"run:user:{target.uid}"
     else:
         args, label = ["--email", target.email], f"run:user:{target.email}"
-    background_tasks.add_task(_single_run, "send_jobbyo.py", args, label, _search_env())
+    if target.replacement and target.uid:
+        env = {**_search_env(), "JOBBYO_FIND_JOBS": str(REPLACEMENT_JOBS)}
+        background_tasks.add_task(_replacement_run, target.uid, args, label, env)
+    else:
+        background_tasks.add_task(_single_run, "send_jobbyo.py", args, label, _search_env())
     return RunResponse(accepted=True, message=f"Top-up run started for {target.uid or target.email}.")
 
 
+# ---------------------------------------------------------------------------
+# Replacements: a user rejected a job, or auto-apply found one closed. The
+# backend calls /run/user with replacement=true after its short batching wait;
+# this finds new jobs and posts what happened to Galih's channel.
+# ---------------------------------------------------------------------------
+
+REPLACEMENT_JOBS = int(os.getenv("JOBBYO_REPLACEMENT_JOBS", "5"))
+SLACK_WEBHOOK_URL_REPLACEMENTS = os.getenv("SLACK_WEBHOOK_URL_REPLACEMENTS", "")
+_REPLACEMENT_NOTIFIED_PATH = RUN_LOG_DIR / "replacement_notified.json"
+
+
+def _replacement_events(uid: str, selected_jobs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Jobs rejected / closed since this user's last message (first time: last hour)."""
+    import feedback_learning
+
+    try:
+        notified = json.loads(_REPLACEMENT_NOTIFIED_PATH.read_text())
+    except (OSError, ValueError):
+        notified = {}
+    now = datetime.now(timezone.utc)
+    since = feedback_learning._parse_ts(notified.get(uid)) or now - timedelta(hours=1)
+    rejected, closed = [], []
+    for j in selected_jobs:
+        rejected_at = feedback_learning._parse_ts(j.get("rejectedAt"))
+        closed_at = feedback_learning._parse_ts(j.get("closedAt"))
+        if str(j.get("status", "")).lower() == "rejected" and not j.get("removedByOperator") and rejected_at and rejected_at > since:
+            rejected.append(j)
+        elif j.get("jobClosed") and closed_at and closed_at > since:
+            closed.append(j)
+    try:
+        _REPLACEMENT_NOTIFIED_PATH.write_text(json.dumps({**notified, uid: now.isoformat()}))
+    except OSError as e:
+        print(f"[replacement] Could not save notified time: {e}")
+    return rejected, closed
+
+
+def _replacement_message(uid: str, code: int, found: list[dict]) -> str:
+    import send_jobbyo
+
+    automation = send_jobbyo.get_user_automation(uid) or {}
+    profile = send_jobbyo.get_user_profile(uid) or {}
+    prefs = send_jobbyo.extract_job_preferences(automation)
+    rejected, closed = _replacement_events(uid, send_jobbyo.extract_selected_jobs(automation))
+
+    name = profile.get("displayName") or (profile.get("email") or "").split("@")[0] or uid
+    titles = ", ".join((prefs.get("jobTitles") or [])[:3]) or "—"
+    places = ", ".join(((prefs.get("location") or {}).get("places") or [])[:3]) or "—"
+    lines = [f"{SLACK_MENTION_GALIH} *{name}* `{profile.get('email') or ''}` · "
+             f"{len(rejected)} rejected, {len(closed)} closed · wants {titles} · {places}"]
+    for j in rejected[:8]:
+        reason = str(j.get("feedback") or "").strip()
+        lines.append(f"   • {j.get('title') or '?'} at {j.get('company') or '?'}: "
+                     + (f"_{reason[:140]}_" if reason else "no reason given"))
+    for j in closed[:8]:
+        lines.append(f"   • {j.get('title') or '?'} at {j.get('company') or '?'}: closed")
+
+    if code != 0:
+        lines.append(f":warning: The search failed (exit {code}), so no replacements. Needs a person.")
+    else:
+        mark = "" if len(found) >= REPLACEMENT_JOBS else ":warning: "
+        lines.append(f"{mark}Found {len(found)} of {REPLACEMENT_JOBS} replacements:")
+        lines += [f"   • <{j.get('job_url')}|{j.get('title') or '?'}> at {j.get('company') or '?'}" for j in found[:REPLACEMENT_JOBS]]
+    return "\n".join(lines)
+
+
+def _post_replacement_slack(text: str) -> None:
+    print(f"[replacement] {text}")
+    if not SLACK_WEBHOOK_URL_REPLACEMENTS:
+        return
+    resp = requests.post(SLACK_WEBHOOK_URL_REPLACEMENTS,
+                         json={"text": text, "username": "Laras", "icon_emoji": ":bar_chart:"}, timeout=10)
+    if resp.status_code != 200:
+        print(f"[replacement] Webhook returned {resp.status_code}: {resp.text[:200]}")
+
+
+async def _replacement_run(uid: str, args: list[str], label: str, env: dict):
+    existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
+    try:
+        code = await _run_subprocess([PYTHON, "send_jobbyo.py", *args], label, env=env)
+    except Exception as exc:
+        print(f"[{label}] Exception: {exc}")
+        code = 1
+    found, seen = [], set()
+    new_logs = sorted(set(RUN_LOG_DIR.glob("job_run_*.json")) - existing_logs)
+    if new_logs:
+        try:
+            results = json.loads(new_logs[-1].read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            results = []
+        for r in results:
+            if r.get("uid") != uid:
+                continue
+            for j in r.get("jobs_added") or []:
+                if j.get("job_url") not in seen:
+                    seen.add(j.get("job_url"))
+                    found.append(j)
+    try:
+        text = await asyncio.to_thread(_replacement_message, uid, code, found)
+        await asyncio.to_thread(_post_replacement_slack, text)
+    except Exception as exc:  # the search already ran; never fail on the message
+        print(f"[{label}] Replacement message failed: {exc}")
+
+
+async def _send_first_match(report: dict, uid: str, recipient: str, who: str, label: str) -> bool:
+    """The first-match email, or hold it if it's thin, and tell the team."""
+    import first_match
+
+    kept = report["kept"]
+    emailed = False
+    if len(kept) >= first_match.MIN_JOBS_TO_EMAIL:
+        try:
+            emailed = await asyncio.to_thread(first_match.send_first_match_email, report, recipient)
+        except Exception as exc:
+            print(f"[{label}] first-match email failed: {exc}")
+        _mark_first_match_emailed(uid, emailed)
+        slack_text = (
+            f"First matches for {who}: kept {len(kept)} of {report['stats']['checked']} checked"
+            + (" and sent the welcome email." if emailed else ", but the email failed to send — worth a look.")
+        )
+    else:
+        # Never send a thin first email: hold it for the team to top up.
+        tags = " ".join(t for t in (SLACK_MENTION_GALIH, SLACK_MENTION_NADIA) if t)
+        drops = Counter(d.get("drop_category") for d in report["dropped"]).most_common(3)
+        slack_text = (
+            f"Only {len(kept)} strong first match(es) for {who} out of {report['stats']['checked']} checked "
+            f"(main drops: {', '.join(f'{c} {n}' for c, n in drops) or 'none'}). Saved to their queue; "
+            f"welcome email is held. {tags} can you find a few more by hand? Then send it with "
+            f"`python3 first_match.py --uid {uid} --send`.".strip()
+        )
+    if str(report.get("method", "")).startswith("previous version"):
+        slack_text += f" — used the {report['method']}"
+    await asyncio.to_thread(_send_ops_only_slack_sync, slack_text)
+    return emailed
+
+
+# uid -> what their first search is doing after the search itself: "reviewing"
+# (the hand-check of each posting) or "retrying" (one wider look). For the live card.
+_first_match_stage: dict = {}
+
+
+async def _first_match_retry(uid: str, label: str, report: dict, profile: dict) -> dict:
+    """Fewer than first_match.MIN_STRONG strong first matches: one wider look,
+    with nearby titles from their resume, before anything reaches them.
+    Returns the report, with whatever the second look found added."""
+    import first_match, setup_brief
+    try:
+        picked = {str(t).lower() for t in report["facts"].get("target_titles") or []}
+        suggested = (await asyncio.to_thread(setup_brief.suggest_titles, uid)).get("titles") or []
+        extra = [t["title"] for t in suggested
+                 if t["title"].lower() not in picked and t.get("kind") in ("current", "variant", "step_up")][:4]
+        if not extra:
+            return report
+        print(f"[{label}] only {first_match.strong_count(report)} strong first match(es); looking wider: {extra}")
+        _first_match_stage[uid] = "retrying"
+        existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
+        env = {
+            **_search_env(),
+            "JOBBYO_DRY_RUN": "1",
+            "JOBBYO_FIRST_MATCH": "1",
+            "JOBBYO_TARGET_JOBS": os.getenv("JOBBYO_FIRST_MATCH_POOL", "25"),
+            "JOBBYO_DRY_RUN_FILE": f"run_logs/dry_run_first_match_retry_{re.sub(r'[^A-Za-z0-9]+', '_', uid.lower())}.json",
+            "JOBBYO_EXTRA_TITLES": "|".join(extra),
+        }
+        code = await _run_subprocess([PYTHON, "send_jobbyo.py", "--uid", uid, "--assume-paid"], label, env=env)
+        new_logs = sorted(set(RUN_LOG_DIR.glob("job_run_*.json")) - existing_logs)
+        if code != 0 or not new_logs:
+            return report
+        entries = [r for r in json.loads(new_logs[-1].read_text()) if r.get("uid") == uid]
+        _first_match_stage[uid] = "reviewing"
+        more = await asyncio.to_thread(first_match.curate, uid, entries, profile, None,
+                                       set(report.get("reviewed_urls") or []), True)
+        return await asyncio.to_thread(first_match.merge_retry, report, more) if more else report
+    except Exception as exc:
+        print(f"[{label}] first-match retry failed (keeps the first look): {exc}")
+        return report
+
+
+def _held(target: "UserTarget", preview: bool) -> bool:
+    """A sign-up who hasn't paid yet: their search stays quiet (no email, no Slack)."""
+    return preview and not _preview_runs.get(target.uid, {}).get("paid")
+
+
 async def _finish_subscribed_run(
-    target: "UserTarget", label: str, existing_logs: set, started_at: float, code: int
+    target: "UserTarget", label: str, existing_logs: set, started_at: float, code: int, preview: bool = False,
 ) -> SubscribedJobsResponse:
     """Read the completed run's jobs_added and email the user. Shared by the
     normal (fast) path and the timeout-continuation path in
@@ -441,6 +630,23 @@ async def _finish_subscribed_run(
 
     jobs_added.sort(key=lambda j: j.get("grade") or 0, reverse=True)
 
+    if not jobs_added and (resolved_uid or target.uid):
+        # Nothing to read: the live card still gets an answer (why, and that
+        # the team takes it from here) instead of waiting forever.
+        try:
+            import first_match
+            uid0 = resolved_uid or target.uid
+            empty = await asyncio.to_thread(first_match.empty_report, uid0)
+            empty["why_hard"] = await asyncio.to_thread(first_match.why_hard, empty)
+            _first_match_path(uid0).write_text(json.dumps(empty, indent=2, default=str))
+            _save_live_card(uid0)
+        except Exception as exc:
+            print(f"[{label}] empty first-match report failed: {exc}")
+
+    if not jobs_added and _held(target, preview):
+        return SubscribedJobsResponse(accepted=True, message="Preview: no jobs found.",
+                                      duration_seconds=duration_seconds, jobs_found=0)
+
     if not jobs_added:
         who = None
         reason = "no obvious reason from their stated preferences, worth a manual look"
@@ -479,10 +685,26 @@ async def _finish_subscribed_run(
     job_status = next((r.get("job_status") for r in user_entries if r.get("job_status")), "waiting_approval")
     report = None
     first_match.FIRST_MATCH_CLAUDE_MODEL = _load_search_settings()["first_match_model"]
+    _first_match_stage[resolved_uid] = "reviewing"
     try:
         report = await asyncio.to_thread(first_match.curate, resolved_uid, user_entries, profile)
+        if (str(report.get("method", "")).startswith("claude")
+                and first_match.strong_count(report) < first_match.MIN_STRONG):
+            report = await _first_match_retry(resolved_uid, label, report, profile)
     except Exception as exc:
         print(f"[{label}] first-match curation failed, falling back to the plain first email: {exc}")
+    finally:
+        _first_match_stage.pop(resolved_uid, None)
+    _save_live_card(resolved_uid)
+    if report is not None:
+        if not report.get("kept"):
+            report["why_hard"] = await asyncio.to_thread(first_match.why_hard, report)
+        # "Add anyway" posts left-out jobs with the same status as these
+        report["job_status"] = job_status
+        try:
+            _first_match_path(resolved_uid).write_text(json.dumps(report, indent=2, default=str))
+        except OSError as exc:
+            print(f"[{label}] could not save the first-match status: {exc}")
 
     if report is not None:
         kept = report["kept"]
@@ -498,30 +720,13 @@ async def _finish_subscribed_run(
             kept = []
             emailed = False
         else:
-            emailed = False
-            if len(kept) >= first_match.MIN_JOBS_TO_EMAIL:
-                try:
-                    emailed = await asyncio.to_thread(first_match.send_first_match_email, report, recipient)
-                except Exception as exc:
-                    print(f"[{label}] first-match email failed: {exc}")
-                _mark_first_match_emailed(resolved_uid, emailed)
-                slack_text = (
-                    f"First matches for {who}: kept {len(kept)} of {report['stats']['checked']} checked"
-                    + (" and sent the welcome email." if emailed else ", but the email failed to send — worth a look.")
+            if _held(target, preview):
+                _mark_first_match_preview(resolved_uid)
+                return SubscribedJobsResponse(
+                    accepted=True, message=f"Preview: kept {len(kept)} first match(es), email held until they pay.",
+                    duration_seconds=duration_seconds, jobs_found=len(kept),
                 )
-            else:
-                # Never send a thin first email: hold it for the team to top up.
-                tags = " ".join(t for t in (SLACK_MENTION_GALIH, SLACK_MENTION_NADIA) if t)
-                drops = Counter(d.get("drop_category") for d in report["dropped"]).most_common(3)
-                slack_text = (
-                    f"Only {len(kept)} strong first match(es) for {who} out of {report['stats']['checked']} checked "
-                    f"(main drops: {', '.join(f'{c} {n}' for c, n in drops) or 'none'}). Saved to their queue; "
-                    f"welcome email is held. {tags} can you find a few more by hand? Then send it with "
-                    f"`python3 first_match.py --uid {resolved_uid} --send`.".strip()
-                )
-            if str(report.get("method", "")).startswith("previous version"):
-                slack_text += f" — used the {report['method']}"
-            await asyncio.to_thread(_send_ops_only_slack_sync, slack_text)
+            emailed = await _send_first_match(report, resolved_uid, recipient, who, label)
 
         response_jobs = [
             TopJob(title=j.get("title"), company=j.get("company"), url=j.get("job_url"),
@@ -537,6 +742,10 @@ async def _finish_subscribed_run(
             jobs=response_jobs,
             emailed=emailed,
         )
+
+    if _held(target, preview):  # curation crashed: paying runs the full search instead
+        return SubscribedJobsResponse(accepted=True, message="Preview: curation failed.",
+                                      duration_seconds=duration_seconds, jobs_found=0)
 
     # Fallback (curation crashed): save what the pipeline found and send the
     # plain first email, so a new user is never left with nothing.
@@ -699,6 +908,10 @@ async def run_user_subscribed(target: UserTarget):
     if not target.uid and not target.email:
         raise HTTPException(status_code=422, detail="Provide uid or email.")
 
+    released = await _release_preview(target)
+    if released is not None:
+        return released
+
     key = (target.uid or target.email or "").strip().lower()
     last = _subscribed_last_run.get(key)
     now = datetime.now(timezone.utc)
@@ -770,6 +983,254 @@ async def run_user_subscribed(target: UserTarget):
         return await _finish_subscribed_run(target, label, existing_logs, started_at, code)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# A sign-up's first search runs right after calibration, before the paywall, so
+# they can watch it (the webapp's live card). It's the same search, but nothing
+# goes out until they pay: /run/user/subscribed then sends the email from it
+# instead of searching again.
+PREVIEW_MAX_AGE_SECONDS = int(os.getenv("JOBBYO_PREVIEW_MAX_AGE_SECONDS", str(7 * 86400)))
+_preview_runs: dict = {}  # uid -> {"paid": bool}, while its search runs
+
+
+async def _preview_run(target: UserTarget) -> None:
+    uid = target.uid
+    label = f"run:subscribed:{uid}"
+    existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
+    started_at = asyncio.get_event_loop().time()
+    try:
+        import first_match
+        await asyncio.to_thread(first_match.wait_for_calibration, uid,
+                                int(os.getenv("JOBBYO_FIRST_SEARCH_CALIBRATION_WAIT_S", "240")))
+        env = {
+            **_search_env(),
+            "JOBBYO_DRY_RUN": "1",
+            "JOBBYO_FIRST_MATCH": "1",
+            "JOBBYO_TARGET_JOBS": os.getenv("JOBBYO_FIRST_MATCH_POOL", "25"),
+            "JOBBYO_DRY_RUN_FILE": f"run_logs/dry_run_first_match_{re.sub(r'[^A-Za-z0-9]+', '_', uid.lower())}.json",
+        }
+        code = await _run_subprocess([PYTHON, "send_jobbyo.py", "--uid", uid, "--assume-paid"], label, env=env)
+        await _finish_subscribed_run(target, label, existing_logs, started_at, code, preview=True)
+    except Exception as exc:
+        print(f"[{label}] preview failed: {exc}")
+    finally:
+        _preview_runs.pop(uid, None)
+
+
+class LeftOutAdd(BaseModel):
+    uid: str
+    url: str
+
+
+@app.post("/run/user/first-match/add")
+async def first_match_add_left_out(req: LeftOutAdd):
+    """"Add anyway" on the live card: a job the first search's final check left
+    out goes to their queue after all (they saw the reason first)."""
+    import first_match
+    try:
+        job = await asyncio.to_thread(first_match.add_left_out, req.uid, req.url, "waiting_approval")
+    except OSError:
+        raise HTTPException(status_code=404, detail="No first search for this user.")
+    if not job:
+        raise HTTPException(status_code=404, detail="Not one of the jobs left out.")
+    return {"added": True, "title": job.get("title"), "company": job.get("company")}
+
+
+@app.post("/run/user/preview", response_model=RunResponse, status_code=202)
+async def run_user_preview(target: UserTarget, background_tasks: BackgroundTasks):
+    """Start a sign-up's first search before they pay. Once per person."""
+    uid = target.uid
+    if not uid:
+        raise HTTPException(status_code=422, detail="Provide uid.")
+    last = _subscribed_last_run.get(uid.strip().lower())
+    recent = last is not None and (datetime.now(timezone.utc) - last).total_seconds() < SUBSCRIBED_COOLDOWN_SECONDS
+    if uid in _preview_runs or recent or _first_match_path(uid).exists():
+        return RunResponse(accepted=False, message="Their first search already ran.")
+    _preview_runs[uid] = {"paid": False}
+    background_tasks.add_task(_preview_run, target)
+    return RunResponse(accepted=True, message=f"Preview search started for {uid}.")
+
+
+async def _release_preview(target: UserTarget) -> Optional[SubscribedJobsResponse]:
+    """They paid: use the search they already watched. None = run a normal one."""
+    uid = target.uid
+    if not uid:
+        return None
+    if uid in _preview_runs:  # still running: _finish_subscribed_run sends the email
+        _preview_runs[uid]["paid"] = True
+        return SubscribedJobsResponse(accepted=True, message=f"Preview for {uid} still running; it emails when done.",
+                                      duration_seconds=0, jobs_found=0)
+    path = _first_match_path(uid)
+    try:
+        report = json.loads(path.read_text())
+        age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+    except (OSError, ValueError):
+        return None
+    if not report.get("preview") or age > PREVIEW_MAX_AGE_SECONDS:
+        return None
+    report["preview"] = False
+    path.write_text(json.dumps(report, indent=2, default=str))
+
+    import send_jobbyo
+    profile = send_jobbyo.get_user_profile(uid) or {}
+    recipient = TOP_JOBS_TEST_RECIPIENT or report.get("email")
+    emailed = await _send_first_match(report, uid, recipient, profile.get("displayName") or recipient,
+                                      f"run:subscribed:{uid}")
+    kept = report.get("kept") or []
+    return SubscribedJobsResponse(
+        accepted=True, message=f"Used the preview search for {uid}: {len(kept)} match(es).",
+        duration_seconds=0, jobs_found=len(kept), emailed=emailed,
+        jobs=[TopJob(title=j.get("title"), company=j.get("company"), url=j.get("job_url"), location=j.get("location"),
+                     grade=j.get("grade"), reason=j.get("fit_line")) for j in kept],
+    )
+
+
+# What a user may see of their own search: the lines the webapp's live card
+# reads, and no names of the sites we search.
+_LIVE_CARD_LINE = re.compile(
+    r"^(STARTING ROUND |job-fit-engine: |Hiring\.cafe: |Jobo ATS(:| call )|Fit stage: |rejected \d+× |BATCH \d|"
+    r"REVIEW |-{5,}$|APPROVED JOBS|• |Grade: |Reason: |URL: |FINAL JOBS POSTED|Users: |shortlist: |$)"
+)
+_LIVE_CARD_NAMES = (("job-fit-engine:", "Search:"), ("Hiring.cafe:", "Job boards:"),
+                    ("Jobo ATS:", "Career pages:"), ("Jobo ATS call", "Career pages call"))
+
+
+def _live_card_lines(lines: list[str]) -> list[str]:
+    out = []
+    for line in lines:
+        line = line.strip()
+        if _LIVE_CARD_LINE.match(line):
+            for name, plain in _LIVE_CARD_NAMES:
+                if line.startswith(name):
+                    line = plain + line[len(name):]
+            out.append(line)
+    return out
+
+
+# Who signs the live card's note when a first search finds nothing: the team
+# hand-picks those matches.
+FIRST_MATCH_TEAM = {"name": os.getenv("JOBBYO_FIRST_MATCH_TEAM_NAME", "Galih"),
+                    "role": os.getenv("JOBBYO_FIRST_MATCH_TEAM_ROLE", "Your recruiter at Jobbyo")}
+_live_profiles: dict = {}  # uid -> (fetched at, profile), the card polls every few seconds
+_LIVE_PROFILE_TTL_S = 600
+
+
+def _live_profile(uid: str) -> Optional[dict]:
+    """Who we're searching for, as the live card shows it: their target, where,
+    pay, and what their setup ratings told us. Plain facts, no site names."""
+    hit = _live_profiles.get(uid)
+    if hit and time.time() - hit[0] < _LIVE_PROFILE_TTL_S:
+        return hit[1]
+    try:
+        import send_jobbyo, first_match
+        automation = send_jobbyo.get_user_automation(uid) or {}
+        facts = first_match.candidate_facts(send_jobbyo.get_user_profile(uid) or {}, automation)
+        cal = automation.get("calibrationProfile") or {}
+        profile = {
+            "first_name": (facts["name"] or "").split(" ")[0],
+            "headline": facts["headline"],
+            "titles": facts["target_titles"][:8],
+            "places": facts["places"][:6],
+            "workplace": facts["workplace_types"],
+            "pay_floor": facts["pay_floor"],
+            "currency": facts["salary_currency"],
+            "summary": str(cal.get("summary") or "")[:400],
+            "industries": (cal.get("industries") or [])[:4],
+            "company_sizes": (cal.get("company_sizes") or [])[:3],
+            "liked": len(facts["taste"]["would_apply"]),
+            "skipped": len(facts["taste"]["not_for_me"]),
+        }
+    except Exception as exc:
+        print(f"[live] profile for {uid} failed: {exc}")
+        profile = None
+    _live_profiles[uid] = (time.time(), profile)
+    return profile
+
+
+def sj_normalize(url) -> str:
+    import send_jobbyo
+    return send_jobbyo.normalize_url(url or "")
+
+
+def _live_result(uid: str, since_iso: str) -> Optional[dict]:
+    """Their curated first matches once the hand-check is done (this search's,
+    not an older one): the picks, and the best roles left out with the reason."""
+    import first_match
+    path = _first_match_path(uid)
+    try:
+        if datetime.fromtimestamp(path.stat().st_mtime, timezone.utc) < datetime.fromisoformat(since_iso):
+            return None
+        report = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return {
+        "checked": (report.get("stats") or {}).get("checked"),
+        "kept": [{"title": j.get("title"), "company": j.get("company"), "url": j.get("job_url"),
+                  "workplace": j.get("workplace"), "pay": j.get("pay"), "grade": j.get("grade") or j.get("score"),
+                  "reason": j.get("fit_line") or j.get("review_reason"), "stretch": bool(j.get("stretch"))}
+                 for j in report.get("kept") or []],
+        "left_out": [{"title": d.get("title"), "company": d.get("company"), "url": d.get("job_url"),
+                      "reason": d.get("drop_reason"),
+                      "added": sj_normalize(d.get("job_url")) in (report.get("added_anyway") or [])}
+                     for d in first_match.left_out_highlights(report, None)],
+        "more_coming": first_match.more_coming(report),
+        "why_hard": report.get("why_hard") or [],
+        "team": FIRST_MATCH_TEAM,
+    }
+
+
+def _live_card_path(uid: str) -> Path:
+    return RUN_LOG_DIR / f"live_card_{re.sub(r'[^A-Za-z0-9_-]', '', uid)}.json"
+
+
+def _save_live_card(uid: str) -> None:
+    """Their search's steps, kept on disk once it's done: the live card shows
+    them again after a server restart (a deploy) instead of an empty chat."""
+    mine = [r for r in _LIVE_RUNS.values() if r["label"].endswith(f":{uid}")]
+    if not mine:
+        return
+    run = max(mine, key=lambda r: r["started_at"])
+    try:
+        _live_card_path(uid).write_text(json.dumps({"started_at": run["started_at"],
+                                                    "lines": _live_card_lines(list(run["lines"]))}))
+    except OSError as exc:
+        print(f"[live] could not save the card for {uid}: {exc}")
+
+
+def _live_docs(uid: str) -> dict:
+    """The persona and search plan the search wrote for them (once it has), for
+    the live card -- the same two files their CV and docs page shows."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", uid)
+    persona = _read_json(SCRIPT_DIR / "personas" / f"{safe}.json")
+    if persona and str(persona.get("career_hybrid") or "").startswith("No-GPT"):
+        persona = None  # the plain fallback persona isn't worth showing
+    return {"persona": persona, "search_contract": _read_json(SCRIPT_DIR / "search_contracts" / f"{safe}.json")}
+
+
+@app.get("/run/user/live/{uid}")
+async def run_user_live(uid: str):
+    """This one user's latest search, for the webapp's live card: the search's
+    key steps, who it's for, and (once checked) the final picks."""
+    mine = [r for r in _LIVE_RUNS.values() if r["label"].endswith(f":{uid}")]
+    if not mine:
+        # Finished before this server started (a deploy): their saved picks.
+        path = _first_match_path(uid)
+        if not path.exists():
+            return {"run": None, "lines": []}
+        at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        saved = _read_json(_live_card_path(uid)) or {}
+        return {"run": {"started_at": at, "active": False, "failed": False, "stage": "done"}, "lines": saved.get("lines") or [],
+                "profile": await asyncio.to_thread(_live_profile, uid), "docs": await asyncio.to_thread(_live_docs, uid),
+                "result": await asyncio.to_thread(_live_result, uid, "1970-01-01T00:00:00+00:00")}
+    run = max(mine, key=lambda r: r["started_at"])
+    first = min(mine, key=lambda r: r["started_at"])  # a wider retry is a later run of the same search
+    return {"run": {"started_at": run["started_at"], "active": run["finished_at"] is None,
+                    "failed": run["exit_code"] not in (0, None),
+                    "stage": _first_match_stage.get(uid) or ("searching" if run["finished_at"] is None else "done")},
+            "lines": _live_card_lines(list(run["lines"])),
+            "profile": await asyncio.to_thread(_live_profile, uid),
+            "docs": await asyncio.to_thread(_live_docs, uid),
+            "result": await asyncio.to_thread(_live_result, uid, first["started_at"])}
 
 
 # --- Hot leads ---------------------------------------------------------
@@ -1133,7 +1594,8 @@ async def _compute_coverage_today() -> dict:
             elif status == "waiting_approval":
                 waiting_c += 1
 
-        if total >= COVERAGE_TARGET_JOBS:
+        covered_at = min(COVERAGE_TARGET_JOBS, daily_targets.for_user(uid))
+        if total >= covered_at:
             covered += 1
         elif total >= 1:
             partial += 1
@@ -1145,6 +1607,7 @@ async def _compute_coverage_today() -> dict:
             "name": user.get("displayName") or user.get("name") or "",
             "email": user.get("email", ""),
             "total": total,
+            "covered_at": covered_at,
             "applied": applied_c,
             "pending": pending_c,
             "waiting_approval": waiting_c,
@@ -1183,7 +1646,7 @@ async def coverage_today(send_slack: bool = False):
     if send_slack:
         warn_lines = [
             f"  • {u['name']} ({u['email']}): {u['total']} jobs"
-            for u in report["users"] if u["total"] < COVERAGE_TARGET_JOBS
+            for u in report["users"] if u["total"] < u["covered_at"]
         ]
         status_icon = "✅" if report["meets_goal"] else "⚠️"
         slack_text = (
@@ -1435,6 +1898,16 @@ def _first_match_path(uid: str) -> Path:
     return RUN_LOG_DIR / f"first_match_{re.sub(r'[^A-Za-z0-9_-]', '', uid)}.json"
 
 
+def _mark_first_match_preview(uid: str) -> None:
+    path = _first_match_path(uid)
+    try:
+        report = json.loads(path.read_text())
+        report["preview"] = True
+        path.write_text(json.dumps(report, indent=2, default=str))
+    except (OSError, ValueError) as exc:
+        print(f"[first-match] couldn't mark {uid} as a preview: {exc}")
+
+
 def _mark_first_match_emailed(uid: str, emailed: bool) -> None:
     path = _first_match_path(uid)
     try:
@@ -1578,7 +2051,8 @@ async def admin_first_matches(limit: int = 60):
             "method": r.get("method") or "first version",
             "checked": (r.get("stats") or {}).get("checked"), "candidates": (r.get("stats") or {}).get("candidates"),
             "kept": len(r.get("kept") or []), "dropped": len(r.get("dropped") or []),
-            "held": len(r.get("kept") or []) < 3, "emailed": r.get("emailed"),
+            "held": len(r.get("kept") or []) < 3 and not r.get("preview"), "preview": bool(r.get("preview")),
+            "emailed": r.get("emailed"),
         })
     return {"first_matches": out}
 
@@ -1873,11 +2347,12 @@ def _day_jobs(jobs: list[dict], day: str, automated_urls: set) -> list[dict]:
     return out
 
 
-def _day_counts(jobs: list[dict], day: str, automated_urls: set) -> dict:
+def _day_counts(uid: str, jobs: list[dict], day: str, automated_urls: set) -> dict:
     day_jobs = _day_jobs(jobs, day, automated_urls)
     total, automated = len(day_jobs), sum(j["by_search"] for j in day_jobs)
+    target = daily_targets.for_user(uid)
     return {"total": total, "automated": automated, "manual": total - automated,
-            "target": DAILY_TARGET, "missing": max(0, DAILY_TARGET - total)}
+            "target": target, "missing": max(0, target - total)}
 
 
 def _feedback(jobs: list[dict], days: int = 14) -> list[dict]:
@@ -1915,7 +2390,7 @@ async def admin_search_daily(day: Optional[str] = None):
             feedback = _feedback(jobs)
             out.append({
                 "uid": uid, "name": user.get("displayName") or user.get("name") or "", "email": user.get("email", ""),
-                **_day_counts(jobs, day, automated_urls),
+                **_day_counts(uid, jobs, day, automated_urls),
                 "feedback_count": len(feedback), "feedback_with_text": sum(1 for f in feedback if f["feedback"]),
                 "automation_paused": user.get("automationPaused") or None,
             })
@@ -1942,7 +2417,7 @@ async def admin_search_user_day(uid: str, day: Optional[str] = None):
         notes = (_read_json(SCRIPT_DIR / "personas" / f"{uid}.feedback.json") or {}).get("notes") or {}
         automated_urls = _automation_urls(day)
         return {
-            "uid": uid, "day": day, **_day_counts(jobs, day, automated_urls),
+            "uid": uid, "day": day, **_day_counts(uid, jobs, day, automated_urls),
             "jobs": _day_jobs(jobs, day, automated_urls),
             "feedback": _feedback(jobs),
             "not_passed": summary.get("rejected_sample") or [],
@@ -2025,7 +2500,7 @@ async def admin_search_add_anyway(uid: str, job: AddAnyway):
     def post():
         resp = requests.post(f"{BACKEND_BASE}/automations/users/{uid}/selected-jobs", json={
             "job_id": f"admin_{uuid.uuid4().hex[:12]}", "job_url": job.job_url.strip(), "title": job.title,
-            "company": job.company, "description": job.location, "grade": 0,
+            "company": job.company, "description": job.location, "grade": 0, "hand_picked": True,
         }, timeout=30)
         resp.raise_for_status()
 

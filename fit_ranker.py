@@ -64,6 +64,11 @@ _COUNTRIES = {
     "brasil": "BR", "méxico": "MX", "españa": "ES", "deutschland": "DE", "italia": "IT",
     "nederland": "NL", "schweiz": "CH", "suisse": "CH", "österreich": "AT", "polska": "PL",
     "türkiye": "TR", "perú": "PE", "belgië": "BE", "belgique": "BE",
+    # Eastern Europe and more of the Americas (Georgia is left out: also a US state)
+    "ukraine": "UA", "russia": "RU", "estonia": "EE", "latvia": "LV", "lithuania": "LT", "serbia": "RS",
+    "croatia": "HR", "bulgaria": "BG", "slovakia": "SK", "slovenia": "SI", "iceland": "IS", "cyprus": "CY",
+    "malta": "MT", "armenia": "AM", "belarus": "BY", "kazakhstan": "KZ", "costa rica": "CR", "uruguay": "UY",
+    "ecuador": "EC", "venezuela": "VE", "guatemala": "GT", "dominican republic": "DO", "puerto rico": "PR",
 }
 _US_STATES = {
     "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut",
@@ -115,14 +120,24 @@ def _country_of(text: str) -> str | None:
 # --- candidate side --------------------------------------------------------
 
 
+_VAGUE_PLACE = re.compile(
+    r"^(any|anywhere|anyplace|everywhere|worldwide|world ?wide|global(ly)?|international|the world|world|earth|all|"
+    r"all locations|any location|no preference|flexible|open|n/?a|remote|remote anywhere|fully remote|100% remote|"
+    r"remote worldwide|remote global)$", re.I)
+
+
 def candidate_profile(user_profile: dict, prefs: dict, home_country: str | None = None) -> dict:
     """What the user actually chose + facts from their CV."""
     loc = prefs.get("location") or {}
     types = {_norm(t).replace("onsite", "on-site") for t in (loc.get("type") or []) if _norm(t)}
 
+    # "Anywhere", "Worldwide", "Remote"... aren't places (the app turns them away
+    # now, utils/places.js); one saved before that is ignored, not read as the world.
+    given = [p for p in loc.get("places") or [] if str(p).strip() and not _VAGUE_PLACE.match(str(p).strip().rstrip(".!"))]
+
     # country -> None (anywhere in that country) or a set of city/state tokens
     places: dict[str, set[str] | None] = {}
-    for raw in loc.get("places") or []:
+    for raw in given:
         parts = [p.strip() for p in str(raw).split(",") if p.strip()]
         if not parts:
             continue
@@ -142,7 +157,7 @@ def candidate_profile(user_profile: dict, prefs: dict, home_country: str | None 
     cv = (user_profile or {}).get("cv") or {}
     # Zero or one place we couldn't read ("Hartford, CT"): their home country.
     # Several unreadable places can span countries (Shanghai + Bangkok): left open.
-    if not places and len([p for p in loc.get("places") or [] if str(p).strip()]) <= 1:
+    if not places and len(given) <= 1:
         home = _country_of(home_country or cv.get("country") or "")
         if home:
             places[home] = None
@@ -204,6 +219,39 @@ def job_facts(job: dict) -> dict:
         "h1b_sponsor": hc.get("h1b_sponsor"),
         "posted_at": hc.get("posted_at") or "",
     }
+
+
+# ISO2 -> a country's name, for notes the user reads (first alias = the usual name)
+_COUNTRY_NAMES = {}
+for _alias, _code in _COUNTRIES.items():
+    _COUNTRY_NAMES.setdefault(_code, _alias.title() if len(_alias) > 3 else _alias.upper())
+
+
+def outside_area(job: dict, cand: dict) -> str | None:
+    """A short plain note when the job is outside the places they picked (e.g.
+    "In United States, not Spain"), else None. The same location checks as
+    hard_reject_reason: jobs from a loosened round can still land here."""
+    f = job_facts(job)
+    places = cand["places"]
+    name = lambda codes: ", ".join(sorted(_COUNTRY_NAMES.get(c, c) for c in codes))
+    if cand["types"] == {"remote"} and f["type"] in {"onsite", "on-site", "hybrid"}:
+        return f"{'Hybrid' if f['type'] == 'hybrid' else 'On-site'}, and you picked remote"
+    if not places:
+        return None
+    if f["type"] == "remote":
+        reach = f["remote_countries"] or f["countries"]
+        if not f["worldwide"] and reach and not reach & places.keys():
+            return f"Remote only in {name(reach)}"
+        return None
+    if f["countries"]:
+        shared = f["countries"] & places.keys()
+        if not shared:
+            return f"In {name(f['countries'])}, not {name(places.keys())}"
+        if all(places[c] is not None for c in shared):
+            wanted = set().union(*(places[c] for c in shared))
+            if f["local"] and not any(w in f["local"] for w in wanted):
+                return f"Outside {', '.join(sorted(w.title() for w in wanted))}"
+    return None
 
 
 def _company_key(name) -> str:
@@ -320,6 +368,17 @@ def taste_signals(selected_jobs: list[dict], automation: dict | None = None) -> 
             rejected.append(j)
         elif status in ("approved", "applied") and not auto_mode:
             liked.append(j)
+    # The example roles they rated at setup count too, after their own decisions:
+    # a new user's first search is already shaped by them.
+    for item in (automation or {}).get("calibration") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("liked"), bool):
+            continue
+        tags = item.get("tags") if isinstance(item.get("tags"), dict) else {}
+        desc = ", ".join(str(v) for v in tags.values() if v)
+        if item.get("skills"):
+            desc += "\nSkills: " + ", ".join(str(s) for s in item["skills"])
+        example = {"title": item.get("title"), "company": item.get("company"), "description": desc}
+        (liked if item["liked"] else rejected).append(example)
     return {"liked": liked[:TASTE_MAX_SIGNALS], "rejected": rejected[:TASTE_MAX_SIGNALS]}
 
 
@@ -408,6 +467,9 @@ def apply_fit_stage(jobs, user_profile, prefs, cv_text, openai_client=None, keep
             if kept:
                 print(f"Fit stage: CV-fit ranked; keeping top {len(kept)} "
                       f"(fit {kept[0]['fit_score']}–{kept[-1]['fit_score']}), dropped {len(dropped)}")
+                # the webapp's live card lists these while the review reads them
+                for j in kept:
+                    print(f"  shortlist: {j.get('title') or ''} — {j.get('company') or ''} | {j.get('location') or ''} | {j.get('job_url') or ''}")
         except Exception as e:  # ranking is an improvement, never a reason to lose the pool
             print(f"Fit stage: CV-fit ranking failed, keeping source order: {e}")
     return kept, rejected

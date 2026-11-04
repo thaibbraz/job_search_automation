@@ -42,6 +42,12 @@ import send_jobbyo as sj
 FIRST_MATCH_CLAUDE_MODEL = os.getenv("JOBBYO_FIRST_MATCH_CLAUDE_MODEL", "claude-opus-5-5")
 MIN_JOBS_TO_EMAIL = 3
 MIN_SCORE = 75
+# Fewer than MIN_STRONG matches at STRONG_SCORE+ and the first search looks once
+# more with nearby titles (api.py _first_match_retry). Otherwise quality wins:
+# a short list of great matches, and we tell them more are coming.
+STRONG_SCORE = 85
+MIN_STRONG = 3
+LEFT_OUT_SHOWN = 3
 # how long the first batch waits for the setup calibration to finish
 CALIBRATION_WAIT_S = int(os.getenv("JOBBYO_FIRST_MATCH_CALIBRATION_WAIT_S", "300"))
 # a small nudge for jobs on sites we apply on by ourselves (they go out fast, with proof)
@@ -562,9 +568,11 @@ def _previous_version(uid, run_entries, user_profile, automation, why, claude_jo
     return report
 
 
-def curate(uid, run_entries, user_profile=None, automation=None):
+def curate(uid, run_entries, user_profile=None, automation=None, skip_urls=(), retry=False):
     """run_entries: this user's entries from the signup run's job_run_*.json
-    (one per round). Returns a report dict; posts and sends nothing."""
+    (one per round). Returns a report dict; posts and sends nothing.
+    retry: the wider second look -- skips skip_urls (already reviewed), and
+    returns None instead of falling back to first_match_v1."""
     user_profile = user_profile or sj.get_user_profile(uid) or {}
     # always the freshest list: their calibration may have finished during the search
     automation = automation if calibration_done(automation) else wait_for_calibration(uid)
@@ -581,7 +589,7 @@ def curate(uid, run_entries, user_profile=None, automation=None):
                 pipeline_drops[b] += 1
         for j in r.get("jobs_added") or []:
             key = sj.normalize_url(j.get("job_url", ""))
-            if key and key not in seen:
+            if key and key not in seen and key not in skip_urls:
                 seen.add(key)
                 candidates.append(dict(j))
     checked = int(sum(metrics.get(k, 0) for k in
@@ -608,8 +616,11 @@ def curate(uid, run_entries, user_profile=None, automation=None):
     try:
         kept, reviewed_out = _review_and_split(facts, open_jobs)
     except Exception as e:
+        if retry:
+            print(f"first_match: retry review failed ({str(e)[:80]})")
+            return None
         return _previous_version(uid, run_entries, user_profile, automation, f"Claude failed: {str(e)[:80]}")
-    if not kept:
+    if not kept and not retry:
         return _previous_version(uid, run_entries, user_profile, automation, "Claude kept 0", len(open_jobs))
     dropped += reviewed_out
 
@@ -634,14 +645,142 @@ def curate(uid, run_entries, user_profile=None, automation=None):
         "method": method,
         "estimated_cost_usd": estimate_cost(FIRST_MATCH_CLAUDE_MODEL, len(open_jobs)),
         "kept": [clean(j) for j in kept],
-        "dropped": [{k: j.get(k) for k in ("title", "company", "job_url", "score", "drop_category", "drop_reason")} for j in dropped],
+        # location/description/source too, so a left-out job can still be added (add_left_out)
+        "dropped": [{**{k: j.get(k) for k in ("title", "company", "job_url", "score", "drop_category", "drop_reason",
+                                              "location", "source")},
+                     "description": str(j.get("description") or "")[:1500]} for j in dropped],
+        "reviewed_urls": sorted({sj.normalize_url(j.get("job_url", "")) for j in candidates} - {""}),
         "copy": copy,
     }
     RUN_LOG_DIR.mkdir(exist_ok=True)
-    (RUN_LOG_DIR / f"first_match_{uid}.json").write_text(json.dumps(report, indent=2, default=str))
+    if not retry:
+        (RUN_LOG_DIR / f"first_match_{uid}.json").write_text(json.dumps(report, indent=2, default=str))
     print(f"first_match: [{method}] kept {len(kept)}, dropped {len(dropped)} "
           f"({dict(Counter(d.get('drop_category') for d in dropped))})")
     return report
+
+
+def strong_count(report):
+    return sum(1 for j in (report or {}).get("kept") or [] if (j.get("score") or 0) >= STRONG_SCORE)
+
+
+def merge_retry(report, more):
+    """The wider second look added to the first report: best of both, the
+    copy rewritten from the whole picture. Saved like curate()'s."""
+    facts = report["facts"]
+    kept = sorted(report["kept"] + more["kept"],
+                  key=lambda j: (j.get("score") or 0) + (ASSISTED_SITE_BONUS if sj.on_assisted_site(j) else 0),
+                  reverse=True)
+    stretches = [j for j in kept if j.get("stretch")]
+    kept = [j for j in kept if not j.get("stretch")]
+    kept = kept[: facts["daily_limit"] - (1 if stretches else 0)] + stretches[:1]
+    dropped = report["dropped"] + more["dropped"]
+    stats = dict(report["stats"])
+    stats["checked"] += more["stats"]["checked"]
+    stats["candidates"] += more["stats"]["candidates"]
+    stats["pipeline_drops"] = dict(Counter(report["stats"]["pipeline_drops"]) + Counter(more["stats"]["pipeline_drops"]))
+    stats["retried"] = True
+    merged = {**report, "kept": kept, "dropped": dropped, "stats": stats,
+              "reviewed_urls": sorted(set(report.get("reviewed_urls") or []) | set(more.get("reviewed_urls") or [])),
+              "estimated_cost_usd": round((report.get("estimated_cost_usd") or 0) + (more.get("estimated_cost_usd") or 0), 4),
+              "copy": write_copy(facts, stats, kept, dropped)}
+    (RUN_LOG_DIR / f"first_match_{report['uid']}.json").write_text(json.dumps(merged, indent=2, default=str))
+    print(f"first_match: retry added {len(more['kept'])}; now {len(kept)} kept, {strong_count(merged)} strong")
+    return merged
+
+
+def left_out_highlights(report, n=LEFT_OUT_SHOWN):
+    """The roles the review turned down, most promising first, each with the
+    reason, so they can see what was left out and why (n=None: all of them).
+    Closed postings aren't worth a look."""
+    out = [{**d, "drop_reason": d.get("drop_reason") or "Not a strong enough fit for you"}
+           for d in report.get("dropped") or [] if d.get("job_url") and d.get("drop_category") != "closed"]
+    out.sort(key=lambda d: d.get("score") or 0, reverse=True)
+    return out[:n] if n else out
+
+
+def add_left_out(uid, url, job_status):
+    """They chose a job the final check left out ("Add anyway" on the live
+    card): post it to their queue like the kept ones, and remember it so the
+    card shows it as added. Returns the job, or None if it isn't one we left out."""
+    path = RUN_LOG_DIR / f"first_match_{uid}.json"
+    report = json.loads(path.read_text())
+    key = sj.normalize_url(url)
+    job = next((d for d in report.get("dropped") or [] if sj.normalize_url(d.get("job_url") or "") == key), None)
+    if not job:
+        return None
+    if key not in (report.get("added_anyway") or []):
+        post_kept({**report, "kept": [{**job, "grade": job.get("score"),
+                                       "review_reason": f"Added by you (left out because: {job.get('drop_reason')})"}]},
+                  report.get("job_status") or job_status)
+        report["added_anyway"] = (report.get("added_anyway") or []) + [key]
+        path.write_text(json.dumps(report, indent=2, default=str))
+    return job
+
+
+WHY_HARD_SCHEMA = {
+    "type": "object",
+    "properties": {"reasons": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"title": {"type": "string"}, "text": {"type": "string"}},
+        "required": ["title", "text"], "additionalProperties": False}}},
+    "required": ["reasons"],
+    "additionalProperties": False,
+}
+
+
+def why_hard(report):
+    """No first matches: 1-3 honest reasons why, from what this search
+    actually saw (pool size, what cut the most, how niche the titles are).
+    The live card shows them before handing over to the team."""
+    facts, stats = report["facts"], report["stats"]
+    drops = Counter(d.get("drop_category") for d in report.get("dropped") or [])
+    examples = [d.get("drop_reason") for d in report.get("dropped") or [] if d.get("drop_reason")][:12]
+    prompt = f"""A job seeker's first search found no roles good enough to send. Explain why in 1-3 short reasons,
+in Jobbyo's voice: warm, plain, careful, like a thoughtful recruiter. Never blame them or their profile; a
+niche or senior profile is a strength that fewer postings are written for. No hype, no exclamation marks.
+
+FACTS (use ONLY these; never invent numbers or market data)
+- Open roles checked: {stats.get('checked')}
+- Roles that reached the final read: {stats.get('candidates')}
+- Earlier automatic filters dropped, by reason: {json.dumps(stats.get('pipeline_drops') or {})}
+- Final read dropped, by category: {json.dumps(dict(drops))}
+- Final read reasons, examples: {json.dumps(examples)}
+- Their titles: {facts['target_titles'][:10]}; workplace: {facts['workplace_types']}; places: {facts['places']};
+  home: {facts['home']}; minimum pay: {facts['minimum_salary']} {facts['salary_currency']}; CV headline: {facts['headline']}
+
+WRITE reasons: each a title (3-6 words, e.g. "A small pool right now", "Many remote roles aren't open to you",
+"Your profile is a rare mix") and a text (one sentence, max 30 words, tied to the facts, e.g. "Only 311 open
+roles matched your titles this week, and many are on-site."). Pick the reasons that really explain it."""
+    try:
+        reasons = (_llm_json(prompt, WHY_HARD_SCHEMA, "first_match_why_hard").get("reasons") or [])[:3]
+    except Exception as e:
+        print(f"first_match: why_hard failed ({e})")
+        reasons = []
+    return [r for r in reasons if r.get("title") and r.get("text")] or [
+        {"title": "A small pool right now", "text": f"I checked {stats.get('checked') or 'every'} open roles, "
+                                                    "and none cleared the bar I hold your matches to."}]
+
+
+def empty_report(uid, user_profile=None, automation=None, checked=0):
+    """A first search that found nothing to read: the same report shape with
+    no picks, so the live card and the team see it like any other."""
+    user_profile = user_profile or sj.get_user_profile(uid) or {}
+    automation = automation or sj.get_user_automation(uid) or {}
+    report = {"uid": uid, "email": user_profile.get("email"), "facts": candidate_facts(user_profile, automation),
+              "stats": {"checked": checked, "candidates": 0, "pipeline_drops": {}}, "method": "nothing found",
+              "kept": [], "dropped": [], "copy": {"intro": "", "left_out": "", "why_only": "", "tips": []}}
+    (RUN_LOG_DIR / f"first_match_{uid}.json").write_text(json.dumps(report, indent=2, default=str))
+    return report
+
+
+def more_coming(report):
+    """Fewer than their daily limit: we keep looking rather than pad the list."""
+    return len(report.get("kept") or []) < (report.get("facts") or {}).get("daily_limit", 10)
+
+
+MORE_COMING_LINE = ("I only send roles that clear this bar, so I kept the list short. "
+                    "I'm still looking and will send more as I find them.")
 
 
 # ---------------------------------------------------------------------------
@@ -662,14 +801,24 @@ def render_body_html(report, first_name):
         title = html.escape(j.get("title") or "")
         url = j.get("job_url") or ""
         title_html = f'<a href="{html.escape(url)}" style="color:#3A56E2;">{title}</a>' if url else title
-        stretch = ' <em style="color:#6b7280;">(a stretch)</em>' if j.get("stretch") else ""
+        stretch = ' <em style="color:#6b7280;">(a step up)</em>' if j.get("stretch") else ""
         angle = (f'<br><span style="color:#4b5563;">Lead with {html.escape(j["angle"])}.</span>'
                  if j.get("angle") else "")
         items += (f'<li style="margin-bottom:10px;"><strong>{html.escape(j.get("company") or "")}</strong>, '
                   f'{title_html}{" · " + html.escape(meta) if meta else ""}{stretch}. '
                   f'{html.escape(j.get("fit_line") or "")}{angle}</li>')
     parts.append(f'<ul style="margin:0 0 14px 0;padding-left:20px;">{items}</ul>')
-    if copy.get("left_out"):
+    if more_coming(report):
+        parts.append(f"<p {p}>{html.escape(MORE_COMING_LINE)}</p>")
+    left = left_out_highlights(report)
+    if left:
+        rows = "".join(
+            f'<li style="margin-bottom:6px;"><a href="{html.escape(d["job_url"])}" style="color:#3A56E2;">'
+            f'{html.escape(d.get("title") or "")}</a>{", " + html.escape(d["company"]) if d.get("company") else ""}: '
+            f'{html.escape(d["drop_reason"])}</li>' for d in left)
+        parts.append(f'<p style="margin:0 0 6px 0;"><strong>What I left out, and why:</strong></p>'
+                     f'<ul style="margin:0 0 14px 0;padding-left:20px;">{rows}</ul>')
+    elif copy.get("left_out"):
         parts.append(f"<p {p}>{_md_bold(copy['left_out'])}</p>")
     if copy.get("why_only"):
         parts.append(f"<p {p}>{_md_bold(copy['why_only'])}</p>")
@@ -686,13 +835,20 @@ def render_body_text(report, first_name):
     lines = [f"Hi {first_name},", "", c["intro"], ""]
     for j in report["kept"]:
         meta = " · ".join(x for x in (j.get("workplace"), j.get("pay")) if x)
-        stretch = " (a stretch)" if j.get("stretch") else ""
+        stretch = " (a step up)" if j.get("stretch") else ""
         lines.append(f"- {j.get('company')}, {j.get('title')}{' · ' + meta if meta else ''}{stretch}. {j.get('fit_line')}")
         if j.get("angle"):
             lines.append(f"    Lead with {j['angle']}.")
-    for key in ("left_out", "why_only"):
-        if c.get(key):
-            lines += ["", c[key]]
+    if more_coming(report):
+        lines += ["", MORE_COMING_LINE]
+    left = left_out_highlights(report)
+    if left:
+        lines += ["", "What I left out, and why:"] + [
+            f"- {d.get('title')}{', ' + d['company'] if d.get('company') else ''}: {d['drop_reason']} ({d['job_url']})" for d in left]
+    elif c.get("left_out"):
+        lines += ["", c["left_out"]]
+    if c.get("why_only"):
+        lines += ["", c["why_only"]]
     if c.get("tips"):
         lines += ["", "To get more matches:"] + [f"- {t}" for t in c["tips"]]
     return "\n".join(lines)

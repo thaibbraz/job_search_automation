@@ -15,6 +15,7 @@ from datetime import date, datetime, timezone, timedelta
 import requests
 
 from date_utils import parse_utc_timestamp
+import daily_targets
 import fit_ranker
 import feedback_learning
 import team_corrections
@@ -143,6 +144,7 @@ TARGET_JOBS_PER_USER = env_int("JOBBYO_TARGET_JOBS", 10)
 # Admin "find N more" for one user (Job Search page): the target becomes what
 # they already have today plus N, whatever the daily target is.
 FIND_EXTRA_JOBS = env_int("JOBBYO_FIND_JOBS", 0)
+_FIND_BASE = {}
 
 # The second overnight round only runs for users still below this count after
 # the first round AND only when Round 1 had enough live/direct-source signal.
@@ -802,10 +804,33 @@ def assisted_sites_first(jobs, keep_others=False):
     return ours + great + (rest if keep_others else [])
 
 
+# uid -> their location profile (fit_ranker.candidate_profile), for outside_area notes
+_AREA_CAND = {}
+
+
+def _note_outside_area(uid, jobs):
+    """Flag jobs outside the places they picked (job["outside_area"], a short
+    note the app shows), e.g. ones a loosened round let through."""
+    if not uid:
+        return
+    try:
+        if uid not in _AREA_CAND:
+            automation = get_user_automation(uid) or {}
+            _AREA_CAND[uid] = fit_ranker.candidate_profile(get_user_profile(uid) or {}, extract_job_preferences(automation),
+                                                           home_country=user_country(automation))
+        for j in jobs:
+            note = fit_ranker.outside_area(j, _AREA_CAND[uid])
+            if note:
+                j["outside_area"] = note
+    except Exception as e:  # a missing note never blocks saving their jobs
+        print(f"outside_area: skipped for {uid}: {e}")
+
+
 def api_post_jobs(email, jobs, default_status=DEFAULT_STATUS, uid=None, added_at=None):
     added_at = added_at or _jobs_added_at_timestamp()
     for j in jobs:
         j["addedAt"] = added_at
+    _note_outside_area(uid, jobs)
 
     payload = {
         "jobs": jobs,
@@ -2392,7 +2417,8 @@ def count_jobs_today(existing_jobs, job_status=None):
         status = str(job.get("status", "")).strip().lower()
         added_date = parse_added_at_date(job.get("addedAt") or job.get("createdAt") or job.get("added_at") or job.get("created_at"))
 
-        if status in accepted_statuses and added_date == today:
+        # A closed posting has to be replaced, so it doesn't fill today's quota.
+        if status in accepted_statuses and added_date == today and not job.get("jobClosed"):
             count += 1
 
     return count
@@ -6383,6 +6409,12 @@ def all_search_titles(automation, persona=None, user_profile=None):
         titles = [str(t).strip() for t in (extract_job_preferences(automation).get("jobTitles") or []) if str(t).strip()]
     if persona and isinstance(persona, dict):
         titles += [str(t).strip() for t in (persona.get("target_titles") or []) if str(t).strip()][:3]
+    if FIRST_MATCH_MODE:
+        # First search: also the example roles they said they'd apply to at
+        # setup, and the nearby titles of a wider retry (api.py _first_match_retry).
+        titles += [str(i.get("title") or "").strip() for i in (automation or {}).get("calibration") or []
+                   if isinstance(i, dict) and i.get("liked") is True and str(i.get("title") or "").strip()][:3]
+        titles += [t.strip() for t in os.getenv("JOBBYO_EXTRA_TITLES", "").split("|") if t.strip()]
     seen, out = set(), []
     for t in titles:
         if t.lower() not in seen:
@@ -6441,7 +6473,8 @@ def _build_hc_query(automation, search_contract, user_profile, persona=None):
     # dropped everyone else — a Nairobi candidate got an unfiltered worldwide
     # search, and a UAE+UK candidate got UK only — and the reviewer then
     # rejected the whole batch on location.
-    locations = [str(p).strip() for p in (_prefs_loc.get("places") or []) if str(p).strip()][:3]
+    locations = [str(p).strip() for p in (_prefs_loc.get("places") or [])
+                 if str(p).strip() and not fit_ranker._VAGUE_PLACE.match(str(p).strip().rstrip(".!"))][:3]
     if not locations:
         allowed_regions = policy.get("allowed_regions", [])
         if "us" in allowed_regions:
@@ -6693,7 +6726,8 @@ def build_jobo_search_bodies(keywords, locations, workplace_type, salary_floor, 
         # whole country (a remote job isn't tied to their city).
         prefs_loc = extract_job_preferences(automation).get("location") or {}
         country = user_country(automation)
-        places = ([str(p).strip() for p in (prefs_loc.get("places") or []) if str(p).strip()][:8]
+        places = ([str(p).strip() for p in (prefs_loc.get("places") or [])
+                   if str(p).strip() and not fit_ranker._VAGUE_PLACE.match(str(p).strip().rstrip(".!"))][:8]
                   or list(locations or []) or ([country] if country else []))
         types = {str(t).strip().lower().replace("-", "") for t in (prefs_loc.get("type") or []) if str(t).strip()}
         # Seniority filter at the source: experienced users don't spend their
@@ -7162,9 +7196,12 @@ def find_jobs_for_user(
         else []
     )
     pending_today_before = count_jobs_today(existing_jobs, job_status)
+    global TARGET_JOBS_PER_USER
+    TARGET_JOBS_PER_USER = daily_targets.for_user(user_profile.get("uid") or user.get("uid"))
     if FIND_EXTRA_JOBS > 0:
-        global TARGET_JOBS_PER_USER
-        TARGET_JOBS_PER_USER = pending_today_before + FIND_EXTRA_JOBS
+        # Counted once: later rounds must not add FIND_EXTRA_JOBS again on top
+        # of what round 1 already found.
+        TARGET_JOBS_PER_USER = _FIND_BASE.setdefault(uid, pending_today_before) + FIND_EXTRA_JOBS
 
     # Nightly learning from the user's rejections (feedback_learning.py):
     # hard rules for the fit stage + context for every AI review of this user.
@@ -8521,7 +8558,8 @@ def run_round(
             existing_jobs = extract_existing_jobs(automation or {})
             pending_today = count_jobs_today(existing_jobs, job_status)
 
-            if pending_today >= TARGET_JOBS_PER_USER:
+            # with "find N more", TARGET_JOBS_PER_USER is what the last round aimed for
+            if pending_today >= (TARGET_JOBS_PER_USER if FIND_EXTRA_JOBS > 0 else daily_targets.for_user(uid)):
                 print(f"SKIP: already has {pending_today} {job_status}/legacy jobs today.")
                 continue
 
@@ -8799,7 +8837,8 @@ def build_daily_report_payload(result):
         )
 
     if needs_more:
-        comments += f" You still need {TARGET_JOBS_PER_USER - pending_after} more job{'s' if TARGET_JOBS_PER_USER - pending_after != 1 else ''} to hit today's target — we'll keep looking."
+        still_short = daily_targets.for_user(user_profile.get("uid") or user.get("uid")) - pending_after
+        comments += f" You still need {still_short} more job{'s' if still_short != 1 else ''} to hit today's target — we'll keep looking."
 
     uid = user_profile.get("uid") or user.get("uid") or ""
     app_url = f"https://app.jobbyo.ai/auto-apply/{uid}" if uid else ""
@@ -8884,13 +8923,14 @@ def send_slack_run_report(results_by_uid, companies_added_by_ats=None):
         email = user_profile.get("email") or (r.get("user") or {}).get("email") or ""
         jobs_found = len(r.get("jobs_added") or [])
         pending = r.get("pending_today_after_estimate", 0)
-        needs_manual = pending < MIN_ACCEPTABLE_JOBS_PER_USER
+        user_target = daily_targets.for_user(user_profile.get("uid") or (r.get("user") or {}).get("uid"))
+        needs_manual = pending < min(MIN_ACCEPTABLE_JOBS_PER_USER, user_target)
         keywords = prefs.get("jobTitles") or []
         loc = prefs.get("location") or {}
         location_places = ", ".join(loc.get("places") or [])
 
         total_found += jobs_found
-        total_needed += max(0, TARGET_JOBS_PER_USER - pending)
+        total_needed += max(0, user_target - pending)
 
         funnel = (r.get("round_metrics") or {}).get("source_funnel", {})
         for src in SOURCE_KEYS:
@@ -9013,59 +9053,6 @@ def send_source_health_alert(results_by_uid):
         )
     except Exception as e:
         print(f"Source health alert failed (non-fatal): {e}")
-
-
-def send_rejections_for_galih(results_by_uid):
-    """Daily Slack list of users who rejected jobs in the last 24h, with their
-    reasons and what they're looking for -- so Galih can find replacements."""
-    blocks_text = []
-    total = 0
-    for r in results_by_uid.values():
-        automation = r.get("automation") or {}
-        rejected = feedback_learning.rejected_since(extract_selected_jobs(automation), hours=24)
-        if not rejected:
-            continue
-        total += len(rejected)
-        profile = r.get("user_profile") or {}
-        prefs = extract_job_preferences(automation)
-        name = profile.get("displayName") or (profile.get("email") or "").split("@")[0] or "?"
-        titles = ", ".join((prefs.get("jobTitles") or [])[:3]) or "—"
-        places = ", ".join(((prefs.get("location") or {}).get("places") or [])[:3]) or "—"
-        lines = [f"*{name}* `{profile.get('email') or ''}` · {len(rejected)} rejected · wants {titles} · {places}"]
-        for j in rejected[:6]:
-            reason = str(j.get("feedback") or "").strip()
-            lines.append(f"   • {j.get('title') or '?'} at {j.get('company') or '?'}: "
-                         + (f"_{reason[:140]}_" if reason else "no reason given"))
-        blocks_text.append("\n".join(lines))
-    if not blocks_text:
-        return
-    # Both nightly passes (19:00 + 22:00) are full runs: post once per day.
-    marker = RUN_LOG_DIR / f"galih_rejections_{datetime.now(timezone.utc):%Y-%m-%d}.done"
-    if marker.exists() and not DRY_RUN:
-        return
-
-    header = f"🔍 *Galih — {total} jobs rejected in the last 24h ({len(blocks_text)} users)*\nFind replacements that avoid these reasons:"
-    sections, current = [], header
-    for chunk in blocks_text:  # Slack caps a section at 3000 chars
-        if len(current) + len(chunk) + 2 > 2900:
-            sections.append(current)
-            current = ""
-        current += ("\n\n" if current else "") + chunk
-    sections.append(current)
-
-    webhook = os.getenv("SLACK_WEBHOOK_URL_DAILY_RUN", "")
-    print(header)
-    if not webhook:
-        return
-    try:
-        requests.post(webhook, json={
-            "text": f"Galih — {total} jobs rejected in the last 24h",
-            "username": "Laras", "icon_emoji": ":bar_chart:",
-            "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": t}} for t in sections[:45]],
-        }, timeout=15)
-        marker.write_text("posted")
-    except Exception as e:
-        print(f"Rejections-for-Galih Slack post failed (non-fatal): {e}")
 
 
 def save_run_log(all_results):
@@ -9568,7 +9555,6 @@ def main():
     if not (SINGLE_USER_EMAIL or SINGLE_USER_EMAILS or SINGLE_USER_UID):
         send_slack_run_report(results_by_uid, _companies_added_by_ats)
         send_source_health_alert(results_by_uid)
-        send_rejections_for_galih(results_by_uid)
 
     total_new = sum(len(v.get("jobs_added") or []) for v in results_by_uid.values())
     total_rejected = sum(len(r.get("jobs_rejected_by_review") or []) for r in all_results)
@@ -9631,7 +9617,8 @@ def main():
         rm = merged.get("round_metrics") or {}
         funnel = rm.get("source_funnel", {})
 
-        if pending >= TARGET_JOBS_PER_USER:
+        user_target = daily_targets.for_user(uid)
+        if pending >= user_target:
             icon = "✅"
         elif pending >= MIN_ACCEPTABLE_JOBS_PER_USER:
             icon = "⚠️ "
