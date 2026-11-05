@@ -8322,6 +8322,13 @@ def resolve_requested_user(uid=None, email=None):
 
     # Paid status decides whether results are stored. Free candidates get the
     # jobs returned to them but nothing written to their queue.
+    # A first-search preview runs before they pay and saves nothing, so it's
+    # not held to /users/paid.
+    if ASSUME_PAID and DRY_RUN and FIRST_MATCH_MODE:
+        user["_assume_paid"] = True
+        print(f"First-search preview: {user['email']} — nothing will be saved.")
+        return user
+
     if ASSUME_PAID:
         # /run/user/subscribed (this endpoint's only real caller) is public
         # -- no shared secret between the two services to gate on -- so

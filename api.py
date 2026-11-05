@@ -268,12 +268,18 @@ async def _run_subprocess(cmd: list[str], label: str, env: Optional[dict] = None
         stderr=asyncio.subprocess.STDOUT,
     )
     assert proc.stdout is not None
-    async for line in proc.stdout:
-        text = line.decode(errors='replace').rstrip()
-        print(f"[{label}] {text}")
-        live["lines"].append(text)
-        live["line_count"] += 1
-    await proc.wait()
+    try:
+        async for line in proc.stdout:
+            text = line.decode(errors='replace').rstrip()
+            print(f"[{label}] {text}")
+            live["lines"].append(text)
+            live["line_count"] += 1
+        await proc.wait()
+    except asyncio.CancelledError:  # e.g. a preview restarted: the search stops with it
+        proc.kill()
+        live["finished_at"] = datetime.now(timezone.utc).isoformat()
+        live["exit_code"] = -1
+        raise
     code = proc.returncode or 0
     print(f"[{label}] Finished — exit code {code}")
     live["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -991,14 +997,18 @@ async def run_user_subscribed(target: UserTarget):
 # instead of searching again.
 PREVIEW_MAX_AGE_SECONDS = int(os.getenv("JOBBYO_PREVIEW_MAX_AGE_SECONDS", str(7 * 86400)))
 _preview_runs: dict = {}  # uid -> {"paid": bool}, while its search runs
+_preview_started: dict = {}  # uid -> ISO time of their latest preview on this server
+_preview_tasks: dict = {}  # uid -> its running preview, so starting over can cancel it
 
 
-async def _preview_run(target: UserTarget) -> None:
+async def _preview_run(target: UserTarget, replaces: Optional[asyncio.Task] = None) -> None:
     uid = target.uid
     label = f"run:subscribed:{uid}"
-    existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
-    started_at = asyncio.get_event_loop().time()
     try:
+        if replaces:
+            await asyncio.wait([replaces])
+        existing_logs = set(RUN_LOG_DIR.glob("job_run_*.json"))
+        started_at = asyncio.get_event_loop().time()
         import first_match
         await asyncio.to_thread(first_match.wait_for_calibration, uid,
                                 int(os.getenv("JOBBYO_FIRST_SEARCH_CALIBRATION_WAIT_S", "240")))
@@ -1014,7 +1024,10 @@ async def _preview_run(target: UserTarget) -> None:
     except Exception as exc:
         print(f"[{label}] preview failed: {exc}")
     finally:
-        _preview_runs.pop(uid, None)
+        if _preview_tasks.get(uid) is asyncio.current_task():  # else a newer one took over
+            _preview_tasks.pop(uid, None)
+            _preview_runs.pop(uid, None)
+            _first_match_stage.pop(uid, None)
 
 
 class LeftOutAdd(BaseModel):
@@ -1037,17 +1050,25 @@ async def first_match_add_left_out(req: LeftOutAdd):
 
 
 @app.post("/run/user/preview", response_model=RunResponse, status_code=202)
-async def run_user_preview(target: UserTarget, background_tasks: BackgroundTasks):
-    """Start a sign-up's first search before they pay. Once per person."""
+async def run_user_preview(target: UserTarget):
+    """Start a sign-up's first search before they pay: a fresh one each visit,
+    cancelling one still running: a new automation means the old settings are out.
+    If they paid during the old one, the new one emails them instead.
+    Refused, the live card shows their latest search."""
     uid = target.uid
     if not uid:
         raise HTTPException(status_code=422, detail="Provide uid.")
     last = _subscribed_last_run.get(uid.strip().lower())
     recent = last is not None and (datetime.now(timezone.utc) - last).total_seconds() < SUBSCRIBED_COOLDOWN_SECONDS
-    if uid in _preview_runs or recent or _first_match_path(uid).exists():
+    if recent:
         return RunResponse(accepted=False, message="Their first search already ran.")
-    _preview_runs[uid] = {"paid": False}
-    background_tasks.add_task(_preview_run, target)
+    paid = _preview_runs.get(uid, {}).get("paid", False)
+    running = _preview_tasks.get(uid)
+    if running:
+        running.cancel()
+    _preview_runs[uid] = {"paid": paid}
+    _preview_started[uid] = datetime.now(timezone.utc).isoformat()
+    _preview_tasks[uid] = asyncio.ensure_future(_preview_run(target, running))
     return RunResponse(accepted=True, message=f"Preview search started for {uid}.")
 
 
@@ -1212,6 +1233,14 @@ async def run_user_live(uid: str):
     """This one user's latest search, for the webapp's live card: the search's
     key steps, who it's for, and (once checked) the final picks."""
     mine = [r for r in _LIVE_RUNS.values() if r["label"].endswith(f":{uid}")]
+    started = _preview_started.get(uid)
+    if started:  # only the latest preview: the older one's picks aren't this search's
+        newest = datetime.fromisoformat(started)
+        latest = [r for r in mine if datetime.fromisoformat(r["started_at"]) >= newest]
+        if latest or uid in _preview_runs:
+            mine = latest
+    if not mine and uid in _preview_runs:
+        return {"run": None, "lines": []}  # waiting for calibration, the search hasn't begun
     if not mine:
         # Finished before this server started (a deploy): their saved picks.
         path = _first_match_path(uid)
@@ -1230,7 +1259,7 @@ async def run_user_live(uid: str):
             "lines": _live_card_lines(list(run["lines"])),
             "profile": await asyncio.to_thread(_live_profile, uid),
             "docs": await asyncio.to_thread(_live_docs, uid),
-            "result": await asyncio.to_thread(_live_result, uid, first["started_at"])}
+            "result": None if uid in _preview_runs else await asyncio.to_thread(_live_result, uid, first["started_at"])}
 
 
 # --- Hot leads ---------------------------------------------------------
