@@ -244,12 +244,16 @@ def _search_env(model: Optional[str] = None, profile: Optional[str] = None) -> d
 _LIVE_RUNS: dict = {}
 _LIVE_MAX_LINES = 1500
 _LIVE_KEEP_FINISHED = 25
+# The live card's own lines, kept apart from the last-1500 window: a full search
+# logs more than that, and the card must never lose its first steps.
+_LIVE_MAX_CARD_LINES = 6000
 
 
 def _live_start(label: str, cmd: list[str]) -> dict:
     from collections import deque
     run = {"label": label, "cmd": " ".join(cmd[1:]), "started_at": datetime.now(timezone.utc).isoformat(),
-           "finished_at": None, "exit_code": None, "lines": deque(maxlen=_LIVE_MAX_LINES), "line_count": 0}
+           "finished_at": None, "exit_code": None, "lines": deque(maxlen=_LIVE_MAX_LINES), "line_count": 0,
+           "card": deque(maxlen=_LIVE_MAX_CARD_LINES)}
     _LIVE_RUNS[f"{label}@{run['started_at']}"] = run
     finished = sorted((k for k, r in _LIVE_RUNS.items() if r["finished_at"]), key=lambda k: _LIVE_RUNS[k]["finished_at"])
     for k in finished[:-_LIVE_KEEP_FINISHED]:
@@ -274,6 +278,8 @@ async def _run_subprocess(cmd: list[str], label: str, env: Optional[dict] = None
             print(f"[{label}] {text}")
             live["lines"].append(text)
             live["line_count"] += 1
+            if _LIVE_CARD_LINE.match(text.strip()):
+                live["card"].append(text)
         await proc.wait()
     except asyncio.CancelledError:  # e.g. a preview restarted: the search stops with it
         proc.kill()
@@ -1062,6 +1068,9 @@ async def run_user_preview(target: UserTarget):
     recent = last is not None and (datetime.now(timezone.utc) - last).total_seconds() < SUBSCRIBED_COOLDOWN_SECONDS
     if recent:
         return RunResponse(accepted=False, message="Their first search already ran.")
+    began = _preview_started.get(uid)
+    if began and uid in _preview_runs and (datetime.now(timezone.utc) - datetime.fromisoformat(began)).total_seconds() < 20:
+        return RunResponse(accepted=True, message=f"Preview search already starting for {uid}.")  # a double call
     paid = _preview_runs.get(uid, {}).get("paid", False)
     running = _preview_tasks.get(uid)
     if running:
@@ -1213,7 +1222,7 @@ def _save_live_card(uid: str) -> None:
     run = max(mine, key=lambda r: r["started_at"])
     try:
         _live_card_path(uid).write_text(json.dumps({"started_at": run["started_at"],
-                                                    "lines": _live_card_lines(list(run["lines"]))}))
+                                                    "lines": _search_card_lines(mine, run)}))
     except OSError as exc:
         print(f"[live] could not save the card for {uid}: {exc}")
 
@@ -1226,6 +1235,19 @@ def _live_docs(uid: str) -> dict:
     if persona and str(persona.get("career_hybrid") or "").startswith("No-GPT"):
         persona = None  # the plain fallback persona isn't worth showing
     return {"persona": persona, "search_contract": _read_json(SCRIPT_DIR / "search_contracts" / f"{safe}.json")}
+
+
+def _same_search(runs: list, latest: dict) -> list:
+    """The runs of the latest search: it and a wider retry an hour or less before it."""
+    end = datetime.fromisoformat(latest["started_at"])
+    return [r for r in runs if (end - datetime.fromisoformat(r["started_at"])).total_seconds() <= 3600]
+
+
+def _search_card_lines(runs: list, latest: dict) -> list[str]:
+    """Every run of this search in order, so a wider retry adds to the story
+    instead of restarting it; each from its whole card, not the last-lines window."""
+    return [line for i, r in enumerate(sorted(_same_search(runs, latest), key=lambda r: r["started_at"]))
+            for line in ((["WIDER SEARCH"] if i else []) + _live_card_lines(list(r.get("card") or r["lines"])))]
 
 
 @app.get("/run/user/live/{uid}")
@@ -1256,7 +1278,7 @@ async def run_user_live(uid: str):
     return {"run": {"started_at": run["started_at"], "active": run["finished_at"] is None,
                     "failed": run["exit_code"] not in (0, None),
                     "stage": _first_match_stage.get(uid) or ("searching" if run["finished_at"] is None else "done")},
-            "lines": _live_card_lines(list(run["lines"])),
+            "lines": _search_card_lines(mine, run),
             "profile": await asyncio.to_thread(_live_profile, uid),
             "docs": await asyncio.to_thread(_live_docs, uid),
             "result": None if uid in _preview_runs else await asyncio.to_thread(_live_result, uid, first["started_at"])}
