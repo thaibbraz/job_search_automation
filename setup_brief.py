@@ -244,7 +244,9 @@ Return:
 - expansions: 2-4 concrete one-tap changes that would grow their pool the most, realistic for
   their background. Each has:
   - kind: add_title (a close title they didn't pick), add_location (a nearby city/metro or
-    country they could work in), add_remote (only if they excluded remote), or lower_salary.
+    country they could work in), add_remote (only if they excluded remote), or lower_salary
+    (only if they set a minimum, and only to a lower one). Every change must make the pool
+    bigger, never smaller: never raise their minimum.
   - value: exactly what to apply: the title text, the location text, "remote", or the new yearly
     minimum as digits in their currency.
   - label: 2-6 words for a button, e.g. "Add Data Analyst", "Add Madrid", "Include remote roles",
@@ -297,9 +299,13 @@ def _clean_expansions(items, prefs):
             continue
         if kind == "add_remote" and "remote" in types:
             continue
+        if kind not in ("add_title", "add_location", "add_remote", "add_hybrid", "lower_salary"):
+            continue
         if kind == "lower_salary":
+            # only a lower minimum grows the pool; a raise would shrink it
             digits = "".join(ch for ch in value if ch.isdigit())
-            if not digits:
+            current = "".join(ch for ch in str(prefs.get("minimumAcceptableSalary") or "") if ch.isdigit())
+            if not digits or not current or int(digits) >= int(current):
                 continue
             value = digits
         seen.add((kind, value.lower()))
